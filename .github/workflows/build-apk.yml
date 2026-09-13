@@ -52,11 +52,13 @@ jobs:
           echo "Resolved Node 24.x -> $TAG"
 
       - name: Sync node-versions.json default/bundled to resolved tag
+        env:
+          NODE_TAG: ${{ steps.nodever.outputs.tag }}
         run: |
           python3 - <<'PY'
-          import json, sys
+          import json, os
           p = "app/src/main/assets/node-versions.json"
-          tag = sys.argv[1]
+          tag = os.environ["NODE_TAG"]
           d = json.load(open(p))
           d["default"] = tag
           for v in d["versions"]:
