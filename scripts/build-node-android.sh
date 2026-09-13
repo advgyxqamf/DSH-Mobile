@@ -377,30 +377,57 @@ echo "==> 运行官方 android-configure (NDK ${ANDROID_NDK} + API ${ANDROID_API
 #       obj.target/ → arm64，最终 node 二进制
 #   实测在 4 vCPU 的 GitHub runner 上，make 跑满 150 分钟仍在 host V8 阶段
 #   （心跳 195 跳后被 timeout-minutes 掐断，job: cancelled）。
-#   gyp 的 ninja 生成器不需要像 make 那样为每个目标 fork 子 make，
-#   V8 这种「几万个 .o、依赖图很深」的场景通常快 20-40%。
 #
-#   做法: android-configure 已经把 CC/CXX/GYP_DEFINES 等环境变量设好了，
-#         紧接着在【同一环境】下重跑一次 ./configure 并补上 --ninja，
-#         这样既能保留 Android 目标配置，又切换成 ninja 生成器。
-#         若 configure 失败（例如环境里的 python 版本不符），则回退 make，
-#         不因为一个性能优化把整个构建搞挂。
+#   坑（第一次改这里时踩的，务必别重犯）：
+#     android_configure.py 第 74 行是  os.environ['GYP_DEFINES'] = GYP_DEFINES
+#     —— **只在它自己的 python 进程内生效，不会 export 到父 shell**。
+#     所以在外层直接重跑 ./configure 时 GYP_DEFINES 是空的，gyp 立刻报
+#         gyp: Undefined variable android_ndk_path in node.gyp while trying to load node.gyp
+#         Error running GYP
+#     而 configure 在报错前已经改写了 Makefile/config.gypi，导致随后的 make 也废了：
+#         make: *** No rule to make target 'out/Release/build.ninja', needed by 'node'.  Stop.
+#     （我原先写的「失败就回退 make」是错的 —— 此时 out/ 已被污染，回退回不去。）
+#
+#   正确做法: 自己显式带上 GYP_DEFINES（取值同 android_configure.py 第 69-73 行），
+#             在【同一个环境】重跑 configure 并加 --ninja。
+#             并且一旦这一步没拿到 build.ninja，就**干净退出**，
+#             而不是留着一个半配置好的 out/ 让后续 make 报出误导性的错误。
 # ---------------------------------------------------------------------------
 USE_NINJA=0
 if command -v ninja >/dev/null 2>&1; then
-  echo "==> 切换到 Ninja 生成器（重跑 configure，保留 android-configure 设好的环境）"
-  if ./configure --dest-cpu="${ARCH}" --dest-os=android --openssl-no-asm --cross-compiling --ninja 2>&1 | tail -20; then
+  echo "==> 切换到 Ninja 生成器（显式带上 GYP_DEFINES 重跑 configure）"
+  # 与 android_configure.py 保持一致的 gyp 变量集
+  export GYP_DEFINES="target_arch=${ARCH} v8_target_arch=${ARCH} android_target_arch=${ARCH} host_os=linux OS=android android_ndk_path=${ANDROID_NDK}"
+  echo "    GYP_DEFINES=$GYP_DEFINES"
+  if ./configure --dest-cpu="${ARCH}" --dest-os=android --openssl-no-asm --cross-compiling --ninja 2>&1 | tail -25; then
     if [ -f out/Release/build.ninja ]; then
       USE_NINJA=1
       echo "    [ok] out/Release/build.ninja 已生成，将用 ninja 构建"
+      # ninja 图预检：gyp 的 ninja 生成器偶尔会产出重复规则
+      # （如 "multiple rules generate ... js_protocol.stamp"），
+      # 那会在编译中途才炸、且看着像编译器问题。这里提前查一次，
+      # 让报错落在「生成阶段」而不是「编译阶段」。预检失败不致命（仅警告），
+      # 避免因为 gyp 的无害告警把整个构建挡掉。
+      if ! ninja -C out/Release -n -t targets >/dev/null 2>/tmp/ninja-graph-check.err; then
+        echo "    [warn] ninja 图预检报告问题（不一定致命，继续编译）:"
+        head -5 /tmp/ninja-graph-check.err | sed 's/^/      /'
+      else
+        echo "    [ok] ninja 图预检通过"
+      fi
     else
-      echo "    [warn] configure 成功但没生成 build.ninja，回退 make"
+      echo "    [error] configure --ninja 返回成功但没有 out/Release/build.ninja"
+      echo "            out/ 可能处于半配置状态。为安全起见中止，避免误导性报错。"
+      exit 1
     fi
   else
-    echo "    [warn] configure --ninja 失败，回退 make（构建继续，只是可能更慢）"
+    echo "    [error] configure --ninja 失败。"
+    echo "            configure 已改写 out/ 与 Makefile，此时回退 make 也会失败"
+    echo "            （会报 \"No rule to make target 'out/Release/build.ninja'\"）。"
+    echo "            如需在无 ninja 环境构建，请卸载 ninja 后重跑本脚本。"
+    exit 1
   fi
 else
-  echo "==> [info] 未安装 ninja，使用 make"
+  echo "==> [info] 未安装 ninja，使用 make（会明显更慢，且可能超出 CI 超时）"
 fi
 
 # ---------------------------------------------------------------------------
@@ -426,36 +453,49 @@ fi
 #         而 bionic 的 <asm/hwcap.h> 提供了这些常量、libc 也导出 getauxval，
 #         因此无需任何额外库，且 CRC32/PMULL 反而是"真检测"而非硬编码。
 #
-#   注意: 补丁必须打在 gyp 生成的 Makefile 上（而不是 config.gypi）——
+#   注意: 补丁必须打在 gyp **生成物**上（而不是 config.gypi）——
 #         ARMV8_OS_ANDROID 是 gyp 条件展开出的 -D，config.gypi 里根本不存在。
 #         实测证据: 打补丁后 cpu_features.o 的未定义符号从
 #         `U android_getCpuFeatures` 变为 `U getauxval`（libc 提供）。
+#
+#   两种生成器的产物位置不同，必须都覆盖（切 ninja 后曾漏掉，会导致老错误重现）：
+#     make  : out/deps/zlib/*.target.mk        （-DARMV8_OS_ANDROID 直接写在 mk 里）
+#     ninja : out/Release/obj/deps/zlib/*.ninja（同一个宏，写在 defines 展开处）
 # ---------------------------------------------------------------------------
 ZMK_DIR="out/deps/zlib"
-if [ -d "$ZMK_DIR" ]; then
+ZMK_NINJA_DIR="out/Release/obj/deps/zlib"
+ZMK_FILES=""
+for pat in "$ZMK_DIR/*.target.mk" "$ZMK_DIR/*.host.mk" \
+           "$ZMK_NINJA_DIR/*.ninja"; do
+  for f in $pat; do
+    [ -f "$f" ] && ZMK_FILES="$ZMK_FILES $f"
+  done
+done
+if [ -n "$ZMK_FILES" ]; then
   echo "==> 修补 gyp 生成的 zlib 目标: ARMV8_OS_ANDROID -> ARMV8_OS_LINUX"
-  python3 - "$ZMK_DIR" <<'PY'
-import os, sys, glob
-d = sys.argv[1]
+  python3 - $ZMK_FILES <<'PY'
+import os, sys
+total_files = 0
 total = 0
-for f in sorted(glob.glob(os.path.join(d, "*.target.mk")) +
-                glob.glob(os.path.join(d, "*.host.mk"))):
+for f in sys.argv[1:]:
     s = open(f, encoding="utf-8", errors="replace").read()
     n = s.count("-DARMV8_OS_ANDROID")
     if n:
         s = s.replace("-DARMV8_OS_ANDROID", "-DARMV8_OS_LINUX")
         open(f, "w", encoding="utf-8").write(s)
-        print("  patched %s (%d occurrence(s))" % (os.path.basename(f), n))
+        print("  patched %s (%d occurrence(s))" % (f, n))
         total += n
-print("  total replaced:", total)
+        total_files += 1
+print("  total: %d occurrence(s) in %d file(s)" % (total, total_files))
 if total == 0:
-    sys.exit("FATAL: no -DARMV8_OS_ANDROID found in zlib gyp makefiles; "
-             "upstream layout changed, patch needs review")
+    sys.exit("FATAL: no -DARMV8_OS_ANDROID found in zlib gyp outputs "
+             "(searched make .mk and ninja .ninja); upstream layout changed, "
+             "patch needs review")
 PY
   echo "==> 补丁后核对（应只剩 ARMV8_OS_LINUX）:"
-  grep -h "ARMV8_OS" "$ZMK_DIR"/*.target.mk | sort -u
+  grep -h -o "ARMV8_OS_[A-Z]*" $ZMK_FILES 2>/dev/null | sort -u | sed 's/^/    /'
 else
-  echo "==> [warn] $ZMK_DIR 不存在，跳过 zlib 补丁"
+  echo "==> [warn] 未找到 zlib gyp 产物（$ZMK_DIR / $ZMK_NINJA_DIR），跳过补丁"
 fi
 
 echo "==> 编译 (NDK r27+ 链接器默认 max-page-size=16384 → 16KB 页对齐)"
