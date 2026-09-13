@@ -42,11 +42,37 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y git python3 ninja cmake make zip
 
+      - name: Resolve latest Node 24.x tag
+        id: nodever
+        run: |
+          TAG=$(git ls-remote --tags https://github.com/nodejs/node \
+            | grep -oE 'refs/tags/v24\.[0-9]+\.[0-9]+$' \
+            | sed 's#refs/tags/v##' | sort -V | tail -1)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved Node 24.x -> $TAG"
+
+      - name: Sync node-versions.json default/bundled to resolved tag
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          p = "app/src/main/assets/node-versions.json"
+          tag = sys.argv[1]
+          d = json.load(open(p))
+          d["default"] = tag
+          for v in d["versions"]:
+              if v.get("bundled"):
+                  v["version"] = tag
+                  v["url"] = v["url"].replace("24.21.0", tag)
+          json.dump(d, open(p, "w"), indent=2, ensure_ascii=False)
+          print("node-versions.json default ->", tag)
+          PY
+          "${{ steps.nodever.outputs.tag }}"
+
       - name: Build Node for Android (NDK r27+ 交叉编译 arm64-v8a)
         env:
           ANDROID_NDK: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
           ANDROID_API: "24"
-        run: ./scripts/build-node-android.sh 24.21.0
+        run: ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }}
 
       - name: Set up Gradle
         uses: gradle/setup-gradle@v4

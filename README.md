@@ -62,10 +62,13 @@ NDK r27+ 链接器默认 16KB 页对齐，满足 Android 15+ (API 35) 的 `dlope
 
 **路径 A（推荐，零本地环境）：GitHub Actions 一键出包**
 
-本仓库已带 `.github/workflows/build-apk.yml`。把它推到 GitHub → Actions → 手动
-`Run workflow`（或 push 到 main/master 自动触发）→ 完成后在 Artifacts 下载
-`android-node-container-apk.zip`，里面是 `app-debug.apk`。CI 运行器有完整公网，会自动：
-装 SDK/NDK → `build-node-android.sh` 编 Node → `assembleDebug` → 上传 APK。
+本仓库已带 `.github/workflows/build-apk.yml`。把它推到**你有写权限**的 GitHub 仓库
+（或让我用你的 PAT 直接推）→ Actions → 手动 `Run workflow`（或 push 到 main/master 自动触发）
+→ 完成后在 **Artifacts** 下载 `android-node-container-apk`，里面是 `app-debug.apk`。
+
+CI 运行器有完整公网，会自动：装 JDK17 + SDK/NDK(r27) →
+**自动解析 nodejs/node 上最新的 24.x tag 并写回 `node-versions.json`** →
+`build-node-android.sh` 交叉编译 Node → `./gradlew assembleDebug` → 上传 APK。
 
 **路径 B（本地，需已装 SDK/NDK）：**
 
@@ -76,8 +79,8 @@ export ANDROID_HOME=/path/to/sdk ANDROID_NDK=/path/to/ndk   # NDK 需 r27+
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-> 注：本仓库未附带 `gradle-wrapper.jar`（二进制无法手生成）。两条路径都会自动
-> `gradle wrapper` 生成它，无需你手动处理。
+> 注：`gradle-wrapper.jar` 与 `gradlew` 已随仓库提交（指向官方 Gradle 8.9 发行版），
+> CI 直接用 `./gradlew assembleDebug`，无需你手动生成。
 
 ### 3.3 运行 & 验证（你在手机上会看到什么）
 
