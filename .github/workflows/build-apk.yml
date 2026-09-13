@@ -164,6 +164,7 @@ jobs:
           ANDROID_API: "24"
         run: |
           set -o pipefail
+          chmod +x scripts/build-node-android.sh
           ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }} 2>&1 | tee /tmp/node-build.log
 
       - name: Build debug APK
