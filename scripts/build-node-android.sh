@@ -83,6 +83,39 @@ else
   echo "==> [warn] $STACK_TRACE 不存在，跳过补丁"
 fi
 
+# ---------------------------------------------------------------------------
+# 宿主工具链分离（必须在 android-configure 之前 export，否则 build 会在 ICU 阶段崩）：
+#
+#   现象: /bin/sh: 1: .../out/Release/icupkg: Exec format error
+#         make[1]: *** [tools/icu/icudata.target.mk:13:
+#                       .../obj/gen/icudt78l.dat] Error 126
+#
+#   根因: android-configure 把 CC/CXX 设成 aarch64-linux-android*-clang（供目标架构用）。
+#         而 gyp 的 make 生成器里，宿主(host)工具的编译器是这样取的
+#         （见 tools/gyp/pylib/gyp/generator/make.py）:
+#             CC_host  = $(CC_host  or  CC)
+#             CXX_host = $(CXX_host or  CXX)
+#         即「没设 *_host 就回退到 CC」。于是 icupkg / genccode / genrep 这些
+#         **要跑在构建机（x86_64）上**的工具被编成了 ARM64 二进制，
+#         宿主无法执行 → Exec format error。
+#
+#   修法: 提前把 CC_host/CXX_host/LINK_host/AR_host 指向宿主编译器，
+#         CC/CXX 由 android-configure 留给目标架构。实测: 设置后
+#         out/Release/icupkg 从 aarch64 变为
+#         'ELF 64-bit LSB pie executable, x86-64' 且可正常运行。
+# ---------------------------------------------------------------------------
+HOST_CC="${CC_host:-$(command -v gcc || command -v clang)}"
+HOST_CXX="${CXX_host:-$(command -v g++ || command -v clang++)}"
+if [ -z "$HOST_CC" ] || [ -z "$HOST_CXX" ]; then
+  echo "==> [error] 找不到宿主编译器 (gcc/g++/clang)，交叉编译无法产出可运行的 host 工具"
+  exit 1
+fi
+export CC_host="$HOST_CC"
+export CXX_host="$HOST_CXX"
+export LINK_host="$HOST_CXX"
+export AR_host="${AR_host:-$(command -v ar || echo ar)}"
+echo "==> 宿主工具链: CC_host=$CC_host  CXX_host=$CXX_host  AR_host=$AR_host"
+
 echo "==> 运行官方 android-configure (NDK ${ANDROID_NDK} + API ${ANDROID_API} + arch ${ARCH})"
 # Node 24 官方参数顺序: ./android-configure [patch] <path to the Android NDK> <Android SDK version> <target architecture>
 # 即 <ndk> <api> <arch>（注意：不是 <ndk> <arch> <api>）
