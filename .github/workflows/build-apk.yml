@@ -27,15 +27,6 @@ jobs:
       contents: write
     steps:
       # ---------------------------------------------------------------------------
-      # 先校验本 workflow 自身：重复键之类的结构错误会被 GitHub 直接拒绝加载，
-      # 表现为 Actions 页面「红色 ✗ + 0s/几秒」且不产生任何步骤日志（极难排查）。
-      # 放在最前面，宁可在此处明确失败，也不要让整轮 run 静默消失。
-      # ---------------------------------------------------------------------------
-      - name: Validate workflow file
-        id: wfvalidate
-        run: python3 scripts/validate-workflow.py .github/workflows/build-apk.yml
-
-      # ---------------------------------------------------------------------------
       # 心跳：把「CI 活着、当前在哪个阶段」持续推到 ci-hb 分支。
       #
       # 为什么需要：沙箱侧读不到 GitHub Actions 日志，只能靠分支自报。原先只有开头
@@ -131,6 +122,20 @@ jobs:
       - name: Checkout
         id: checkout
         uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------------
+      # 校验本 workflow 自身：重复键之类的结构错误会被 GitHub 直接拒绝加载，
+      # 表现为 Actions 页面「红色 ✗ + 0s/几秒」且不产生任何步骤日志（极难排查）。
+      #
+      # 必须放在 Checkout 之后 —— 校验脚本本身来自仓库，checkout 之前它不存在。
+      # （踩过的坑：原先放在最前面，结果 python3 找不到 scripts/validate-workflow.py，
+      #   该步骤失败导致后面所有步骤 skipped，又是一轮静默失败。）
+      # ---------------------------------------------------------------------------
+      - name: Validate workflow file
+        id: wfvalidate
+        run: |
+          echo "2/9 validate-workflow" > /tmp/ci-stage
+          python3 scripts/validate-workflow.py .github/workflows/build-apk.yml
 
       - name: Set up JDK 17
         id: setupjava
@@ -312,6 +317,8 @@ jobs:
             echo "job    : ${{ job.status }}"
             echo
             echo "=== step outcomes ==="
+            echo "wfvalidate  : ${{ steps.wfvalidate.outcome }}"
+            echo "hbstart     : ${{ steps.hbstart.outcome }}"
             echo "ping        : ${{ steps.ping.outcome }}"
             echo "checkout    : ${{ steps.checkout.outcome }}"
             echo "setup-java  : ${{ steps.setupjava.outcome }}"
@@ -359,6 +366,8 @@ jobs:
             echo "ANDROID_NDK: ${ANDROID_NDK:-<unset>}"
             echo
             echo "=== step outcomes (success/failure/skipped) ==="
+            echo "wfvalidate  : ${{ steps.wfvalidate.outcome }}"
+            echo "hbstart     : ${{ steps.hbstart.outcome }}"
             echo "ping        : ${{ steps.ping.outcome }}"
             echo "checkout    : ${{ steps.checkout.outcome }}"
             echo "setup-java  : ${{ steps.setupjava.outcome }}"
