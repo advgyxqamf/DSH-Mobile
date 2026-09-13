@@ -162,13 +162,16 @@ jobs:
         env:
           ANDROID_NDK: ${{ env.ANDROID_NDK }}
           ANDROID_API: "24"
-        run: ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }} 2>&1 | tee /tmp/node-build.log
+        run: |
+          set -o pipefail
+          ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }} 2>&1 | tee /tmp/node-build.log
 
       - name: Build debug APK
         id: gradlebuild
         env:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
         run: |
+          set -o pipefail
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon 2>&1 | tee /tmp/gradle-build.log
 
