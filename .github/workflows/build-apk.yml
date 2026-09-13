@@ -6,6 +6,8 @@ name: Build Android Node Container APK
 #
 # 用法：把本仓库推到 GitHub → Actions → 手动 Run workflow（或 push 到 main/master 自动触发）
 #      → 完成后在 Artifacts 里下载 android-node-container-apk.zip，里面是 app-debug.apk。
+#
+# 注：诊断日志经 PAT（仓库 Secret）推到 ci-diag 分支，维护者在沙箱侧经 raw 通道读取。
 
 on:
   workflow_dispatch:
