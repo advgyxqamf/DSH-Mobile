@@ -21,6 +21,32 @@ jobs:
     permissions:
       contents: write
     steps:
+      # ---------------------------------------------------------------------------
+      # 连通性探针：在第一时间把 run 信息推到 ci-ping 分支。
+      # 目的：区分「CI 根本没启动」vs「CI 跑了但推送受阻」。
+      # 该步骤不依赖任何编译产物、不依赖 PAT(用自带 GITHUB_TOKEN)。
+      # 沙箱侧经 raw 通道(http://ghproxy.net/https://raw.githubusercontent.com/.../ci-ping/ping.txt)即可读到。
+      # ---------------------------------------------------------------------------
+      - name: Ping (push ci-ping branch to prove CI ran)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -x
+          git config --global --add safe.directory '*'
+          rm -rf /tmp/ping && mkdir -p /tmp/ping && cd /tmp/ping
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" .
+          {
+            echo "CI_PING_OK"
+            echo "time : $(date -u)"
+            echo "run  : ${{ github.run_id }}"
+            echo "sha  : ${{ github.sha }}"
+          } > ping.txt
+          git config user.email "ci@workbuddy.local"
+          git config user.name "CI Probe"
+          git add ping.txt
+          git commit -m "ci: ping"
+          git push origin HEAD:ci-ping --force
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -102,24 +128,28 @@ jobs:
           if-no-files-found: error
 
       # ---------------------------------------------------------------------------
-      # 成功自报：把 APK 作为 Release 资产发布（tag = ci-latest，每次强制更新）。
-      # 关键：Release 资产下载走 github.com 主机（ghproxy 放行），因此沙箱侧可直接
-      # 经 https://ghproxy.net/https://github.com/<repo>/releases/download/ci-latest/app-debug.apk
-      # 把 APK 抓回，彻底绕开“沙箱读不到 Actions API/Artifact”的限制。
-      # 用 workflow 自带 GITHUB_TOKEN（配合 permissions: contents: write），不依赖 PAT Secret。
+      # 成功自报：把构建成功标记推到 ci-ok 分支（raw 通道可读）。
+      # 用自带 GITHUB_TOKEN + permissions:contents=write，不依赖 PAT Secret。
       # ---------------------------------------------------------------------------
-      - name: Publish APK as Release asset (ci-latest)
+      - name: Mark success -> ci-ok branch
         if: success()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ci-latest
-          name: "CI latest build (${{ steps.nodever.outputs.tag }})"
-          files: app/build/outputs/apk/debug/app-debug.apk
-          make_latest: true
-          body: |
-            Automated build of the Android Node container.
-            Node: ${{ steps.nodever.outputs.tag }}
-            Artifact: app-debug.apk
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global --add safe.directory '*'
+          rm -rf /tmp/okpush && mkdir -p /tmp/okpush && cd /tmp/okpush
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" .
+          {
+            echo "BUILD_OK"
+            echo "time : $(date -u)"
+            echo "node : ${{ steps.nodever.outputs.tag }}"
+            echo "apk  : app/build/outputs/apk/debug/app-debug.apk"
+          } > ci-ok.txt
+          git config user.email "ci@workbuddy.local"
+          git config user.name "CI Diagnostic Bot"
+          git add ci-ok.txt
+          git commit -m "ci: build succeeded"
+          git push origin HEAD:ci-ok --force
 
       # ---------------------------------------------------------------------------
       # 失败自诊：沙箱侧无法直接访问 GitHub API/日志，故把报错汇总推到 ci-diag 分支，
@@ -151,17 +181,7 @@ jobs:
           } > diag/ci-failure-last.txt
           echo "----- diag file -----"; cat diag/ci-failure-last.txt
 
-          # 通道1(主): 用 gh CLI 把诊断发布成 ci-failed release 的资产。
-          # 资产下载走 github.com 主机，沙箱经 ghproxy 可直接抓取，不依赖分支推送权限。
-          if command -v gh >/dev/null 2>&1; then
-            gh release delete ci-failed --yes --cleanup-tag 2>/dev/null || true
-            gh release create ci-failed --title "CI failed diagnostics" --notes "automated failure log" \
-              diag/ci-failure-last.txt || echo "[warn] gh release create failed"
-          else
-            echo "[warn] gh not found; skipping release channel"
-          fi
-
-          # 通道2(备): 推 ci-diag 分支（完整 clone 规避 shallow 限制）。
+          # 推 ci-diag 分支（该通道已由 main 推送验证可用）。完整 clone 规避 shallow 限制。
           rm -rf /tmp/diagpush && mkdir -p /tmp/diagpush && cd /tmp/diagpush
           git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" . 2>/tmp/clone.err \
             || echo "[warn] clone failed: $(cat /tmp/clone.err 2>/dev/null)"
@@ -170,7 +190,7 @@ jobs:
           git config user.name "CI Diagnostic Bot"
           git add diag/ci-failure-last.txt 2>/dev/null || true
           git commit -m "ci: automated failure diagnostics" 2>/dev/null || true
-          git push origin HEAD:ci-diag --force 2>&1 || echo "[warn] branch push failed (non-fatal, release channel is primary)"
+          git push origin HEAD:ci-diag --force 2>&1 || echo "[warn] branch push failed"
           echo "--- diagnostics capture finished ---"
       - name: Upload failure diagnostics artifact (backup)
         if: failure()
