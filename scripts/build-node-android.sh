@@ -84,6 +84,61 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# V8 trap-handler 补丁（必须，否则 host 工具 mksnapshot 链接失败）：
+#
+#   现象: 链接 out/Release/mksnapshot 时报
+#           undefined reference to `v8::internal::trap_handler::TryHandleSignal(int, siginfo_t*, void*)'
+#           undefined reference to `v8::internal::trap_handler::RegisterDefaultTrapHandler()'
+#           undefined reference to `v8_internal_simulator_ProbeMemory'
+#
+#   根因: 交叉编译时 V8_HOST_ARCH_X64=1 且 V8_TARGET_ARCH_ARM64=1，
+#         trap-handler.h 的判定阶梯会命中 "Arm64 simulator on x64" 分支，
+#         设上 V8_TRAP_HANDLER_VIA_SIMULATOR + V8_TRAP_HANDLER_SUPPORTED true。
+#         但 simulator 的 ProbeMemory 只存在于 arm64 翻译单元，
+#         host(x64) 侧的 mksnapshot 自然链接不到这些符号。
+#
+#   修法: 把整条判定阶梯短路到 #else 分支（V8_TRAP_HANDLER_SUPPORTED false），
+#         与 Node 官方 android-patches/trap-handler.h.patch 目的一致
+#         （见 https://github.com/nodejs/node/issues/36287）。
+#
+#   注意: 官方的 patch 文件已过期，`patch -f` 会 "Hunk #1 FAILED"
+#         （上游把注释从 "Arm64 native" 改成了 "Arm64 (non-simulator)"），
+#         所以这里不调用 `./android-configure patch`，改用锚点替换。
+# ---------------------------------------------------------------------------
+TRAP_HDR="deps/v8/src/trap-handler/trap-handler.h"
+if [ -f "$TRAP_HDR" ]; then
+  echo "==> 应用 V8 trap-handler 补丁: $TRAP_HDR"
+  python3 - "$TRAP_HDR" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='replace').read()
+if 'android-container patch' in s:
+    print("  already patched, skip")
+    sys.exit(0)
+anchor = ("// X64 on Linux, Windows, MacOS, FreeBSD.\n"
+          "#if V8_HOST_ARCH_X64 && V8_TARGET_ARCH_X64 &&")
+if anchor not in s:
+    sys.exit("FATAL: trap-handler.h anchor not found; upstream layout changed, "
+             "patch needs review")
+new = ("// [android-container patch] force-disable the V8 trap handler for the\n"
+       "// Android cross build. See https://github.com/nodejs/node/issues/36287 :\n"
+       "// cross-compiling an arm64 target from an x64 host would match the\n"
+       "// 'Arm64 simulator on x64' branch and set V8_TRAP_HANDLER_VIA_SIMULATOR,\n"
+       "// but the simulator's ProbeMemory only exists in an arm64 translation\n"
+       "// unit, so host tools (mksnapshot) fail to link. Short-circuit the whole\n"
+       "// ladder down to '#else -> V8_TRAP_HANDLER_SUPPORTED false'.\n"
+       "#if 0\n"
+       "#if V8_HOST_ARCH_X64 && V8_TARGET_ARCH_X64 &&")
+s = s.replace(anchor, new, 1)
+open(p, 'w', encoding='utf-8').write(s)
+print("  patched:", p)
+PY
+  grep -n "android-container patch\|V8_TRAP_HANDLER_SUPPORTED false" "$TRAP_HDR" | head
+else
+  echo "==> [warn] $TRAP_HDR 不存在，跳过 trap-handler 补丁"
+fi
+
+# ---------------------------------------------------------------------------
 # 宿主工具链分离（必须在 android-configure 之前 export，否则 build 会在 ICU 阶段崩）：
 #
 #   现象: /bin/sh: 1: .../out/Release/icupkg: Exec format error
