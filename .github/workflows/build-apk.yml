@@ -34,8 +34,8 @@ jobs:
           ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKMANAGER" --licenses
-          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.2.12479018"
+          yes | "$SDKMANAGER" --licenses 2>&1 | tee -a /tmp/sdk-install.log
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.2.12479018" 2>&1 | tee -a /tmp/sdk-install.log
 
       - name: Install host build deps
         run: |
@@ -73,7 +73,7 @@ jobs:
         env:
           ANDROID_NDK: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
           ANDROID_API: "24"
-        run: ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }}
+        run: ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }} 2>&1 | tee /tmp/node-build.log
 
       - name: Set up Gradle
         uses: gradle/setup-gradle@v4
@@ -83,7 +83,7 @@ jobs:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug
+          ./gradlew assembleDebug 2>&1 | tee /tmp/gradle-build.log
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -91,3 +91,36 @@ jobs:
           name: android-node-container-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      # ---------------------------------------------------------------------------
+      # 失败自诊：沙箱侧无法直接访问 GitHub API/日志，故把报错汇总推到 ci-diag 分支，
+      # 通过 raw.githubusercontent.com（git/raw 流量可穿透 ghproxy）让维护者能读取。
+      # 仅在该 job 任一步骤失败时运行。
+      # ---------------------------------------------------------------------------
+      - name: Capture failure diagnostics -> ci-diag branch
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p diag
+          {
+            echo "=== CI failure diagnostics ==="
+            echo "run : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "node: ${{ steps.nodever.outputs.tag }}"
+            echo "ANDROID_SDK_ROOT: ${ANDROID_SDK_ROOT:-<unset>}"
+            echo
+            echo "=== sdk-install.log (tail 80) ==="
+            tail -80 /tmp/sdk-install.log 2>/dev/null || echo "(no sdk-install.log)"
+            echo
+            echo "=== node-build.log (tail 120) ==="
+            tail -120 /tmp/node-build.log 2>/dev/null || echo "(no node-build.log — failure occurred before Node build)"
+            echo
+            echo "=== gradle-build.log (tail 150) ==="
+            tail -150 /tmp/gradle-build.log 2>/dev/null || echo "(no gradle-build.log — failure before Gradle)"
+          } > diag/ci-failure-last.txt
+          git config user.email "ci@workbuddy.local"
+          git config user.name "CI Diagnostic Bot"
+          git add diag/ci-failure-last.txt
+          git commit -m "ci: automated failure diagnostics" || echo "(nothing to commit)"
+          git push "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git" HEAD:ci-diag --force \
+            || echo "(diag push failed — check GITHUB_TOKEN perms)"
