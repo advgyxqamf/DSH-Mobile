@@ -99,6 +99,31 @@ jobs:
           if-no-files-found: error
 
       # ---------------------------------------------------------------------------
+      # 成功自报：沙箱侧无法读 GitHub API，故把“构建成功”标记推到 ci-ok 分支，
+      # 通过 raw 通道让维护者经 ghproxy 自动感知“APK 已就绪”，无需人工盯 Actions。
+      # ---------------------------------------------------------------------------
+      - name: Mark success -> ci-ok branch
+        if: success()
+        env:
+          PAT: ${{ secrets.PAT }}
+        run: |
+          git config --global --add safe.directory '*'
+          rm -rf /tmp/okpush && mkdir -p /tmp/okpush && cd /tmp/okpush
+          git clone "https://x-access-token:${PAT}@github.com/${{ github.repository }}.git" .
+          {
+            echo "BUILD_OK"
+            echo "time : $(date -u)"
+            echo "node : ${{ steps.nodever.outputs.tag }}"
+            echo "apk  : app/build/outputs/apk/debug/app-debug.apk"
+            echo "grab : 仓库 Actions -> Artifacts -> android-node-container-apk"
+          } > ci-ok.txt
+          git config user.email "ci@workbuddy.local"
+          git config user.name "CI Diagnostic Bot"
+          git add ci-ok.txt
+          git commit -m "ci: build succeeded"
+          git push origin HEAD:ci-ok --force
+
+      # ---------------------------------------------------------------------------
       # 失败自诊：沙箱侧无法直接访问 GitHub API/日志，故把报错汇总推到 ci-diag 分支，
       # 通过 raw.githubusercontent.com（git/raw 流量可穿透 ghproxy）让维护者能读取。
       # 仅在该 job 任一步骤失败时运行。
