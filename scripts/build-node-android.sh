@@ -36,10 +36,11 @@ echo "==> 克隆 Node.js v${NODE_VERSION} 源码"
 git clone --depth 1 --branch "v${NODE_VERSION}" https://github.com/nodejs/node "$WORK/node"
 cd "$WORK/node"
 
-echo "==> 运行官方 android-configure (NDK 工具链 + ${ARCH} + API ${ANDROID_API})"
-# 参数顺序以 Node 官方文档为准: <ndk> [arch] [api_level]
+echo "==> 运行官方 android-configure (NDK ${ANDROID_NDK} + API ${ANDROID_API} + arch ${ARCH})"
+# Node 24 官方参数顺序: ./android-configure [patch] <path to the Android NDK> <Android SDK version> <target architecture>
+# 即 <ndk> <api> <arch>（注意：不是 <ndk> <arch> <api>）
 # 内部会: 把 CC/CXX/AR/LD 指向 NDK clang，并 ./configure --dest-os=android --dest-cpu=${ARCH}
-./android-configure "$ANDROID_NDK" "$ARCH" "$ANDROID_API"
+./android-configure "$ANDROID_NDK" "$ANDROID_API" "$ARCH"
 
 echo "==> 编译 (NDK r27+ 链接器默认 max-page-size=16384 → 16KB 页对齐)"
 make -j"$(nproc)"
