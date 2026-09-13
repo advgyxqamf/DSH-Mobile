@@ -24,28 +24,41 @@ jobs:
       # ---------------------------------------------------------------------------
       # 连通性探针：在第一时间把 run 信息推到 ci-ping 分支。
       # 目的：区分「CI 根本没启动」vs「CI 跑了但推送受阻」。
-      # 该步骤不依赖任何编译产物、不依赖 PAT(用自带 GITHUB_TOKEN)。
-      # 沙箱侧经 raw 通道(http://ghproxy.net/https://raw.githubusercontent.com/.../ci-ping/ping.txt)即可读到。
+      # 优先用 PAT（全权限，一定能推）；PAT 未配置时退回 GITHUB_TOKEN。
+      # 沙箱侧经 raw 通道即可读到，无需 API。
       # ---------------------------------------------------------------------------
       - name: Ping (push ci-ping branch to prove CI ran)
         env:
+          PAT: ${{ secrets.PAT }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -x
           git config --global --add safe.directory '*'
           rm -rf /tmp/ping && mkdir -p /tmp/ping && cd /tmp/ping
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" .
+          TOKEN_USE="${PAT}"
+          if [ -z "$TOKEN_USE" ]; then
+            echo "::warning::secrets.PAT is empty; falling back to GITHUB_TOKEN"
+            TOKEN_USE="${GH_TOKEN}"
+          fi
+          if ! git clone "https://x-access-token:${TOKEN_USE}@github.com/${{ github.repository }}.git" . ; then
+            echo "::error::ci-ping: git clone failed (token=${TOKEN_USE:0:8}...)"
+            exit 1
+          fi
           {
             echo "CI_PING_OK"
             echo "time : $(date -u)"
             echo "run  : ${{ github.run_id }}"
             echo "sha  : ${{ github.sha }}"
+            echo "token: $( [ -n "${PAT}" ] && echo PAT || echo GITHUB_TOKEN )"
           } > ping.txt
           git config user.email "ci@workbuddy.local"
           git config user.name "CI Probe"
           git add ping.txt
           git commit -m "ci: ping"
-          git push origin HEAD:ci-ping --force
+          if ! git push origin HEAD:ci-ping --force; then
+            echo "::error::ci-ping: git push failed — token has no write access"
+            exit 1
+          fi
+          echo "::notice::ci-ping pushed successfully"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -134,11 +147,13 @@ jobs:
       - name: Mark success -> ci-ok branch
         if: success()
         env:
+          PAT: ${{ secrets.PAT }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --global --add safe.directory '*'
+          TOKEN_USE="${PAT:-$GH_TOKEN}"
           rm -rf /tmp/okpush && mkdir -p /tmp/okpush && cd /tmp/okpush
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" .
+          git clone "https://x-access-token:${TOKEN_USE}@github.com/${{ github.repository }}.git" .
           {
             echo "BUILD_OK"
             echo "time : $(date -u)"
@@ -156,12 +171,14 @@ jobs:
       # 通过 raw.githubusercontent.com（git/raw 流量可穿透 ghproxy）让维护者能读取。
       # 仅在该 job 任一步骤失败时运行。
       # ---------------------------------------------------------------------------
-      - name: Capture failure diagnostics (write file + push branch + release asset)
+      - name: Capture failure diagnostics (write file + push branch)
         if: failure()
         env:
+          PAT: ${{ secrets.PAT }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config --global --add safe.directory '*'
+          TOKEN_USE="${PAT:-$GH_TOKEN}"
           mkdir -p diag
           {
             echo "=== CI failure diagnostics ==="
@@ -183,7 +200,7 @@ jobs:
 
           # 推 ci-diag 分支（该通道已由 main 推送验证可用）。完整 clone 规避 shallow 限制。
           rm -rf /tmp/diagpush && mkdir -p /tmp/diagpush && cd /tmp/diagpush
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" . 2>/tmp/clone.err \
+          git clone "https://x-access-token:${TOKEN_USE}@github.com/${{ github.repository }}.git" . 2>/tmp/clone.err \
             || echo "[warn] clone failed: $(cat /tmp/clone.err 2>/dev/null)"
           cp "$GITHUB_WORKSPACE/diag/ci-failure-last.txt" ./diag/ci-failure-last.txt 2>/dev/null || true
           git config user.email "ci@workbuddy.local"
