@@ -19,9 +19,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: "[TEST] force early failure to validate diag push"
-        run: exit 1
-
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -32,13 +29,17 @@ jobs:
         uses: android-actions/setup-android@v3
         # 该 action 会把 SDK 装到 $ANDROID_SDK_ROOT
 
-      - name: Install SDK packages (platform-tools / platform / build-tools / NDK r27)
+      - name: Install SDK packages (platform-tools / platform / build-tools / NDK)
         env:
           ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --licenses 2>&1 | tee -a /tmp/sdk-install.log
           "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.2.12479018" 2>&1 | tee -a /tmp/sdk-install.log
+          # 把实际装上的 NDK 版本透传给后续步骤（避免硬编码 build 号对不上 → 装失败）
+          NDK_VER=$(ls "$ANDROID_SDK_ROOT/ndk" 2>/dev/null | sort -V | tail -1)
+          echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/$NDK_VER" >> "$GITHUB_ENV"
+          echo "Resolved NDK -> $NDK_VER"
 
       - name: Install host build deps
         run: |
@@ -72,9 +73,9 @@ jobs:
           print("node-versions.json default ->", tag)
           PY
 
-      - name: Build Node for Android (NDK r27+ 交叉编译 arm64-v8a)
+      - name: Build Node for Android (NDK 交叉编译 arm64-v8a)
         env:
-          ANDROID_NDK: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+          ANDROID_NDK: ${{ env.ANDROID_NDK }}
           ANDROID_API: "24"
         run: ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }} 2>&1 | tee /tmp/node-build.log
 
@@ -103,31 +104,34 @@ jobs:
       - name: Capture failure diagnostics -> ci-diag branch
         if: failure()
         env:
-          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PAT: ${{ secrets.PAT }}
         run: |
           git config user.email "ci@workbuddy.local"
           git config user.name "CI Diagnostic Bot"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           mkdir -p diag
           {
             echo "=== CI failure diagnostics ==="
             echo "run : ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             echo "node: ${{ steps.nodever.outputs.tag }}"
             echo "ANDROID_SDK_ROOT: ${ANDROID_SDK_ROOT:-<unset>}"
+            echo "ANDROID_NDK: ${ANDROID_NDK:-<unset>}"
             echo
-            echo "=== sdk-install.log (tail 80) ==="
-            tail -80 /tmp/sdk-install.log 2>/dev/null || echo "(no sdk-install.log)"
+            echo "=== sdk-install.log (tail 100) ==="
+            tail -100 /tmp/sdk-install.log 2>/dev/null || echo "(no sdk-install.log)"
             echo
-            echo "=== node-build.log (tail 120) ==="
-            tail -120 /tmp/node-build.log 2>/dev/null || echo "(no node-build.log — failure occurred before Node build)"
+            echo "=== node-build.log (tail 150) ==="
+            tail -150 /tmp/node-build.log 2>/dev/null || echo "(no node-build.log — failure occurred before Node build)"
             echo
             echo "=== gradle-build.log (tail 150) ==="
             tail -150 /tmp/gradle-build.log 2>/dev/null || echo "(no gradle-build.log — failure before Gradle)"
           } > diag/ci-failure-last.txt
-          git add diag/ci-failure-last.txt
+          git add -A
           git commit -m "ci: automated failure diagnostics" || true
-          # 显式把 token 注入 origin 再推送（避免 persist-credentials 留下的凭证与 x-access-token 前缀冲突）
-          git remote set-url origin "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
-          git push origin HEAD:ci-diag --force
+          # 用全权限 PAT 推送（GITHUB_TOKEN 在本仓库无 push 新分支权限，改用 secrets.PAT）
+          git remote set-url origin "https://x-access-token:${PAT}@github.com/${{ github.repository }}.git"
+          echo "--- pushing diagnostics to ci-diag ---"
+          git push origin HEAD:ci-diag --force 2>&1 | tee /tmp/push.log || cat /tmp/push.log
       - name: Upload failure diagnostics artifact (backup)
         if: failure()
         uses: actions/upload-artifact@v4
