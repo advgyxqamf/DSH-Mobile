@@ -17,11 +17,13 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    # 硬超时：Node/V8 交叉编译正常在 40-90 分钟内完成。给到 150 分钟足够富余，
-    # 又能保证万一编译死锁（曾出现过 ping 之后 70 分钟零信号的情况）不会一路耗到
-    # GitHub 默认的 360 分钟。注意：超时会导致 job 被 cancel，而 `if: failure()`
-    # 对 cancel 不触发，所以超时路径由下面的 heartbeat 步骤负责留痕。
-    timeout-minutes: 150
+    # 硬超时。这个值调整过一次：原先 150 分钟，结果实测被 timeout 掐断
+    # （心跳 195 跳 ≈ 146 分钟后 job: cancelled，日志显示当时仍在编 host V8）。
+    # 原因是要编【两份 V8】：obj.host(x64) 供 mksnapshot 等宿主工具，
+    # obj.target(arm64) 才是最终产物；在 4 vCPU runner 上总时长远超 150 分钟。
+    # 现在：默认切了 ninja（快 20-40%），超时放宽到 330 分钟（5.5 小时），
+    # 既留足余量，又低于 GitHub 默认的 360 分钟上限，确保超时能留下明确记录。
+    timeout-minutes: 330
     # 发 Release 需要 contents:write；用 workflow 自带 GITHUB_TOKEN 即可，不依赖 PAT。
     permissions:
       contents: write
@@ -58,6 +60,13 @@ jobs:
               echo "stage: $stage"
               echo "run  : $RUN_ID"
               echo "sha  : $SHA"
+              # 日志体积与「编译行数」：判断「卡死」还是「在推进」的最直接依据。
+              # 15MB 的编译日志只看 tail 看不出速度，这两个数字能。
+              # 用 tail -c 限制扫描范围，避免每 45 秒全量扫 15MB 拖慢 runner。
+              if [ -f /tmp/node-build.log ]; then
+                echo "logsize: $(wc -c < /tmp/node-build.log 2>/dev/null || echo 0)"
+                echo "objs   : $(tail -c 400000 /tmp/node-build.log 2>/dev/null | grep -c 'Building CXX object\|clang++\|ninja' || echo 0)"
+              fi
             } > hb.txt
             git add hb.txt >/dev/null 2>&1
             git commit -q -m "hb $n ($stage)" >/dev/null 2>&1

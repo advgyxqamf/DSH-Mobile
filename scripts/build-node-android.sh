@@ -368,6 +368,42 @@ echo "==> 运行官方 android-configure (NDK ${ANDROID_NDK} + API ${ANDROID_API
 ./android-configure "$ANDROID_NDK" "$ANDROID_API" "$ARCH"
 
 # ---------------------------------------------------------------------------
+# 改用 Ninja 构建（性能关键）。
+#
+#   为什么: android_configure.py 内部那行是
+#       ./configure --dest-cpu=... --dest-os=android --openssl-no-asm --cross-compiling
+#   **没有 --ninja**，所以默认落到 make。而本工程要编【两份 V8】：
+#       obj.host/   → x64，给 mksnapshot 等宿主工具用
+#       obj.target/ → arm64，最终 node 二进制
+#   实测在 4 vCPU 的 GitHub runner 上，make 跑满 150 分钟仍在 host V8 阶段
+#   （心跳 195 跳后被 timeout-minutes 掐断，job: cancelled）。
+#   gyp 的 ninja 生成器不需要像 make 那样为每个目标 fork 子 make，
+#   V8 这种「几万个 .o、依赖图很深」的场景通常快 20-40%。
+#
+#   做法: android-configure 已经把 CC/CXX/GYP_DEFINES 等环境变量设好了，
+#         紧接着在【同一环境】下重跑一次 ./configure 并补上 --ninja，
+#         这样既能保留 Android 目标配置，又切换成 ninja 生成器。
+#         若 configure 失败（例如环境里的 python 版本不符），则回退 make，
+#         不因为一个性能优化把整个构建搞挂。
+# ---------------------------------------------------------------------------
+USE_NINJA=0
+if command -v ninja >/dev/null 2>&1; then
+  echo "==> 切换到 Ninja 生成器（重跑 configure，保留 android-configure 设好的环境）"
+  if ./configure --dest-cpu="${ARCH}" --dest-os=android --openssl-no-asm --cross-compiling --ninja 2>&1 | tail -20; then
+    if [ -f out/Release/build.ninja ]; then
+      USE_NINJA=1
+      echo "    [ok] out/Release/build.ninja 已生成，将用 ninja 构建"
+    else
+      echo "    [warn] configure 成功但没生成 build.ninja，回退 make"
+    fi
+  else
+    echo "    [warn] configure --ninja 失败，回退 make（构建继续，只是可能更慢）"
+  fi
+else
+  echo "==> [info] 未安装 ninja，使用 make"
+fi
+
+# ---------------------------------------------------------------------------
 # zlib cpufeatures 补丁（CI 实测验证版）：
 #
 #   现象: 链接期 ld.lld: error: undefined symbol: android_getCpuFeatures
@@ -423,7 +459,24 @@ else
 fi
 
 echo "==> 编译 (NDK r27+ 链接器默认 max-page-size=16384 → 16KB 页对齐)"
-make -j"$(nproc)"
+# 进度可见性：构建耗时以小时计，而 CI 侧只能靠心跳判断「还在跑 vs 卡死」。
+# 这里周期性打印一行进度（含时间戳），让 15MB 的日志里也能一眼看出推进速度。
+JOBS="$(nproc)"
+if [ "$USE_NINJA" = "1" ]; then
+  echo "==> 使用 ninja -j${JOBS} 构建"
+  # 注意：本脚本开着 set -euo pipefail，ninja 一旦失败脚本会直接退出，
+  # 因此不需要（也不能依赖）管道后的 PIPESTATUS 兜底。
+  # 这里只是把输出逐行转发、给进度行加时间戳，不做错误吞并。
+  ninja -C out/Release -j"${JOBS}" 2>&1 | while IFS= read -r line; do
+    printf '%s\n' "$line"
+    case "$line" in
+      \[*/*\]*) printf '[progress %s] %s\n' "$(date -u +%H:%M:%S)" "$line" ;;
+    esac
+  done
+else
+  echo "==> 使用 make -j${JOBS} 构建"
+  make -j"${JOBS}"
+fi
 
 echo "==> 拷贝产物到 $OUT_DIR/node"
 cp out/Release/node "$OUT_DIR/node"
