@@ -77,25 +77,37 @@ jobs:
           echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
           ls "$ANDROID_SDK_ROOT" 2>/dev/null || true
 
-      - name: Install SDK packages (platform-tools / platform / build-tools / NDK)
+      - name: Install SDK packages (platform-tools / platform / build-tools; NDK reused if present)
         env:
           ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
-          yes | "$SDKMANAGER" --licenses 2>&1 | tee -a /tmp/sdk-install.log
-          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" 2>&1 | tee -a /tmp/sdk-install.log
-          # NDK：不硬编码 build 号，先取 remote 上可用的 r27 列表，取最新一个安装。
-          NDK_PKG=$("$SDKMANAGER" --list 2>/dev/null | grep -oE 'ndk;27\.[0-9.]+' | sort -V | tail -1)
-          if [ -z "$NDK_PKG" ]; then
-            echo "[warn] no ndk;27.x found in remote list; falling back to any ndk"
-            NDK_PKG=$("$SDKMANAGER" --list 2>/dev/null | grep -oE 'ndk;[0-9.]+' | sort -V | tail -1)
-          fi
-          echo "Installing NDK package: $NDK_PKG"
-          "$SDKMANAGER" "$NDK_PKG" 2>&1 | tee -a /tmp/sdk-install.log
-          # 把实际装上的 NDK 版本透传给后续步骤（避免硬编码 build 号对不上 → 装失败）
+          echo "== sdkmanager: $SDKMANAGER"
+          "$SDKMANAGER" --version 2>&1 | tail -1
+
+          # 只接受 license，输出重定向到日志（避免刷屏/污染）
+          yes | "$SDKMANAGER" --licenses >/tmp/sdk-install.log 2>&1 || true
+
+          echo "== installing platform-tools / platform-34 / build-tools-34.0.0"
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" >>/tmp/sdk-install.log 2>&1 \
+            || { echo "[error] sdkmanager base install failed"; tail -40 /tmp/sdk-install.log; exit 1; }
+
+          # NDK：runner 镜像通常已自带（如 /usr/local/lib/android/sdk/ndk/<ver>）。
+          # 已有就直接复用，避免因某个具体 build 号在远端不存在而导致安装失败。
           NDK_VER=$(ls "$ANDROID_SDK_ROOT/ndk" 2>/dev/null | sort -V | tail -1)
+          if [ -n "$NDK_VER" ]; then
+            echo "== reusing preinstalled NDK: $NDK_VER"
+          else
+            echo "== no preinstalled NDK; resolving from remote list"
+            NDK_PKG=$("$SDKMANAGER" --list 2>/dev/null | grep -oE 'ndk;[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1)
+            echo "== installing NDK package: $NDK_PKG"
+            "$SDKMANAGER" "$NDK_PKG" >>/tmp/sdk-install.log 2>&1 \
+              || { echo "[error] NDK install failed"; tail -40 /tmp/sdk-install.log; exit 1; }
+            NDK_VER=$(ls "$ANDROID_SDK_ROOT/ndk" 2>/dev/null | sort -V | tail -1)
+          fi
           echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/$NDK_VER" >> "$GITHUB_ENV"
-          echo "Resolved NDK -> $NDK_VER"
+          echo "== resolved ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/$NDK_VER"
+          ls "$ANDROID_SDK_ROOT/ndk/$NDK_VER" 2>/dev/null | head
 
       - name: Install host build deps
         run: |
@@ -105,9 +117,13 @@ jobs:
       - name: Resolve latest Node 24.x tag
         id: nodever
         run: |
-          TAG=$(git ls-remote --tags https://github.com/nodejs/node \
+          TAG=$(git ls-remote --tags https://github.com/nodejs/node 2>/dev/null \
             | grep -oE 'refs/tags/v24\.[0-9]+\.[0-9]+$' \
             | sed 's#refs/tags/v##' | sort -V | tail -1)
+          if [ -z "$TAG" ]; then
+            echo "[warn] could not resolve latest v24.x tag via ls-remote; falling back to 24.21.0"
+            TAG="24.21.0"
+          fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Resolved Node 24.x -> $TAG"
 
@@ -196,8 +212,9 @@ jobs:
             echo "ANDROID_SDK_ROOT: ${ANDROID_SDK_ROOT:-<unset>}"
             echo "ANDROID_NDK: ${ANDROID_NDK:-<unset>}"
             echo
-            echo "=== sdk-install.log (tail 100) ==="
-            tail -100 /tmp/sdk-install.log 2>/dev/null || echo "(no sdk-install.log)"
+            echo "=== sdk-install.log (filtered tail 60, license noise removed) ==="
+            grep -viE "warranty|liability|indemnif|export regulation|severability|pre-release|evaluation license|open source software|MIPS|Accept\? \(y/N\)|YOUR USE OF|Google is the parent|third party beneficiaries|EXPORT RESTRICTIONS|governing law|Santa Clara|conflict of laws" /tmp/sdk-install.log 2>/dev/null | tail -60 \
+              || echo "(no sdk-install.log)"
             echo
             echo "=== node-build.log (tail 150) ==="
             tail -150 /tmp/node-build.log 2>/dev/null || echo "(no node-build.log — failure occurred before Node build)"
