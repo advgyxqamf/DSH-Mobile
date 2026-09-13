@@ -104,36 +104,134 @@ fi
 #   注意: 官方的 patch 文件已过期，`patch -f` 会 "Hunk #1 FAILED"
 #         （上游把注释从 "Arm64 native" 改成了 "Arm64 (non-simulator)"），
 #         所以这里不调用 `./android-configure patch`，改用锚点替换。
+#
+#   踩过的坑（勿重犯）: 最初的做法是在第一个 #if 前面另插一个 `#if 0`，
+#         想让整条阶梯短路。但那会让 #if/#endif 失去配对，编译器直接报
+#         `trap-handler.h:5:2: error: unterminated conditional directive`，
+#         整个头文件后续内容被吞掉，接着爆出几十条荒谬的
+#         `no member named 'ArrayBuffer' in namespace 'v8::internal::trap_handler::v8'`。
+#         正确做法是**不增删任何条件指令**，只给判定块里的 #if 与每个 #elif
+#         的条件前面 AND 一个恒假项（`0 && ...`）。指令种类与配对保持逐字节不变。
+#         另外只改第一个 #if 是不够的：后面的 #elif（arm64 simulator on x64）
+#         仍会命中，所以 6 个 #elif 必须一并置为恒假。
 # ---------------------------------------------------------------------------
 TRAP_HDR="deps/v8/src/trap-handler/trap-handler.h"
 if [ -f "$TRAP_HDR" ]; then
   echo "==> 应用 V8 trap-handler 补丁: $TRAP_HDR"
   python3 - "$TRAP_HDR" <<'PY'
-import sys
+import re, sys
 p = sys.argv[1]
 s = open(p, encoding='utf-8', errors='replace').read()
 if 'android-container patch' in s:
     print("  already patched, skip")
     sys.exit(0)
-anchor = ("// X64 on Linux, Windows, MacOS, FreeBSD.\n"
-          "#if V8_HOST_ARCH_X64 && V8_TARGET_ARCH_X64 &&")
-if anchor not in s:
-    sys.exit("FATAL: trap-handler.h anchor not found; upstream layout changed, "
+
+START = "// X64 on Linux, Windows, MacOS, FreeBSD."
+END = "// Everything else is unsupported."
+if START not in s or END not in s:
+    sys.exit("FATAL: trap-handler.h anchors not found; upstream layout changed, "
              "patch needs review")
-new = ("// [android-container patch] force-disable the V8 trap handler for the\n"
-       "// Android cross build. See https://github.com/nodejs/node/issues/36287 :\n"
-       "// cross-compiling an arm64 target from an x64 host would match the\n"
-       "// 'Arm64 simulator on x64' branch and set V8_TRAP_HANDLER_VIA_SIMULATOR,\n"
-       "// but the simulator's ProbeMemory only exists in an arm64 translation\n"
-       "// unit, so host tools (mksnapshot) fail to link. Short-circuit the whole\n"
-       "// ladder down to '#else -> V8_TRAP_HANDLER_SUPPORTED false'.\n"
-       "#if 0\n"
-       "#if V8_HOST_ARCH_X64 && V8_TARGET_ARCH_X64 &&")
-s = s.replace(anchor, new, 1)
+
+i = s.index(START)
+j = s.index(END)
+block = s[i:j]
+
+n_if = len(re.findall(r"^#if ", block, flags=re.M))
+n_elif = len(re.findall(r"^#elif ", block, flags=re.M))
+if n_if != 1 or n_elif < 1:
+    sys.exit("FATAL: unexpected conditional structure in trap-handler ladder "
+             "(#if=%d #elif=%d); patch needs review" % (n_if, n_elif))
+
+new_block = ("// [android-container patch] Force every branch of the ladder below to be\n"
+             "// false so control falls through to '#else -> V8_TRAP_HANDLER_SUPPORTED\n"
+             "// false'. See https://github.com/nodejs/node/issues/36287 : cross-compiling\n"
+             "// an arm64 target from an x64 host otherwise matches the 'Arm64 simulator\n"
+             "// on x64' branch, setting V8_TRAP_HANDLER_VIA_SIMULATOR -- but the\n"
+             "// simulator's ProbeMemory only exists in an arm64 translation unit, so the\n"
+             "// x64 host tool mksnapshot cannot link.\n"
+             "// We AND a false term into each condition rather than wrapping the block in\n"
+             "// an extra '#if 0', because adding a directive would unbalance\n"
+             "// #if/#endif and the compiler would fail with 'unterminated conditional\n"
+             "// directive', swallowing the rest of this header.\n"
+             + re.sub(r"^#if (?!0 &&)", "#if 0 && ", block, count=1, flags=re.M)
+             )
+new_block = re.sub(r"^#elif (?!0 &&)", "#elif 0 && ", new_block, flags=re.M)
+
+s = s[:i] + new_block + s[j:]
 open(p, 'w', encoding='utf-8').write(s)
-print("  patched:", p)
+print("  patched: neutralised 1 #if + %d #elif" % n_elif)
 PY
-  grep -n "android-container patch\|V8_TRAP_HANDLER_SUPPORTED false" "$TRAP_HDR" | head
+  # 自动断言（两道）：
+  #   1) 结构检查：条件指令必须配平 —— 防止再犯 "unterminated conditional
+  #      directive" 那种把整个头文件吞掉的错。
+  #   2) 语义检查：把判定阶梯单独抽出来，按真实构建的宏环境
+  #      （x64 宿主 / arm64 目标 / linux+android）做一次预处理求值，
+  #      要求 V8_TRAP_HANDLER_SUPPORTED 必须求值为 0。
+  #      注意：这里必须"真求值"，不能靠文本匹配 —— 曾经写过
+  #      `s.replace("0 && ","")` 再找 arm64-simulator 分支的断言，那是反向
+  #      逻辑（剥掉补丁标记后必然命中原始文本），会让补丁成功时反而报 FATAL。
+  python3 - "$TRAP_HDR" <<'PY'
+import re, sys, os, subprocess, tempfile
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+
+# --- 1) 结构：条件指令配平 ---
+depth = 0
+for line in s.splitlines():
+    if re.match(r"^#\s*(if|ifdef|ifndef)\b", line):
+        depth += 1
+    elif re.match(r"^#\s*endif\b", line):
+        depth -= 1
+    if depth < 0:
+        sys.exit("FATAL: trap-handler.h has an extra #endif (depth went negative)")
+if depth != 0:
+    sys.exit("FATAL: trap-handler.h conditional directives are unbalanced "
+             "(depth=%d) -- this is exactly the 'unterminated conditional "
+             "directive' bug; refusing to build." % depth)
+print("  [ok] conditional directives balanced (depth=0)")
+
+# --- 2) 语义：真实求值 ---
+START = "// X64 on Linux, Windows, MacOS, FreeBSD."
+END = "// Everything else is unsupported."
+if START not in s or END not in s:
+    sys.exit("FATAL: cannot locate trap-handler ladder for semantic check")
+ladder = s[s.index(START):s.index(END)]
+
+defs = {"V8_HOST_ARCH_X64": 1, "V8_HOST_ARCH_ARM64": 0, "V8_HOST_ARCH_IA32": 0,
+        "V8_HOST_ARCH_ARM": 0, "V8_HOST_ARCH_PPC64": 0, "V8_HOST_ARCH_S390X": 0,
+        "V8_HOST_ARCH_RISCV64": 0, "V8_HOST_ARCH_LOONG64": 0,
+        "V8_TARGET_ARCH_X64": 0, "V8_TARGET_ARCH_ARM64": 1, "V8_TARGET_ARCH_IA32": 0,
+        "V8_TARGET_ARCH_ARM": 0, "V8_TARGET_ARCH_PPC64": 0, "V8_TARGET_ARCH_S390X": 0,
+        "V8_TARGET_ARCH_RISCV64": 0, "V8_TARGET_ARCH_LOONG64": 0,
+        "V8_OS_LINUX": 1, "V8_OS_ANDROID": 1, "V8_OS_WIN": 0, "V8_OS_DARWIN": 0,
+        "V8_OS_FREEBSD": 0, "V8_OS_AIX": 0}
+hdr = "\n".join("#define %s %d" % (k, v) for k, v in defs.items())
+prog = (hdr + "\n" + ladder +
+        "\n#else\n#define V8_TRAP_HANDLER_SUPPORTED 0\n#endif\n"
+        "int probe_val = V8_TRAP_HANDLER_SUPPORTED;\n")
+
+with tempfile.TemporaryDirectory() as d:
+    f = os.path.join(d, "probe.cpp")
+    open(f, "w").write(prog)
+    r = subprocess.run(["g++", "-std=c++20", "-E", "-P", f],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("FATAL: trap-handler semantic probe failed to preprocess:\n"
+                 + r.stderr[:1500])
+    m = re.search(r"int probe_val = (\w+);", r.stdout)
+    val = m.group(1) if m else None
+if val == "0":
+    print("  [ok] semantic check: x64-host/arm64-target -> "
+          "V8_TRAP_HANDLER_SUPPORTED = false (trap handler disabled)")
+elif val is None:
+    sys.exit("FATAL: could not evaluate V8_TRAP_HANDLER_SUPPORTED "
+             "(preprocessor output did not contain the probe line)")
+else:
+    sys.exit("FATAL: V8_TRAP_HANDLER_SUPPORTED evaluated to %r for "
+             "x64-host/arm64-target; the arm64-simulator branch is still live "
+             "and mksnapshot will fail to link." % val)
+PY
+  grep -c "^#if 0 && \|^#elif 0 && " "$TRAP_HDR" | sed 's/^/  neutralised branches: /'
 else
   echo "==> [warn] $TRAP_HDR 不存在，跳过 trap-handler 补丁"
 fi
