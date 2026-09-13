@@ -1,0 +1,17 @@
+# 构建产物
+.gradle/
+app/build/
+build/
+local.properties
+*.iml
+.idea/
+
+# 编译出的 Node 二进制（体积大，按需本地生成，不入库）
+app/src/main/assets/node-bin/
+
+# OTA 发布包
+release/
+
+# 沙箱产物
+*.log
+.DS_Store

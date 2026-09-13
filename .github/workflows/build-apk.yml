@@ -1,0 +1,66 @@
+name: Build Android Node Container APK
+
+# 这个工作流存在的意义：CI 运行器有完整的公网（能访问 dl.google.com），
+# 而本仓库作者所在的沙箱环境外网被白名单限制、无法下载 Android SDK/NDK。
+# 因此“出包”交给 GitHub Actions：一键编译出可安装的 debug APK 作为构件(artifact)下载。
+#
+# 用法：把本仓库推到 GitHub → Actions → 手动 Run workflow（或 push 到 main/master 自动触发）
+#      → 完成后在 Artifacts 里下载 android-node-container-apk.zip，里面是 app-debug.apk。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        # 该 action 会把 SDK 装到 $ANDROID_SDK_ROOT
+
+      - name: Install SDK packages (platform-tools / platform / build-tools / NDK r27)
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
+        run: |
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.2.12479018"
+
+      - name: Install host build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git python3 ninja cmake make zip
+
+      - name: Build Node for Android (NDK r27+ 交叉编译 arm64-v8a)
+        env:
+          ANDROID_NDK: ${{ env.ANDROID_SDK_ROOT }}/ndk/27.2.12479018
+          ANDROID_API: "24"
+        run: ./scripts/build-node-android.sh 24.21.0
+
+      - name: Set up Gradle
+        uses: gradle/setup-gradle@v4
+
+      - name: Build debug APK
+        env:
+          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-node-container-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
