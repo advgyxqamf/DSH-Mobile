@@ -207,17 +207,21 @@ jobs:
           } > diag/ci-failure-last.txt
           echo "----- diag file -----"; cat diag/ci-failure-last.txt
 
-          # 推 ci-diag 分支（该通道已由 main 推送验证可用）。完整 clone 规避 shallow 限制。
+          # 推 ci-diag 分支（该通道已由 ci-ping 验证可用）。
+          # 用 clone 出来的独立目录，并显式 mkdir/copy/add/commit，避免被静默吞错。
           rm -rf /tmp/diagpush && mkdir -p /tmp/diagpush && cd /tmp/diagpush
-          git clone "https://x-access-token:${TOKEN_USE}@github.com/${{ github.repository }}.git" . 2>/tmp/clone.err \
-            || echo "[warn] clone failed: $(cat /tmp/clone.err 2>/dev/null)"
-          cp "$GITHUB_WORKSPACE/diag/ci-failure-last.txt" ./diag/ci-failure-last.txt 2>/dev/null || true
+          git clone "https://x-access-token:${TOKEN_USE}@github.com/${{ github.repository }}.git" .
+          mkdir -p diag
+          cp "$GITHUB_WORKSPACE/diag/ci-failure-last.txt" diag/ci-failure-last.txt
+          echo "[check] diag dir now contains:"; ls -la diag/
           git config user.email "ci@workbuddy.local"
           git config user.name "CI Diagnostic Bot"
-          git add diag/ci-failure-last.txt 2>/dev/null || true
-          git commit -m "ci: automated failure diagnostics" 2>/dev/null || true
-          git push origin HEAD:ci-diag --force 2>&1 || echo "[warn] branch push failed"
-          echo "--- diagnostics capture finished ---"
+          git add -f diag/ci-failure-last.txt
+          echo "[check] staged files:"; git status --short
+          git commit -m "ci: automated failure diagnostics"
+          echo "[check] commit created:"; git log --oneline -1
+          git push origin HEAD:ci-diag --force
+          echo "--- diagnostics pushed: $(git rev-parse HEAD) ---"
       - name: Upload failure diagnostics artifact (backup)
         if: failure()
         uses: actions/upload-artifact@v4
