@@ -257,48 +257,109 @@ fi
 #         out/Release/icupkg 从 aarch64 变为
 #         'ELF 64-bit LSB pie executable, x86-64' 且可正常运行。
 #
-#   为什么宿主编译器优先用 NDK 自带的 clang（而不是系统 gcc）：
-#         V8/v8_compiler 等 host 目标大量使用 Clang 专有扩展与警告开关
-#         （如 -Wno-nullability-completeness）。用 gcc 编会退化成
-#         'cc1plus: note: unrecognized command-line option'，
-#         且 V8 源码本就按 Clang 预期编写。NDK 的
-#         toolchains/llvm/prebuilt/<host>/bin/clang 不带 target 前缀时，
-#         默认 target 就是构建机自身（实测 x86_64-unknown-linux-gnu），
-#         等于「与目标编译器同源的 clang」，兼容性最好。
+#   为什么宿主编译器**不能**用 NDK 自带的 clang：
+#         这是本脚本踩过的第二个大坑。最初的想法是「用 NDK 自带的 clang 当宿主编译器，
+#         与目标编译器同源、兼容性最好」，架构断言（x86-64）也确实通过了。
+#         但宿主编译器**不只是要产出 x86-64，还要能链接宿主的 libstdc++ 与 libatomic**。
+#         NDK 的 toolchains/llvm/prebuilt/<host>/bin/clang 虽然默认 target 是
+#         x86_64-unknown-linux-gnu，但它的 sysroot / 库搜索路径指向 **Android 目标**：
+#           - 找不到宿主 C++ 标准库头（实测直接 fatal error: 'atomic' file not found）
+#           - NDK 里只有 aarch64/arm 版 libatomic.a，**没有 x86_64 宿主版**
+#         结果就是 mksnapshot 这类 host 工具链接失败：
+#             ld.lld: error: undefined symbol: __atomic_compare_exchange
+#             >>> referenced by wasm-objects.cc / wasm-code-pointer-table.cc
+#             make[1]: *** [tools/v8_gypfiles/mksnapshot.host.mk:230: .../mksnapshot] Error 1
+#         官方 NDK 文档对此有明确说明（https://developer.android.google.cn/ndk/guides/common-problems）：
+#             "Undefined reference to __atomic_* — Some ABIs need libatomic …
+#              Solution: Add -latomic when linking."
+#         且 NDK r23+ 不再自动链接 libatomic，必须显式处理。
+#
+#   修法（双保险）：
+#         1) 宿主编译器优先用**系统 clang**（有完整宿主 sysroot、宿主 libstdc++ 与 libatomic）。
+#            但必须**实测可编译**才采用 —— 不同镜像的 clang 可能缺 C++ 头
+#            （沙箱里就出现过 clang 指向不存在的 gcc-14 include 路径而报 'atomic' not found）。
+#            因此这里对候选编译器逐个跑「编译 + 链接」探针，挑第一个真正能用的。
+#         2) 给宿主链接显式加 -latomic（走 LDFLAGS_host），兜住 outline atomics。
 # ---------------------------------------------------------------------------
-NDK_HOST_BIN="$(ls -d "$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin 2>/dev/null | head -1)"
+# 候选顺序：环境变量显式指定 > 系统 clang > 系统 gcc > NDK clang（最后手段）
 HOST_CC="${CC_host:-}"
 HOST_CXX="${CXX_host:-}"
-if [ -z "$HOST_CC" ] && [ -n "$NDK_HOST_BIN" ] && [ -x "$NDK_HOST_BIN/clang" ]; then
-  HOST_CC="$NDK_HOST_BIN/clang"
-fi
-if [ -z "$HOST_CXX" ] && [ -n "$NDK_HOST_BIN" ] && [ -x "$NDK_HOST_BIN/clang++" ]; then
-  HOST_CXX="$NDK_HOST_BIN/clang++"
-fi
-HOST_CC="${HOST_CC:-$(command -v clang || command -v gcc)}"
-HOST_CXX="${HOST_CXX:-$(command -v clang++ || command -v g++)}"
-if [ -z "$HOST_CC" ] || [ -z "$HOST_CXX" ]; then
-  echo "==> [error] 找不到宿主编译器 (clang/gcc)，交叉编译无法产出可运行的 host 工具"
+NDK_HOST_BIN="$(ls -d "$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin 2>/dev/null | head -1)"
+
+# 宿主编译器可用性探针：必须能「编译并链接」一段用到 C++ 标准库 + 原子操作的代码。
+# 只测能不能产出 x86-64 是不够的 —— 那正是 NDK clang 当初骗过断言的原因。
+probe_host_compiler() {
+  local cxx="$1" tag="$2"
+  [ -n "$cxx" ] || return 1
+  command -v "$cxx" >/dev/null 2>&1 || [ -x "$cxx" ] || return 1
+  cat > "$WORK/host_probe.cpp" <<'PROBE'
+#include <atomic>
+#include <cstdio>
+#include <string>
+#include <memory>
+int main() {
+    int v = 0, exp = 0;
+    __atomic_compare_exchange_n(&v, &exp, 1, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+    std::string s = "ok";
+    auto p = std::make_shared<int>(42);
+    std::printf("%s %d %d\n", s.c_str(), v, *p);
+    return 0;
+}
+PROBE
+  if "$cxx" -m64 -std=gnu++20 "$WORK/host_probe.cpp" -o "$WORK/host_probe.out" -latomic >/dev/null 2>&1; then
+    local info; info="$(file -b "$WORK/host_probe.out" 2>/dev/null || echo unknown)"
+    case "$info" in
+      *x86-64*)
+        echo "    [ok] $tag -> $cxx (x86-64, C++20 + stdlib + atomics 全部可用)"
+        return 0 ;;
+      *)
+        echo "    [skip] $tag -> $cxx 产出非 x86-64: $info"
+        return 1 ;;
+    esac
+  else
+    echo "    [skip] $tag -> $cxx 探针编译/链接失败（缺宿主 C++ 头或 libatomic）"
+    return 1
+  fi
+}
+
+echo "==> 挑选宿主编译器（逐个实测）"
+HOST_CXX_PICKED=""
+for cand in \
+  "${CXX_host:-}" \
+  "$(command -v clang++ 2>/dev/null)" \
+  "/usr/bin/clang++" \
+  "$(command -v g++ 2>/dev/null)" \
+  "/usr/bin/g++" \
+  "${NDK_HOST_BIN:+$NDK_HOST_BIN/clang++}"
+do
+  [ -n "$cand" ] || continue
+  if probe_host_compiler "$cand" "host-cxx"; then
+    HOST_CXX_PICKED="$cand"
+    break
+  fi
+done
+if [ -z "$HOST_CXX_PICKED" ]; then
+  echo "==> [error] 找不到能用的宿主编译器。宿主构建（icupkg/mksnapshot 等）无法完成。"
+  echo "    请安装 clang++ 或 g++ 以及 libstdc++/libatomic 开发包后重试。"
   exit 1
 fi
-# 断言：宿主编译器必须产出宿主架构（而非 ARM）二进制，否则后面必然 Exec format error
-echo "==> 校验宿主编译器产物架构"
-printf 'int main(void){return 0;}\n' > "$WORK/host_cc_probe.c"
-if "$HOST_CC" "$WORK/host_cc_probe.c" -o "$WORK/host_cc_probe.out" 2>/dev/null; then
-  HOST_ARCH_INFO="$(file -b "$WORK/host_cc_probe.out" 2>/dev/null || echo unknown)"
-  echo "    $HOST_ARCH_INFO"
-  case "$HOST_ARCH_INFO" in
-    *x86-64*) echo "    [ok] 宿主编译器产出 x86-64" ;;
-    *) echo "    [error] 宿主编译器产出非宿主架构: $HOST_ARCH_INFO"; exit 1 ;;
-  esac
-else
-  echo "    [warn] 无法编译探针文件，继续（后续若 Exec format error 请回看此处）"
-fi
+HOST_CXX="$HOST_CXX_PICKED"
+# 对应的 C 编译器：与 C++ 同源（clang++->clang, g++->gcc）
+case "$HOST_CXX" in
+  */clang++|clang++) HOST_CC="$(dirname "$HOST_CXX")/clang"; [ -x "$HOST_CC" ] || HOST_CC="$(command -v clang || echo "$HOST_CXX")" ;;
+  */g++|g++)         HOST_CC="$(dirname "$HOST_CXX")/gcc";   [ -x "$HOST_CC" ] || HOST_CC="$(command -v gcc || echo "$HOST_CXX")" ;;
+  *)                 HOST_CC="${CC_host:-$(command -v clang || command -v gcc)}" ;;
+esac
+echo "==> 宿主编译器确定: CXX_host=$HOST_CXX  CC_host=$HOST_CC"
 export CC_host="$HOST_CC"
 export CXX_host="$HOST_CXX"
 export LINK_host="$HOST_CXX"
 export AR_host="${AR_host:-$(command -v ar || echo ar)}"
-echo "==> 宿主工具链: CC_host=$CC_host  CXX_host=$CXX_host  AR_host=$AR_host"
+
+# 宿主链接标志：显式补 -latomic（NDK r23+ 不再自动链接；官方文档要求手动加）。
+# 只作用于 host 目标，不影响 Android 目标产物。
+export LDFLAGS_host="${LDFLAGS_host:-} -latomic"
+echo "==> 宿主工具链: CC_host=$CC_host  CXX_host=$CXX_host  AR_host=$AR_host  LDFLAGS_host=$LDFLAGS_host"
 
 echo "==> 运行官方 android-configure (NDK ${ANDROID_NDK} + API ${ANDROID_API} + arch ${ARCH})"
 # Node 24 官方参数顺序: ./android-configure [patch] <path to the Android NDK> <Android SDK version> <target architecture>
