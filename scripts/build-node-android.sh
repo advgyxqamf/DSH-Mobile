@@ -89,6 +89,61 @@ echo "==> 运行官方 android-configure (NDK ${ANDROID_NDK} + API ${ANDROID_API
 # 内部会: 把 CC/CXX/AR/LD 指向 NDK clang，并 ./configure --dest-os=android --dest-cpu=${ARCH}
 ./android-configure "$ANDROID_NDK" "$ANDROID_API" "$ARCH"
 
+# ---------------------------------------------------------------------------
+# zlib cpufeatures 补丁（CI 实测验证版）：
+#
+#   现象: 链接期 ld.lld: error: undefined symbol: android_getCpuFeatures
+#         >>> referenced by cpu_features.c
+#             .../obj.target/zlib/deps/zlib/cpu_features.o:(_cpu_check_features)
+#             in archive .../obj.target/deps/zlib/libzlib.a
+#
+#   根因: gyp 在 OS=="android" 时给 zlib 目标注入 -DARMV8_OS_ANDROID
+#         （见 gyp 产物 out/deps/zlib/zlib.target.mk 与 zlib_arm_crc32.target.mk），
+#         于是 deps/zlib/cpu_features.c 走 Android 分支:
+#             #include <cpu-features.h>
+#             android_getCpuFeatures();
+#         该符号由 NDK 的 sources/android/cpufeatures 提供；
+#         但 NDK r23+ 已移除该目录，common.gypi 却仍注入
+#             -I$(android_ndk_path)/sources/android/cpufeatures
+#         （CI 上指向不存在的路径），所以既编得过又链不上。
+#
+#   修法: 把 zlib 目标的 -DARMV8_OS_ANDROID 换成 -DARMV8_OS_LINUX。
+#         cpu_features.c 的 Linux 分支用 getauxval(AT_HWCAP) + HWCAP_CRC32/PMULL,
+#         而 bionic 的 <asm/hwcap.h> 提供了这些常量、libc 也导出 getauxval，
+#         因此无需任何额外库，且 CRC32/PMULL 反而是"真检测"而非硬编码。
+#
+#   注意: 补丁必须打在 gyp 生成的 Makefile 上（而不是 config.gypi）——
+#         ARMV8_OS_ANDROID 是 gyp 条件展开出的 -D，config.gypi 里根本不存在。
+#         实测证据: 打补丁后 cpu_features.o 的未定义符号从
+#         `U android_getCpuFeatures` 变为 `U getauxval`（libc 提供）。
+# ---------------------------------------------------------------------------
+ZMK_DIR="out/deps/zlib"
+if [ -d "$ZMK_DIR" ]; then
+  echo "==> 修补 gyp 生成的 zlib 目标: ARMV8_OS_ANDROID -> ARMV8_OS_LINUX"
+  python3 - "$ZMK_DIR" <<'PY'
+import os, sys, glob
+d = sys.argv[1]
+total = 0
+for f in sorted(glob.glob(os.path.join(d, "*.target.mk")) +
+                glob.glob(os.path.join(d, "*.host.mk"))):
+    s = open(f, encoding="utf-8", errors="replace").read()
+    n = s.count("-DARMV8_OS_ANDROID")
+    if n:
+        s = s.replace("-DARMV8_OS_ANDROID", "-DARMV8_OS_LINUX")
+        open(f, "w", encoding="utf-8").write(s)
+        print("  patched %s (%d occurrence(s))" % (os.path.basename(f), n))
+        total += n
+print("  total replaced:", total)
+if total == 0:
+    sys.exit("FATAL: no -DARMV8_OS_ANDROID found in zlib gyp makefiles; "
+             "upstream layout changed, patch needs review")
+PY
+  echo "==> 补丁后核对（应只剩 ARMV8_OS_LINUX）:"
+  grep -h "ARMV8_OS" "$ZMK_DIR"/*.target.mk | sort -u
+else
+  echo "==> [warn] $ZMK_DIR 不存在，跳过 zlib 补丁"
+fi
+
 echo "==> 编译 (NDK r27+ 链接器默认 max-page-size=16384 → 16KB 页对齐)"
 make -j"$(nproc)"
 
