@@ -69,9 +69,13 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        # 该 action 会把 SDK 装到 $ANDROID_SDK_ROOT
+      # 说明：ubuntu-latest runner 自带 Android SDK（$ANDROID_SDK_ROOT / $ANDROID_HOME 已设置）。
+      # 不使用第三方 setup-android action，避免“action 仓库解析不到导致 Set up job 直接失败”。
+      - name: Show Android SDK env
+        run: |
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+          ls "$ANDROID_SDK_ROOT" 2>/dev/null || true
 
       - name: Install SDK packages (platform-tools / platform / build-tools / NDK)
         env:
@@ -79,7 +83,15 @@ jobs:
         run: |
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           yes | "$SDKMANAGER" --licenses 2>&1 | tee -a /tmp/sdk-install.log
-          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;27.2.12479018" 2>&1 | tee -a /tmp/sdk-install.log
+          "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" 2>&1 | tee -a /tmp/sdk-install.log
+          # NDK：不硬编码 build 号，先取 remote 上可用的 r27 列表，取最新一个安装。
+          NDK_PKG=$("$SDKMANAGER" --list 2>/dev/null | grep -oE 'ndk;27\.[0-9.]+' | sort -V | tail -1)
+          if [ -z "$NDK_PKG" ]; then
+            echo "[warn] no ndk;27.x found in remote list; falling back to any ndk"
+            NDK_PKG=$("$SDKMANAGER" --list 2>/dev/null | grep -oE 'ndk;[0-9.]+' | sort -V | tail -1)
+          fi
+          echo "Installing NDK package: $NDK_PKG"
+          "$SDKMANAGER" "$NDK_PKG" 2>&1 | tee -a /tmp/sdk-install.log
           # 把实际装上的 NDK 版本透传给后续步骤（避免硬编码 build 号对不上 → 装失败）
           NDK_VER=$(ls "$ANDROID_SDK_ROOT/ndk" 2>/dev/null | sort -V | tail -1)
           echo "ANDROID_NDK=$ANDROID_SDK_ROOT/ndk/$NDK_VER" >> "$GITHUB_ENV"
@@ -123,15 +135,12 @@ jobs:
           ANDROID_API: "24"
         run: ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }} 2>&1 | tee /tmp/node-build.log
 
-      - name: Set up Gradle
-        uses: gradle/setup-gradle@v4
-
       - name: Build debug APK
         env:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           chmod +x gradlew
-          ./gradlew assembleDebug 2>&1 | tee /tmp/gradle-build.log
+          ./gradlew assembleDebug --no-daemon 2>&1 | tee /tmp/gradle-build.log
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
