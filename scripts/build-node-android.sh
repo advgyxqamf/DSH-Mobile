@@ -36,6 +36,53 @@ echo "==> 克隆 Node.js v${NODE_VERSION} 源码"
 git clone --depth 1 --branch "v${NODE_VERSION}" https://github.com/nodejs/node "$WORK/node"
 cd "$WORK/node"
 
+# ---------------------------------------------------------------------------
+# Android/bionic 补丁：V8 的 stack_trace_posix.cc 通过
+#   #if V8_LIBC_GLIBC || V8_LIBC_BSD || ...
+#   #define HAVE_EXECINFO_H 1
+# 判断是否可用 <execinfo.h>。在某些 NDK(clang) 下 bionic 会被误判为 glibc，
+# 从而 #include <execinfo.h> 并调用 backtrace()/backtrace_symbols()，而 bionic
+# 并不提供这些符号，导致：
+#   error: use of undeclared identifier 'backtrace'
+# 这里强制关闭 HAVE_EXECINFO_H，让 V8 走无 backtrace 的降级路径。
+# ---------------------------------------------------------------------------
+STACK_TRACE="deps/v8/src/base/debug/stack_trace_posix.cc"
+if [ -f "$STACK_TRACE" ]; then
+  echo "==> 应用 bionic backtrace 补丁: $STACK_TRACE"
+  # 在 HAVE_EXECINFO_H 判定后强制置 0（即禁用 execinfo 路径）
+  python3 - "$STACK_TRACE" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='replace').read()
+old = """#if V8_LIBC_GLIBC || V8_LIBC_BSD || V8_LIBC_UCLIBC || V8_OS_SOLARIS
+#define HAVE_EXECINFO_H 1
+#endif"""
+new = """#if V8_LIBC_GLIBC || V8_LIBC_BSD || V8_LIBC_UCLIBC || V8_OS_SOLARIS
+#define HAVE_EXECINFO_H 1
+#endif
+// [android-container patch] bionic libc has no <execinfo.h>/backtrace();
+// force-disable the execinfo path to avoid 'use of undeclared identifier backtrace'.
+#if defined(__ANDROID__)
+#undef HAVE_EXECINFO_H
+#define HAVE_EXECINFO_H 0
+#endif"""
+if old in s:
+    s = s.replace(old, new, 1)
+    open(p, 'w', encoding='utf-8').write(s)
+    print("patched:", p)
+else:
+    print("WARN: anchor not found, patch skipped (upstream may have changed)")
+PY
+  # 兜底：若上面锚点没匹配到，直接在文件开头插入强制定义
+  if ! grep -q "android-container patch" "$STACK_TRACE"; then
+    echo "==> 锚点补丁未生效，改用文件头强制定义"
+    sed -i '1i #if defined(__ANDROID__)\n#undef HAVE_EXECINFO_H\n#define HAVE_EXECINFO_H 0\n#endif' "$STACK_TRACE"
+  fi
+  grep -n "HAVE_EXECINFO_H" "$STACK_TRACE" | head
+else
+  echo "==> [warn] $STACK_TRACE 不存在，跳过补丁"
+fi
+
 echo "==> 运行官方 android-configure (NDK ${ANDROID_NDK} + API ${ANDROID_API} + arch ${ARCH})"
 # Node 24 官方参数顺序: ./android-configure [patch] <path to the Android NDK> <Android SDK version> <target architecture>
 # 即 <ndk> <api> <arch>（注意：不是 <ndk> <arch> <api>）
