@@ -27,6 +27,15 @@ jobs:
       contents: write
     steps:
       # ---------------------------------------------------------------------------
+      # 先校验本 workflow 自身：重复键之类的结构错误会被 GitHub 直接拒绝加载，
+      # 表现为 Actions 页面「红色 ✗ + 0s/几秒」且不产生任何步骤日志（极难排查）。
+      # 放在最前面，宁可在此处明确失败，也不要让整轮 run 静默消失。
+      # ---------------------------------------------------------------------------
+      - name: Validate workflow file
+        id: wfvalidate
+        run: python3 scripts/validate-workflow.py .github/workflows/build-apk.yml
+
+      # ---------------------------------------------------------------------------
       # 心跳：把「CI 活着、当前在哪个阶段」持续推到 ci-hb 分支。
       #
       # 为什么需要：沙箱侧读不到 GitHub Actions 日志，只能靠分支自报。原先只有开头
@@ -122,14 +131,9 @@ jobs:
       - name: Checkout
         id: checkout
         uses: actions/checkout@v4
-        uses: actions/checkout@v4
 
       - name: Set up JDK 17
         id: setupjava
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
