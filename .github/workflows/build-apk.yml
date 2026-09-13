@@ -107,10 +107,9 @@ jobs:
         if: failure()
         env:
           PAT: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.email "ci@workbuddy.local"
-          git config user.name "CI Diagnostic Bot"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory '*'
           mkdir -p diag
           {
             echo "=== CI failure diagnostics ==="
@@ -128,12 +127,21 @@ jobs:
             echo "=== gradle-build.log (tail 150) ==="
             tail -150 /tmp/gradle-build.log 2>/dev/null || echo "(no gradle-build.log — failure before Gradle)"
           } > diag/ci-failure-last.txt
-          git add -A
-          git commit -m "ci: automated failure diagnostics" || true
-          # 用全权限 PAT 推送（GITHUB_TOKEN 在本仓库无 push 新分支权限，改用 secrets.PAT）
-          git remote set-url origin "https://x-access-token:${PAT}@github.com/${{ github.repository }}.git"
-          echo "--- pushing diagnostics to ci-diag ---"
-          git push origin HEAD:ci-diag --force 2>&1 | tee /tmp/push.log || cat /tmp/push.log
+
+          # checkout@v4 默认 shallow clone，直接 push 新分支常被拒（shallow update not allowed）。
+          # 故用一次全新完整 clone 再推，规避 shallow 问题；PAT 优先，GITHUB_TOKEN 兜底。
+          rm -rf /tmp/diagpush && mkdir -p /tmp/diagpush && cd /tmp/diagpush
+          if ! git clone "https://x-access-token:${PAT}@github.com/${{ github.repository }}.git" . 2>/tmp/clone.err; then
+            echo "[warn] PAT clone failed, falling back to GITHUB_TOKEN"
+            git clone "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" .
+          fi
+          cp "$GITHUB_WORKSPACE/diag/ci-failure-last.txt" ./diag/ci-failure-last.txt
+          git config user.email "ci@workbuddy.local"
+          git config user.name "CI Diagnostic Bot"
+          git add diag/ci-failure-last.txt
+          git commit -m "ci: automated failure diagnostics"
+          git push origin HEAD:ci-diag --force
+          echo "--- diagnostics pushed to ci-diag ---"
       - name: Upload failure diagnostics artifact (backup)
         if: failure()
         uses: actions/upload-artifact@v4
