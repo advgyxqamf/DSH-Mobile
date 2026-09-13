@@ -17,10 +17,67 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # 硬超时：Node/V8 交叉编译正常在 40-90 分钟内完成。给到 150 分钟足够富余，
+    # 又能保证万一编译死锁（曾出现过 ping 之后 70 分钟零信号的情况）不会一路耗到
+    # GitHub 默认的 360 分钟。注意：超时会导致 job 被 cancel，而 `if: failure()`
+    # 对 cancel 不触发，所以超时路径由下面的 heartbeat 步骤负责留痕。
+    timeout-minutes: 150
     # 发 Release 需要 contents:write；用 workflow 自带 GITHUB_TOKEN 即可，不依赖 PAT。
     permissions:
       contents: write
     steps:
+      # ---------------------------------------------------------------------------
+      # 心跳：把「CI 活着、当前在哪个阶段」持续推到 ci-hb 分支。
+      #
+      # 为什么需要：沙箱侧读不到 GitHub Actions 日志，只能靠分支自报。原先只有开头
+      # 一个 ci-ping，之后直到结束都没有任何信号，于是「还在编译」和「已经卡死」
+      # 在外部看起来完全一样 —— 曾经为此白等 70 分钟。
+      #
+      # 做法：起一个后台循环，每 45 秒把「第几跳 + 时间戳 + 当前阶段」推一次。
+      # 阶段名由后续步骤通过 /tmp/ci-stage 文件更新（见 set-stage 步骤）。
+      # 循环在 job 结束时由 trap 清理，不阻塞主流程。
+      # ---------------------------------------------------------------------------
+      - name: Start heartbeat updater
+        id: hbstart
+        run: |
+          echo "boot" > /tmp/ci-stage
+          cat > /tmp/heartbeat.sh <<'HB'
+          #!/usr/bin/env bash
+          # 后台心跳：独立进程，每 45s 推一次 ci-hb。失败静默重试，绝不干扰主构建。
+          set +e
+          export GIT_TERMINAL_PROMPT=0
+          cd /tmp/hbrepo 2>/dev/null || exit 0
+          n=0
+          while [ -f /tmp/ci-keepalive ]; do
+            n=$((n+1))
+            stage="$(cat /tmp/ci-stage 2>/dev/null || echo unknown)"
+            {
+              echo "CI_HEARTBEAT"
+              echo "beat : $n"
+              echo "time : $(date -u)"
+              echo "stage: $stage"
+              echo "run  : $RUN_ID"
+              echo "sha  : $SHA"
+            } > hb.txt
+            git add hb.txt >/dev/null 2>&1
+            git commit -q -m "hb $n ($stage)" >/dev/null 2>&1
+            git push -q origin HEAD:ci-hb --force >/dev/null 2>&1
+            sleep 45
+          done
+          HB
+          chmod +x /tmp/heartbeat.sh
+          touch /tmp/ci-keepalive
+          git config --global --add safe.directory '*'
+          TOKEN_USE="${{ secrets.PAT }}"
+          [ -z "$TOKEN_USE" ] && TOKEN_USE="${{ secrets.GITHUB_TOKEN }}"
+          rm -rf /tmp/hbrepo && mkdir -p /tmp/hbrepo && cd /tmp/hbrepo
+          git clone --quiet "https://x-access-token:${TOKEN_USE}@github.com/${{ github.repository }}.git" . || exit 0
+          git config user.email "ci@workbuddy.local"
+          git config user.name "CI Heartbeat"
+          export TOKEN_USE REPO_SLUG="${{ github.repository }}" RUN_ID="${{ github.run_id }}" SHA="${{ github.sha }}"
+          setsid nohup /tmp/heartbeat.sh >/dev/null 2>&1 < /dev/null &
+          echo "heartbeat started (pid $!), pushes to ci-hb every 45s"
+
       # ---------------------------------------------------------------------------
       # 连通性探针：在第一时间把 run 信息推到 ci-ping 分支。
       # 目的：区分「CI 根本没启动」vs「CI 跑了但推送受阻」。
@@ -33,6 +90,7 @@ jobs:
           PAT: ${{ secrets.PAT }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          echo "1/9 ping-ready" > /tmp/ci-stage
           git config --global --add safe.directory '*'
           rm -rf /tmp/ping && mkdir -p /tmp/ping && cd /tmp/ping
           TOKEN_USE="${PAT}"
@@ -64,9 +122,14 @@ jobs:
       - name: Checkout
         id: checkout
         uses: actions/checkout@v4
+        uses: actions/checkout@v4
 
       - name: Set up JDK 17
         id: setupjava
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -77,6 +140,7 @@ jobs:
       - name: Show Android SDK env
         id: sdkenv
         run: |
+          echo "sdk-env" > /tmp/ci-stage
           echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
           echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
           ls "$ANDROID_SDK_ROOT" 2>/dev/null || true
@@ -86,6 +150,7 @@ jobs:
         env:
           ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
         run: |
+          echo "4/9 sdk-install" > /tmp/ci-stage
           set -o pipefail
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           echo "== sdkmanager: $SDKMANAGER"
@@ -121,6 +186,7 @@ jobs:
       - name: Install host build deps
         id: hostdeps
         run: |
+          echo "host-deps" > /tmp/ci-stage
           set -x
           sudo apt-get update 2>&1 | tee -a /tmp/host-deps.log
           sudo apt-get install -y git python3 ninja cmake make zip file 2>&1 | tee -a /tmp/host-deps.log
@@ -128,6 +194,7 @@ jobs:
       - name: Resolve latest Node 24.x tag
         id: nodever
         run: |
+          echo "resolve-node-tag" > /tmp/ci-stage
           TAG=$(git ls-remote --tags https://github.com/nodejs/node 2>/dev/null \
             | grep -oE 'refs/tags/v24\.[0-9]+\.[0-9]+$' \
             | sed 's#refs/tags/v##' | sort -V | tail -1)
@@ -143,6 +210,7 @@ jobs:
         env:
           NODE_TAG: ${{ steps.nodever.outputs.tag }}
         run: |
+          echo "6/9 sync-json" > /tmp/ci-stage
           python3 - <<'PY'
           import json, os
           p = "app/src/main/assets/node-versions.json"
@@ -163,6 +231,7 @@ jobs:
           ANDROID_NDK: ${{ env.ANDROID_NDK }}
           ANDROID_API: "24"
         run: |
+          echo "7/9 NODE-BUILD (longest, V8 compile)" > /tmp/ci-stage
           set -o pipefail
           chmod +x scripts/build-node-android.sh
           ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }} 2>&1 | tee /tmp/node-build.log
@@ -172,6 +241,7 @@ jobs:
         env:
           ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
         run: |
+          echo "8/9 gradle-apk" > /tmp/ci-stage
           set -o pipefail
           chmod +x gradlew
           ./gradlew assembleDebug --no-daemon 2>&1 | tee /tmp/gradle-build.log
@@ -208,6 +278,60 @@ jobs:
           git add ci-ok.txt
           git commit -m "ci: build succeeded"
           git push origin HEAD:ci-ok --force
+
+      # ---------------------------------------------------------------------------
+      # 收尾自报：无论成功、失败、超时还是被取消，都在最后推一次 ci-last 分支，
+      # 写清「最终阶段 + 结论」。这是心跳之外的第二重保障。
+      #
+      # 为什么用 always()：原先只有「成功->ci-ok」和「失败->ci-diag」两条路径，
+      # 而 GitHub 对 job 超时/取消的情况**不会**把 job 标成 failure，于是 if: failure()
+      # 不触发，ci-diag 也不更新 —— 外部看起来就是「ping 之后永远静止」，
+      # 分不清「还在编」和「已经死了」。always() 保证任何结局都有留痕。
+      # ---------------------------------------------------------------------------
+      - name: Final report -> ci-last branch (always runs)
+        if: always()
+        env:
+          PAT: ${{ secrets.PAT }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config --global --add safe.directory '*'
+          # 停掉心跳，避免它在收尾后继续推分支造成混淆
+          rm -f /tmp/ci-keepalive
+          TOKEN_USE="${PAT:-$GH_TOKEN}"
+          mkdir -p /tmp/lastpush
+          {
+            echo "CI_LAST_REPORT"
+            echo "time   : $(date -u)"
+            echo "run    : ${{ github.run_id }}"
+            echo "sha    : ${{ github.sha }}"
+            echo "stage  : $(cat /tmp/ci-stage 2>/dev/null || echo unknown)"
+            echo "job    : ${{ job.status }}"
+            echo
+            echo "=== step outcomes ==="
+            echo "ping        : ${{ steps.ping.outcome }}"
+            echo "checkout    : ${{ steps.checkout.outcome }}"
+            echo "setup-java  : ${{ steps.setupjava.outcome }}"
+            echo "sdk-env     : ${{ steps.sdkenv.outcome }}"
+            echo "sdk-install : ${{ steps.sdkinstall.outcome }}"
+            echo "host-deps   : ${{ steps.hostdeps.outcome }}"
+            echo "node-tag    : ${{ steps.nodever.outcome }}"
+            echo "sync-json   : ${{ steps.syncjson.outcome }}"
+            echo "node-build  : ${{ steps.nodebuild.outcome }}"
+            echo "gradle-build: ${{ steps.gradlebuild.outcome }}"
+            echo
+            echo "=== node-build.log size / tail ==="
+            wc -c /tmp/node-build.log 2>/dev/null || echo "(no node-build.log)"
+            tail -30 /tmp/node-build.log 2>/dev/null | cut -c1-400
+          } > /tmp/ci-last-report.txt
+          cd /tmp/lastpush
+          git clone --quiet "https://x-access-token:${TOKEN_USE}@github.com/${{ github.repository }}.git" . 2>/dev/null || true
+          [ -d .git ] || { echo "[warn] clone failed, skip ci-last"; exit 0; }
+          git config user.email "ci@workbuddy.local"
+          git config user.name "CI Final Report"
+          cp /tmp/ci-last-report.txt ci-last.txt
+          git add -f ci-last.txt
+          git commit -q -m "ci: final report" || true
+          git push origin HEAD:ci-last --force && echo "[ok] ci-last pushed"
 
       # ---------------------------------------------------------------------------
       # 失败自诊：沙箱侧无法直接访问 GitHub API/日志，故把报错汇总推到 ci-diag 分支，
