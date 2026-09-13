@@ -158,12 +158,43 @@ fi
 #         CC/CXX 由 android-configure 留给目标架构。实测: 设置后
 #         out/Release/icupkg 从 aarch64 变为
 #         'ELF 64-bit LSB pie executable, x86-64' 且可正常运行。
+#
+#   为什么宿主编译器优先用 NDK 自带的 clang（而不是系统 gcc）：
+#         V8/v8_compiler 等 host 目标大量使用 Clang 专有扩展与警告开关
+#         （如 -Wno-nullability-completeness）。用 gcc 编会退化成
+#         'cc1plus: note: unrecognized command-line option'，
+#         且 V8 源码本就按 Clang 预期编写。NDK 的
+#         toolchains/llvm/prebuilt/<host>/bin/clang 不带 target 前缀时，
+#         默认 target 就是构建机自身（实测 x86_64-unknown-linux-gnu），
+#         等于「与目标编译器同源的 clang」，兼容性最好。
 # ---------------------------------------------------------------------------
-HOST_CC="${CC_host:-$(command -v gcc || command -v clang)}"
-HOST_CXX="${CXX_host:-$(command -v g++ || command -v clang++)}"
+NDK_HOST_BIN="$(ls -d "$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin 2>/dev/null | head -1)"
+HOST_CC="${CC_host:-}"
+HOST_CXX="${CXX_host:-}"
+if [ -z "$HOST_CC" ] && [ -n "$NDK_HOST_BIN" ] && [ -x "$NDK_HOST_BIN/clang" ]; then
+  HOST_CC="$NDK_HOST_BIN/clang"
+fi
+if [ -z "$HOST_CXX" ] && [ -n "$NDK_HOST_BIN" ] && [ -x "$NDK_HOST_BIN/clang++" ]; then
+  HOST_CXX="$NDK_HOST_BIN/clang++"
+fi
+HOST_CC="${HOST_CC:-$(command -v clang || command -v gcc)}"
+HOST_CXX="${HOST_CXX:-$(command -v clang++ || command -v g++)}"
 if [ -z "$HOST_CC" ] || [ -z "$HOST_CXX" ]; then
-  echo "==> [error] 找不到宿主编译器 (gcc/g++/clang)，交叉编译无法产出可运行的 host 工具"
+  echo "==> [error] 找不到宿主编译器 (clang/gcc)，交叉编译无法产出可运行的 host 工具"
   exit 1
+fi
+# 断言：宿主编译器必须产出宿主架构（而非 ARM）二进制，否则后面必然 Exec format error
+echo "==> 校验宿主编译器产物架构"
+printf 'int main(void){return 0;}\n' > "$WORK/host_cc_probe.c"
+if "$HOST_CC" "$WORK/host_cc_probe.c" -o "$WORK/host_cc_probe.out" 2>/dev/null; then
+  HOST_ARCH_INFO="$(file -b "$WORK/host_cc_probe.out" 2>/dev/null || echo unknown)"
+  echo "    $HOST_ARCH_INFO"
+  case "$HOST_ARCH_INFO" in
+    *x86-64*) echo "    [ok] 宿主编译器产出 x86-64" ;;
+    *) echo "    [error] 宿主编译器产出非宿主架构: $HOST_ARCH_INFO"; exit 1 ;;
+  esac
+else
+  echo "    [warn] 无法编译探针文件，继续（后续若 Exec format error 请回看此处）"
 fi
 export CC_host="$HOST_CC"
 export CXX_host="$HOST_CXX"

@@ -123,7 +123,7 @@ jobs:
         run: |
           set -x
           sudo apt-get update 2>&1 | tee -a /tmp/host-deps.log
-          sudo apt-get install -y git python3 ninja cmake make zip 2>&1 | tee -a /tmp/host-deps.log
+          sudo apt-get install -y git python3 ninja cmake make zip file 2>&1 | tee -a /tmp/host-deps.log
 
       - name: Resolve latest Node 24.x tag
         id: nodever
@@ -246,13 +246,40 @@ jobs:
             grep -viE "warranty|liability|indemnif|export regulation|severability|pre-release|evaluation license|open source software|MIPS|Accept\? \(y/N\)|YOUR USE OF|Google is the parent|third party beneficiaries|EXPORT RESTRICTIONS|governing law|Santa Clara|conflict of laws" /tmp/sdk-install.log 2>/dev/null | tail -60 \
               || echo "(no sdk-install.log)"
             echo
-            echo "=== node-build.log (tail 150) ==="
-            tail -150 /tmp/node-build.log 2>/dev/null || echo "(no node-build.log — failure occurred before Node build)"
+            echo "=== node-build.log :: ALL error lines (grep -n) ==="
+            grep -anE "error:|Error [0-9]+|undefined (reference|symbol)|fatal error|ld\.lld: error|collect2: error" /tmp/node-build.log 2>/dev/null | tail -60 \
+              || echo "(no matching error lines in node-build.log)"
+            echo
+            echo "=== node-build.log :: context around FIRST error (40 lines before/after) ==="
+            FIRST_ERR=$(grep -anE "error:|fatal error" /tmp/node-build.log 2>/dev/null | head -1 | cut -d: -f1)
+            if [ -n "$FIRST_ERR" ]; then
+              START=$(( FIRST_ERR > 40 ? FIRST_ERR - 40 : 1 ))
+              END=$(( FIRST_ERR + 40 ))
+              echo "--- first error at line $FIRST_ERR, showing $START..$END ---"
+              sed -n "${START},${END}p" /tmp/node-build.log | cut -c1-500
+            else
+              echo "(no 'error:' line found; see tail below)"
+            fi
+            echo
+            echo "=== node-build.log :: context around LAST error (40 lines before/after) ==="
+            LAST_ERR=$(grep -anE "error:|fatal error" /tmp/node-build.log 2>/dev/null | tail -1 | cut -d: -f1)
+            if [ -n "$LAST_ERR" ]; then
+              START=$(( LAST_ERR > 40 ? LAST_ERR - 40 : 1 ))
+              END=$(( LAST_ERR + 40 ))
+              echo "--- last error at line $LAST_ERR, showing $START..$END ---"
+              sed -n "${START},${END}p" /tmp/node-build.log | cut -c1-500
+            else
+              echo "(no 'error:' line found; see tail below)"
+            fi
+            echo
+            echo "=== node-build.log (tail 200, warnings filtered out) ==="
+            grep -avE "warning:|note:| \^|^\s*\||^\s*[0-9]+ \|" /tmp/node-build.log 2>/dev/null | tail -200 \
+              || echo "(no node-build.log — failure occurred before Node build)"
             echo
             echo "=== gradle-build.log (tail 150) ==="
             tail -150 /tmp/gradle-build.log 2>/dev/null || echo "(no gradle-build.log — failure before Gradle)"
           } > diag/ci-failure-last.txt
-          echo "----- diag file -----"; cat diag/ci-failure-last.txt
+          echo "----- diag size -----"; wc -c diag/ci-failure-last.txt
 
           # 推 ci-diag 分支（该通道已由 ci-ping 验证可用）。
           # 用 clone 出来的独立目录，并显式 mkdir/copy/add/commit，避免被静默吞错。
