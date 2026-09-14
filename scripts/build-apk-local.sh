@@ -4,7 +4,9 @@
 #
 #  前置：
 #    - Android SDK：设置 ANDROID_HOME 指向 SDK 根目录，且已装
-#        platform-tools / platforms;android-34 / build-tools;34.0.0
+#        platform-tools / platforms;android-35 / build-tools;35.0.0
+#      （compileSdk 35 是 androidx.core 1.15.0 的 AAR metadata 硬要求；
+#        它只影响编译用哪个 API 头，不抬高 APK 的 minSdk=24）
 #    - Android NDK r27+：设置 ANDROID_NDK 指向 NDK 根目录
 #    - 主机侧：git python3 ninja cmake make zip + JDK 17 + Gradle 8.x
 #

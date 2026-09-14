@@ -181,11 +181,14 @@ jobs:
 
       - name: Install SDK packages (platform-tools / platform / build-tools; NDK reused if present)
         id: sdkinstall
-        env:
-          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           echo "4/9 sdk-install" > /tmp/ci-stage
           set -o pipefail
+          # 不显式设置 ANDROID_HOME/ANDROID_SDK_ROOT：runner 镜像自带正确的值。
+          # 曾经写成 ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}，而 workflow 级没有
+          # 定义该变量 → 展开为空 → 反而把 runner 自带的值覆盖成空。
+          echo "== ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          echo "== ANDROID_HOME=${ANDROID_HOME:-<unset>}"
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           echo "== sdkmanager: $SDKMANAGER"
           "$SDKMANAGER" --version 2>&1 | tee -a /tmp/sdk-install.log | tail -1
@@ -193,12 +196,18 @@ jobs:
           # 接受 license（输出进日志，避免刷屏）
           yes | "$SDKMANAGER" --licenses 2>&1 | tee -a /tmp/sdk-install.log | tail -2 || true
 
-          echo "== installing platform-tools / platform-34 / build-tools-34.0.0"
-          if ! "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" 2>&1 | tee -a /tmp/sdk-install.log | tail -5; then
+          echo "== installing platform-tools / platform-35 / build-tools;35.0.0"
+          # compileSdk 必须 >= 35：androidx.core 1.15.0 / core-ktx 1.15.0 的 AAR metadata
+          # 明确要求依赖方 compileSdk >= 35，否则 gradle 在 :app:checkDebugAarMetadata
+          # 阶段直接失败（"requires ... compile against version 35 or later"）。
+          # 注意 compileSdk 与 minSdk 是两件独立的事：提 compileSdk 只影响"用哪个
+          # API 头来编译"，不会抬高 APK 的最低系统要求（minSdk 仍保持 24）。
+          if ! "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0" 2>&1 | tee -a /tmp/sdk-install.log | tail -5; then
             echo "[error] sdkmanager base install failed"
             exit 1
           fi
           echo "== base packages installed OK"
+          echo "== 已安装的 platforms:"; ls "$ANDROID_SDK_ROOT/platforms" 2>/dev/null | sed 's/^/    /'
 
           # NDK：runner 镜像通常已自带（如 /usr/local/lib/android/sdk/ndk/<ver>）。
           # 已有就直接复用，避免因某个具体 build 号在远端不存在而导致安装失败。
@@ -278,12 +287,18 @@ jobs:
 
       - name: Build debug APK
         id: gradlebuild
-        env:
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           echo "8/9 gradle-apk" > /tmp/ci-stage
           set -o pipefail
           chmod +x gradlew
+          # 注意：这里【不要】写 env: ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}。
+          # workflow 级从未定义过 ANDROID_SDK_ROOT，该表达式展开为空字符串，
+          # 于是把 runner 自带的正确值覆盖成空 —— gradle 随即告警
+          #   "WARNING: The following problems were found when resolving the SDK
+          #    location: Set with empty value"（上一轮日志里真实出现过）。
+          # 本步骤没显式传 env，runner 自带的 ANDROID_SDK_ROOT/ANDROID_HOME 自然生效。
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
           ./gradlew assembleDebug --no-daemon 2>&1 | tee /tmp/gradle-build.log
 
       - name: Upload APK
