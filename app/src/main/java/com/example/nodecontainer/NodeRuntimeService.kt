@@ -119,8 +119,7 @@ class NodeRuntimeService : Service() {
                 put("NODE_PATH", File(filesDir, "node_modules").absolutePath)
             }
             nodeProcess = pb.start()
-            val pidStr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) nodeProcess!!.pid().toString() else "n/a"
-            RuntimeDiagnostics.append(this, "exec", true, "node 进程已启动", "pid=$pidStr, 监听 127.0.0.1:$PORT")
+            RuntimeDiagnostics.append(this, "exec", true, "node 进程已启动", "pid=${currentPid(nodeProcess)}, 监听 127.0.0.1:$PORT")
 
             // 6) 转发 stdout/stderr 到诊断
             forward(nodeProcess!!.inputStream, "stdout")
@@ -135,6 +134,38 @@ class NodeRuntimeService : Service() {
             RuntimeDiagnostics.append(this, "fatal", false, "启动流程异常", err(e))
             Log.e(TAG, "启动 Node 失败", e)
         }
+    }
+
+    /**
+     * 取子进程的 PID，仅用于诊断展示（拿不到就返回 "n/a"，绝不影响主流程）。
+     *
+     * 为什么不用 [Process.pid]：**Android 上根本没有这个方法**。
+     * [Process.pid] 是 Java 9 加入 java.lang.Process 的；而 Android 的
+     * java.lang.Process 一直没跟进。已用 android.jar 逐版本核对（javap）：
+     *   android-29 的 java.lang.Process 只有 getOutputStream/getInputStream/
+     *   getErrorStream/waitFor/exitValue/destroy/destroyForcibly/isAlive；
+     *   android-30 完全相同；compileSdk 35 亦无 pid()。
+     * 所以原先那句
+     *     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) nodeProcess!!.pid()
+     * 前提就是错的 —— 它会在编译期直接报
+     *     error: Unresolved reference 'pid'
+     * （CI 真实报错：NodeRuntimeService.kt:122:92 Unresolved reference 'pid'）。
+     * 注意 SDK_INT 这个【运行时】判断救不了【编译期】的方法缺失。
+     *
+     * 也不能用 android.os.Process.myPid()：那是**本应用自己**的 pid，
+     * 不是 node 子进程的 pid，两者含义完全不同，用了会误导诊断。
+     *
+     * 可行做法：Android 的 Process 实现类（java.lang.ProcessImpl）
+     * 把 pid 编进了 toString()，格式形如
+     *     "Process[pid=12345, exitValue=\"not exited\"]"
+     * 这是社区长期沿用的解析方式（JDK 侧亦有同样惯例）。这里用正则提取，
+     * 解析失败一律降级为 "n/a"，不抛异常。
+     */
+    private fun currentPid(p: Process?): String {
+        if (p == null) return "n/a"
+        return runCatching {
+            Regex("""pid=(\d+)""").find(p.toString())?.groupValues?.get(1)
+        }.getOrNull() ?: "n/a"
     }
 
     /** 把 node 子进程的 stdout/stderr 转发：stdout 记诊断、stderr 额外落 node-stderr.log。 */
