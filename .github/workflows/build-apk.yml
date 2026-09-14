@@ -46,6 +46,9 @@ jobs:
           cat > /tmp/heartbeat.sh <<'HB'
           #!/usr/bin/env bash
           # 后台心跳：独立进程，每 45s 推一次 ci-hb。失败静默重试，绝不干扰主构建。
+          #
+          # 注意间隔别调太大：上一轮 job 在「远早于 timeout 的时刻」突然消失，
+          # 最后一个心跳就是唯一的现场证据。45s 的粒度能看清内存趋势。
           set +e
           export GIT_TERMINAL_PROMPT=0
           cd /tmp/hbrepo 2>/dev/null || exit 0
@@ -60,8 +63,15 @@ jobs:
               echo "stage: $stage"
               echo "run  : $RUN_ID"
               echo "sha  : $SHA"
+              # 内存水位：这是判断「会不会被 OOM 杀掉」的关键指标。
+              # 上一轮就是内存耗尽导致进程被内核杀掉、连收尾步骤都没记录，
+              # 而当时的心跳里完全没有内存信息，只能靠猜。现在把它带上。
+              # MemAvailable 取 /proc/meminfo；cgroup 限额另记一行便于对照。
+              echo "mem  : $(awk '/^MemAvailable:/{printf "avail=%.1fGB", $2/1048576}' /proc/meminfo 2>/dev/null)"
+              echo "cgmax: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"
+              echo "load : $(cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3)"
               # 日志体积 + 已编译目标数：判断「卡死」还是「在推进」的最直接依据。
-              # 编 3300 个 TU 的日志有十几 MB，只看 tail 看不出速度，这两个数字能。
+              # 编 6800 个 TU 的日志有十几 MB，只看 tail 看不出速度，这两个数字能。
               # objs 优先数脚本自己打的 [progress ...] 行（含 host/target 计数）；
               # 退回数编译命令行数量。用 tail -c 限制扫描范围，避免每 45 秒
               # 全量扫十几 MB 拖慢 runner。
@@ -69,6 +79,8 @@ jobs:
                 echo "logsize: $(wc -c < /tmp/node-build.log 2>/dev/null || echo 0)"
                 prog="$(tail -c 200000 /tmp/node-build.log 2>/dev/null | grep -o 'host=[0-9]* target=[0-9]*' | tail -1)"
                 echo "objs   : ${prog:-$(tail -c 400000 /tmp/node-build.log 2>/dev/null | grep -c 'clang++\|cc1plus' || echo 0)}"
+                # 是否已经出现 OOM 痕迹（内核会打 oom-kill 或进程报 Killed）
+                echo "oomhits: $(tail -c 200000 /tmp/node-build.log 2>/dev/null | grep -c 'Killed signal\|out of memory\|oom-kill' || echo 0)"
                 echo "lastprog: $(tail -3 /tmp/node-build.log 2>/dev/null | tr '\n' ' ' | cut -c1-160)"
               fi
             } > hb.txt
@@ -254,8 +266,14 @@ jobs:
           ANDROID_API: "24"
         run: |
           echo "7/9 NODE-BUILD (longest, V8 compile)" > /tmp/ci-stage
+          # 记录 runner 的真实内存与并行度决策，便于事后判断是否又是内存问题。
+          echo "=== runner 资源 ==="
+          nproc; free -m | head -2
+          cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "(no cgroup v2 limit)"
+          echo "=== 开始编译 ==="
           set -o pipefail
           chmod +x scripts/build-node-android.sh
+          # 不用 nproc 拉满，交给脚本按内存自适应（脚本内也会读同样的限额）。
           ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }} 2>&1 | tee /tmp/node-build.log
 
       - name: Build debug APK

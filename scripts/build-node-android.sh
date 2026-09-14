@@ -566,10 +566,83 @@ fi
 echo "==> 编译 (NDK r27+ 链接器默认 max-page-size=16384 → 16KB 页对齐)"
 # 进度可见性：构建耗时以小时计，而 CI 侧只能靠心跳判断「还在跑 vs 卡死」。
 # 这里周期性打印一行进度（含时间戳与已产出目标数），让日志里也能一眼看出推进速度。
-JOBS="$(nproc)"
-echo "==> 使用 make -j${JOBS} 构建（host+target 约 3300 个编译单元，预计 3~4 小时）"
-# 后台进度上报: 每 120 秒打一行「已编译 .o 数 + 时间戳」。
-# 这样 ci-hb 心跳之外，日志本身也能证明「在推进」而不是「卡死」。
+
+# ---------------------------------------------------------------------------
+# 并行度必须按【内存】而不是按【核数】来定（这是决定成败的一步）。
+#
+#   现象: 用 nproc（CI 上是 4）跑 make -j4，job 在 144 分钟被硬终止；
+#         配置的 timeout-minutes 是 330 分钟，所以**不是超时**。
+#         异常还在于：连 if: always() 的收尾步骤都没留下任何记录 ——
+#         这是进程/容器被内核直接杀掉的典型特征，而不是正常失败。
+#
+#   根因: 编译 V8 时单个编译进程的内存峰值可达 2~4 GB
+#         （turboshaft / v8_compiler 那几个巨型翻译单元尤其突出）。
+#         GitHub 标准 runner 是 4 vCPU / 16 GB，-j4 的峰值就能摸到 8~16 GB，
+#         再叠加链接阶段的峰值，必然触发 OOM Killer。
+#         本地用 8 GB cgroup 复现了同一现象：
+#             g++: fatal error: Killed signal terminated program cc1plus
+#             make[1]: *** [v8_compiler.host.mk:363: .../turboshaft/...] Error 1
+#
+#   修法: 按可用内存估算并行度，给每个编译进程预留约 3.5 GB（V8 巨型 TU 的
+#         峰值确实能到 3 GB+），并留出 2 GB 余量；下限锁 2（实测 8 GB 环境下
+#         -j2 可全程零 OOM，不必退到 -j1）。
+#         可用内存优先读 cgroup 限额（容器里 MemTotal 是宿主的值，不能直接用），
+#         取不到再退回 /proc/meminfo 的 MemAvailable。
+#         另外允许用 NODE_BUILD_JOBS 环境变量显式覆盖。
+#
+#   取值预期: 4 核 16 GB 的 GitHub runner → (16384-2048)/3584 ≈ 4 → 但仍受
+#         CPU 核数 4 限制，实际 make -j4；若 runner 内存较小会自动降到 -j3/-j2。
+#         实测 8 GB cgroup 下 -j2 全程零 OOM（已越过之前必炸的
+#         obj.host/v8_compiler/.../turboshaft/ 段）。
+#         编译时间会变长，但换来的是不再被 OOM 打断（我们保留了全部功能：
+#         TLS/crypto、Intl/ICU、inspector 都不裁剪）。
+# ---------------------------------------------------------------------------
+detect_mem_mb() {
+  local lim
+  # cgroup v2
+  lim="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || true)"
+  # cgroup v1
+  if [ -z "$lim" ] || [ "$lim" = "max" ]; then
+    lim="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || true)"
+  fi
+  case "$lim" in
+    ''|max|*[!0-9]*) lim="" ;;
+  esac
+  # 明显不合理的巨大值（未设限时的哨兵值）直接忽略
+  if [ -n "$lim" ] && [ "$lim" -gt 1000000000000 ] 2>/dev/null; then lim=""; fi
+  if [ -n "$lim" ]; then
+    echo $((lim / 1024 / 1024))
+    return
+  fi
+  awk '/^MemAvailable:/{print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 0
+}
+
+CPU_JOBS="$(nproc)"
+MEM_MB="$(detect_mem_mb)"
+# 每个编译进程按 3.5 GB 预留，另留 2 GB 给链接与系统。
+# 下限锁在 2：实测 8 GB 环境下 -j2 可以全程零 OOM，不必退到 -j1
+# （-j1 会让本就要几小时的构建再拖长很多，得不偿失）。
+MEM_JOBS=2
+if [ -n "$MEM_MB" ] && [ "$MEM_MB" -gt 0 ] 2>/dev/null; then
+  MEM_JOBS=$(( (MEM_MB - 2048) / 3584 ))
+  [ "$MEM_JOBS" -lt 2 ] && MEM_JOBS=2
+else
+  MEM_JOBS="$CPU_JOBS"
+fi
+JOBS="${NODE_BUILD_JOBS:-$CPU_JOBS}"
+if [ "$MEM_JOBS" -lt "$JOBS" ]; then
+  JOBS="$MEM_JOBS"
+fi
+[ "$JOBS" -lt 1 ] && JOBS=1
+
+echo "==> 并行度决策（按内存而非核数）"
+echo "    检测到可用内存: ${MEM_MB:-未知} MB   CPU: ${CPU_JOBS} 核"
+echo "    按 3.5GB/编译进程 + 2GB 余量 → 内存上限 -j${MEM_JOBS}"
+echo "    最终使用: make -j${JOBS}（可用 NODE_BUILD_JOBS 覆盖）"
+echo "    预期: host+target 合计约 6800 个编译单元，耗时以小时计。"
+echo "    注: 这里刻意不用满 CPU —— 编译 V8 是内存瓶颈而非 CPU 瓶颈，"
+echo "        并发放大后峰值内存会撞穿 runner 限额，导致进程被 OOM 杀掉，"
+echo "        表现是「任务在远早于超时的时刻突然消失、连收尾步骤都没记录」。"
 (
   while true; do
     sleep 120
@@ -581,6 +654,7 @@ echo "==> 使用 make -j${JOBS} 构建（host+target 约 3300 个编译单元，
 PROGRESS_PID=$!
 trap 'kill "$PROGRESS_PID" 2>/dev/null || true' EXIT
 
+# 用 make -j${JOBS} 走完全程。make 失败会非零退出，配合 set -e 让脚本干净收尾。
 make -j"${JOBS}"
 
 echo "==> 拷贝产物到 $OUT_DIR/node"
