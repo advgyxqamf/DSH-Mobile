@@ -426,6 +426,49 @@ jobs:
           if-no-files-found: error
 
       # ---------------------------------------------------------------------------
+      # 发布到 Release（让 APK 有一个【可直接下载】的稳定网址）。
+      #
+      # 为什么需要：Actions 的 artifact 只能从网页界面下载，而下载地址走的是
+      # api.github.com（会 302 到 objects.githubusercontent.com）。本项目的
+      # 维护环境对外网是白名单制，api.github.com 被屏蔽、ghproxy 对 /actions
+      # 路径也返回 403 —— 也就是说 **artifact 在外部拿不到**。
+      # Release 的资产则可经 github.com/<owner>/<repo>/releases/download/...
+      # 访问，且这个路径能被通常的镜像/代理转发，是唯一"外部可达"的分发方式。
+      #
+      # 用 tag 命名（每轮覆盖同一个 tag）：这样下载网址是稳定的，
+      # 不必每轮去查新网址。文件名带 run 号，便于区分是哪次构建。
+      #
+      # 注意：用 workflow 自带的 GITHUB_TOKEN + permissions:contents=write，
+      # 不依赖 PAT Secret（PAT 在本环境里有时读不到）。
+      # ---------------------------------------------------------------------------
+      - name: Publish APK to Release
+        id: release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          TAG="apk-latest"
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          ls -la app/build/outputs/apk/debug/ || true
+          if [ ! -f "$APK" ]; then
+            echo "[error] 未找到 $APK，跳过发布"
+            exit 1
+          fi
+          SIZE="$(du -h "$APK" | cut -f1)"
+          echo "APK 大小: $SIZE"
+          # tag 固定为 apk-latest：存在则更新，不存在则创建。
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "DSH Mobile APK (latest)" \
+                 --notes "自动构建产物，持续覆盖更新。"
+          gh release upload "$TAG" "$APK#app-debug.apk" --clobber
+          echo "=== 发布完成 ==="
+          gh release view "$TAG" --json url,assets 2>/dev/null || true
+          echo "下载地址: https://github.com/${{ github.repository }}/releases/download/${TAG}/app-debug.apk"
+          # 把网址写进 ci-ok 便于外部读取
+          echo "APK_URL=https://github.com/${{ github.repository }}/releases/download/${TAG}/app-debug.apk" >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------------------
       # 成功自报：把构建成功标记推到 ci-ok 分支（raw 通道可读）。
       # 用自带 GITHUB_TOKEN + permissions:contents=write，不依赖 PAT Secret。
       # ---------------------------------------------------------------------------
@@ -444,6 +487,8 @@ jobs:
             echo "time : $(date -u)"
             echo "node : ${{ steps.nodever.outputs.tag }}"
             echo "apk  : app/build/outputs/apk/debug/app-debug.apk"
+            # 可直接下载的稳定网址（Release 资产，见上方 Publish APK 步骤的说明）。
+            echo "url  : https://github.com/${{ github.repository }}/releases/download/apk-latest/app-debug.apk"
           } > ci-ok.txt
           git config user.email "ci@workbuddy.local"
           git config user.name "CI Diagnostic Bot"
