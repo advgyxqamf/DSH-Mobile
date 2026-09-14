@@ -13,6 +13,30 @@ on:
   workflow_dispatch:
   push:
     branches: [main, master]
+    # -----------------------------------------------------------------------
+    # paths-ignore：只改 CI/文档/脚本时【不要】触发这条路。
+    #
+    # 为什么要加（真实教训）：
+    #   这条 workflow 一旦跑起来就是 ~3 小时的 Node 全量交叉编译
+    #   （要编两份 V8：host x64 + target aarch64）。而在此之前，
+    #   任何一次推到 main 都会触发它 —— 包括「只改了发布流程」「只改了
+    #   README」这类根本不需要重编 Node 的提交。白白占机时、还会因为
+    #   cancel-in-progress 把别人正在跑的构建掐掉。
+    #
+    #   所以：CI 自身的文件（.github/**）、文档（*.md）、以及纯打包/发布
+    #   辅助脚本（scripts/inject-*.py、scripts/make-release.sh）都不触发。
+    #   真正决定 Node 二进制的 scripts/build-node-android.sh 与 app/ 仍在
+    #   触发范围内 —— 改它们本来就该重编。
+    #
+    # 需要强制重编时：用 Actions 页面的 Run workflow（workflow_dispatch 不受
+    # paths 过滤影响），或推一个空提交改到非忽略路径。
+    # -----------------------------------------------------------------------
+    paths-ignore:
+      - '.github/**'
+      - '**.md'
+      - 'scripts/inject-*.py'
+      - 'scripts/make-release.sh'
+      - 'scripts/gh-access.sh'
 
 # ---------------------------------------------------------------------------
 # 并发控制：同一个 ref 上只允许一个构建在跑。
