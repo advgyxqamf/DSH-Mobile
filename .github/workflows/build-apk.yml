@@ -60,12 +60,16 @@ jobs:
               echo "stage: $stage"
               echo "run  : $RUN_ID"
               echo "sha  : $SHA"
-              # 日志体积与「编译行数」：判断「卡死」还是「在推进」的最直接依据。
-              # 15MB 的编译日志只看 tail 看不出速度，这两个数字能。
-              # 用 tail -c 限制扫描范围，避免每 45 秒全量扫 15MB 拖慢 runner。
+              # 日志体积 + 已编译目标数：判断「卡死」还是「在推进」的最直接依据。
+              # 编 3300 个 TU 的日志有十几 MB，只看 tail 看不出速度，这两个数字能。
+              # objs 优先数脚本自己打的 [progress ...] 行（含 host/target 计数）；
+              # 退回数编译命令行数量。用 tail -c 限制扫描范围，避免每 45 秒
+              # 全量扫十几 MB 拖慢 runner。
               if [ -f /tmp/node-build.log ]; then
                 echo "logsize: $(wc -c < /tmp/node-build.log 2>/dev/null || echo 0)"
-                echo "objs   : $(tail -c 400000 /tmp/node-build.log 2>/dev/null | grep -c 'Building CXX object\|clang++\|ninja' || echo 0)"
+                prog="$(tail -c 200000 /tmp/node-build.log 2>/dev/null | grep -o 'host=[0-9]* target=[0-9]*' | tail -1)"
+                echo "objs   : ${prog:-$(tail -c 400000 /tmp/node-build.log 2>/dev/null | grep -c 'clang++\|cc1plus' || echo 0)}"
+                echo "lastprog: $(tail -3 /tmp/node-build.log 2>/dev/null | tr '\n' ' ' | cut -c1-160)"
               fi
             } > hb.txt
             git add hb.txt >/dev/null 2>&1

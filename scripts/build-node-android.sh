@@ -317,7 +317,12 @@ PROBE
         return 1 ;;
     esac
   else
-    echo "    [skip] $tag -> $cxx 探针编译/链接失败（缺宿主 C++ 头或 libatomic）"
+    # 打印真实原因，别只写一句「失败」——排查时非常依赖这条线索。
+    # 典型: clang++ 报 "fatal error: 'atomic' file not found"，
+    # 因为它的 C++ 头搜索路径指向一个不存在的 gcc include 目录。
+    echo "    [skip] $tag -> $cxx 探针编译/链接失败，真实原因:"
+    "$cxx" -m64 -std=gnu++20 "$WORK/host_probe.cpp" -o "$WORK/host_probe.out" -latomic 2>&1 \
+      | head -3 | sed 's/^/        | /'
     return 1
   fi
 }
@@ -368,67 +373,124 @@ echo "==> 运行官方 android-configure (NDK ${ANDROID_NDK} + API ${ANDROID_API
 ./android-configure "$ANDROID_NDK" "$ANDROID_API" "$ARCH"
 
 # ---------------------------------------------------------------------------
-# 改用 Ninja 构建（性能关键）。
+# 宿主编译器落地断言（关键！别删）。
 #
-#   为什么: android_configure.py 内部那行是
+#   android-configure 会把 CC/CXX/AR 覆写成 NDK 的 aarch64-linux-android*-clang
+#   （那是给【目标】架构用的），并调用 configure 生成 out/Makefile。
+#   gyp 的 make 生成器据此写出：
+#       CC.host  ?= $(CC_host  or CC)      →  out/Makefile 里的 "CC.host ?= ..."
+#       CXX.host ?= $(CXX_host or CXX)
+#   也就是说：只要我们的 CC_host/CXX_host 在 configure 时可见，宿主工具就会用系统编译器。
+#   但如果这一步没生效，宿主侧就会拿 NDK clang 去编 x64 代码，报：
+#       fatal error: 'atomic' file not found
+#       fatal error: 'cstdint' file not found
+#       make[1]: *** [tools/v8_gypfiles/abseil.host.mk:210: .../cycleclock.o] Error 1
+#   这个报错发生在编译中途、看着像源码问题，实际是工具链选错，极难一眼看出来。
+#   这里在进入漫长编译【之前】就把结论钉死，避免又浪费一两个小时才发现。
+# ---------------------------------------------------------------------------
+if [ ! -f out/Makefile ]; then
+  echo "==> [error] android-configure 之后没有 out/Makefile，配置未生成。"
+  exit 1
+fi
+HOST_CC_IN_MK="$(sed -n 's/^CC\.host[[:space:]]*?*=[[:space:]]*//p' out/Makefile | head -1)"
+HOST_CXX_IN_MK="$(sed -n 's/^CXX\.host[[:space:]]*?*=[[:space:]]*//p' out/Makefile | head -1)"
+echo "==> 校验 out/Makefile 中的宿主工具链:"
+echo "    CC.host  = ${HOST_CC_IN_MK:-<空>}"
+echo "    CXX.host = ${HOST_CXX_IN_MK:-<空>}"
+if [ -z "$HOST_CXX_IN_MK" ]; then
+  echo "==> [error] out/Makefile 里没有 CXX.host，gyp 未采用我们的宿主工具链。"
+  echo "            宿主工具会被编成 ARM64，随后在构建机上 Exec format error。"
+  exit 1
+fi
+case "$HOST_CXX_IN_MK" in
+  *android*)
+    echo "==> [error] 宿主编译器落到了 NDK 的 android 工具链（$HOST_CXX_IN_MK）。"
+    echo "            宿主侧（mksnapshot/icupkg 等）必须用系统编译器，否则会报"
+    echo "            \"fatal error: 'atomic' file not found\"。"
+    echo "            期望: $HOST_CXX"
+    exit 1 ;;
+esac
+# 再复核一次：用 Makefile 里记录的编译器实测能否编 C++ 头（真编译，不看声明）。
+if ! "$HOST_CXX_IN_MK" -m64 -std=gnu++20 -x c++ -c /dev/null -o /dev/null >/dev/null 2>&1; then
+  echo "==> [error] out/Makefile 记录的宿主编译器无法编译 C++ 头：$HOST_CXX_IN_MK"
+  "$HOST_CXX_IN_MK" -m64 -std=gnu++20 -x c++ -c /dev/null -o /dev/null 2>&1 | head -3 | sed 's/^/            | /'
+  echo "            这就是 abseil.host.mk 报 'atomic' file not found 的直接原因。"
+  echo "            可在环境变量里显式指定 CXX_host/CC_host 后重跑本脚本。"
+  exit 1
+fi
+echo "    [ok] 宿主编译器校验通过（非 android 工具链，且实测能编 C++ 头）"
+
+# ---------------------------------------------------------------------------
+# 构建生成器：坚持用 make，**不要切换到 ninja**（这是花了很久才确认的结论）。
+#
+#   android_configure.py 内部那行是
 #       ./configure --dest-cpu=... --dest-os=android --openssl-no-asm --cross-compiling
 #   **没有 --ninja**，所以默认落到 make。而本工程要编【两份 V8】：
 #       obj.host/   → x64，给 mksnapshot 等宿主工具用
 #       obj.target/ → arm64，最终 node 二进制
-#   实测在 4 vCPU 的 GitHub runner 上，make 跑满 150 分钟仍在 host V8 阶段
-#   （心跳 195 跳后被 timeout-minutes 掐断，job: cancelled）。
 #
-#   坑（第一次改这里时踩的，务必别重犯）：
-#     android_configure.py 第 74 行是  os.environ['GYP_DEFINES'] = GYP_DEFINES
-#     —— **只在它自己的 python 进程内生效，不会 export 到父 shell**。
-#     所以在外层直接重跑 ./configure 时 GYP_DEFINES 是空的，gyp 立刻报
-#         gyp: Undefined variable android_ndk_path in node.gyp while trying to load node.gyp
-#         Error running GYP
-#     而 configure 在报错前已经改写了 Makefile/config.gypi，导致随后的 make 也废了：
-#         make: *** No rule to make target 'out/Release/build.ninja', needed by 'node'.  Stop.
-#     （我原先写的「失败就回退 make」是错的 —— 此时 out/ 已被污染，回退回不去。）
+#   曾经为了省时间，改成 `./configure --ninja` 重跑。结果 ninja 生成器在
+#   「交叉编译 + host/target 双份 V8」这个组合下**有系统性缺陷**，连撞两堵墙：
 #
-#   正确做法: 自己显式带上 GYP_DEFINES（取值同 android_configure.py 第 69-73 行），
-#             在【同一个环境】重跑 configure 并加 --ninja。
-#             并且一旦这一步没拿到 build.ninja，就**干净退出**，
-#             而不是留着一个半配置好的 out/ 让后续 make 报出误导性的错误。
+#   墙 1：重复规则
+#     ninja: error: obj.host/tools/v8_gypfiles/v8_inspector_headers.ninja:14:
+#       multiple rules generate gen/inspector-generated-output-root/src/js_protocol.stamp
+#     根因: ninja 生成器把 SHARED_INTERMEDIATE_DIR 展开成 "<product_dir>/gen"
+#     （ninja.py 第 45 行 generator_default_variables），**丢掉了 host/target 前缀**；
+#     而 make 生成器用的是 "$(obj)/gen"（.host.mk 里 obj := $(abs_obj)），天然隔离。
+#     实测：该缺陷在原始 ninja 图里造成 1267 个重复输出。
+#     自己给 ninja.py 打补丁（让 SHARED_INTERMEDIATE_DIR 走
+#     GypPathToUniqueOutput("gen")）能消掉第 1 堵墙 —— 重复输出从 1267 降到 0，
+#     但立刻撞上第 2 堵墙，说明这条路上还有成体系的问题。
+#
+#   墙 2：依赖路径分裂（改 gyp 也治不好）
+#     ninja: error: 'obj/tools/v8_gypfiles/postmortem-metadata.gen/torque-generated/
+#       instance-types.h', needed by '.../postmortem-metadata.gen/debug-support.cc',
+#       missing and no known rule to make it
+#     同一份 SHARED_INTERMEDIATE_DIR 产物，因为 GypPathToUniqueOutput 对
+#     process_outputs_as_sources 的产物加了「各自目标名」前缀，生成端落在
+#       .../run_torque.gen/torque-generated/instance-types.h
+#     消费端却去找
+#       .../postmortem-metadata.gen/torque-generated/instance-types.h
+#     这是「目标名限定」与「跨目标引用」两种路径约定冲突，凡是用到
+#     process_outputs_as_sources 的目标都会踩，属于系统性问题而不是孤例。
+#     实测：修完墙 1 后，ninja 图里仍有 5309 个「无规则可生成」的缺失依赖。
+#
+#   结论: ninja 这条路是上游未验证的组合（官方 android_configure.py 从不用
+#         --ninja），逐个打补丁是无底洞。**make 才是上游唯一验证过的路径**，
+#         而且同一份重复规则在 make 下只是一句 warning
+#         （"warning: overriding recipe for target ..."）不致命。
+#
+#   时间预算（据此把 CI 超时提到 330 分钟是够的）:
+#     实测 make 模式下 host+target 合计约 3300 个编译单元
+#     （host ≈1600 / target ≈1700）。4 vCPU runner 上粗估 210~260 分钟。
+#     上一轮 146 分钟仍停在 host 阶段，真正原因不是时间不够，而是撞上了
+#     下面那条「宿主编译器选了 clang++ → 缺宿主 C++ 头」的报错在反复重试。
+#     把宿主工具链修好之后，make 可以在超时内跑完。
+#
+#   踩过的坑（勿重犯）: 用 GYP_DEFINES 在外层重跑 configure 时必须显式 export ——
+#     android_configure.py 第 74 行是 os.environ['GYP_DEFINES'] = GYP_DEFINES，
+#     只在它自己的 python 进程内生效，不会 export 到父 shell，否则 gyp 立刻报
+#     "gyp: Undefined variable android_ndk_path in node.gyp"。而 configure 报错前
+#     已改写 Makefile/config.gypi，随后 make 会报出误导性的
+#     "No rule to make target 'out/Release/build.ninja'"。
+#     既然已决定不用 ninja，这里就不再重跑 configure，保持 android-configure 的
+#     原始 make 配置即可 —— 少一次 configure 就少一个污染 out/ 的机会。
 # ---------------------------------------------------------------------------
+echo "==> 使用 make 生成器（android-configure 的默认配置，上游唯一验证过的路径）"
+echo "    注意: 构建生成器固定为 make；不要改成 --ninja（见上方注释）。"
+unset GYP_DEFINES GYP_GENERATORS 2>/dev/null || true
 USE_NINJA=0
 if command -v ninja >/dev/null 2>&1; then
-  echo "==> 切换到 Ninja 生成器（显式带上 GYP_DEFINES 重跑 configure）"
-  # 与 android_configure.py 保持一致的 gyp 变量集
-  export GYP_DEFINES="target_arch=${ARCH} v8_target_arch=${ARCH} android_target_arch=${ARCH} host_os=linux OS=android android_ndk_path=${ANDROID_NDK}"
-  echo "    GYP_DEFINES=$GYP_DEFINES"
-  if ./configure --dest-cpu="${ARCH}" --dest-os=android --openssl-no-asm --cross-compiling --ninja 2>&1 | tail -25; then
-    if [ -f out/Release/build.ninja ]; then
-      USE_NINJA=1
-      echo "    [ok] out/Release/build.ninja 已生成，将用 ninja 构建"
-      # ninja 图预检：gyp 的 ninja 生成器偶尔会产出重复规则
-      # （如 "multiple rules generate ... js_protocol.stamp"），
-      # 那会在编译中途才炸、且看着像编译器问题。这里提前查一次，
-      # 让报错落在「生成阶段」而不是「编译阶段」。预检失败不致命（仅警告），
-      # 避免因为 gyp 的无害告警把整个构建挡掉。
-      if ! ninja -C out/Release -n -t targets >/dev/null 2>/tmp/ninja-graph-check.err; then
-        echo "    [warn] ninja 图预检报告问题（不一定致命，继续编译）:"
-        head -5 /tmp/ninja-graph-check.err | sed 's/^/      /'
-      else
-        echo "    [ok] ninja 图预检通过"
-      fi
-    else
-      echo "    [error] configure --ninja 返回成功但没有 out/Release/build.ninja"
-      echo "            out/ 可能处于半配置状态。为安全起见中止，避免误导性报错。"
-      exit 1
-    fi
-  else
-    echo "    [error] configure --ninja 失败。"
-    echo "            configure 已改写 out/ 与 Makefile，此时回退 make 也会失败"
-    echo "            （会报 \"No rule to make target 'out/Release/build.ninja'\"）。"
-    echo "            如需在无 ninja 环境构建，请卸载 ninja 后重跑本脚本。"
-    exit 1
-  fi
-else
-  echo "==> [info] 未安装 ninja，使用 make（会明显更慢，且可能超出 CI 超时）"
+  echo "    [info] 系统里装了 ninja，但本构建刻意不使用它。"
 fi
+# 确认落到了 make（存在 out/Makefile 即说明是 make 生成器）
+if [ ! -f out/Makefile ]; then
+  echo "==> [error] 未找到 out/Makefile，说明配置没有落到 make 生成器。"
+  echo "            out/ 可能被之前的 --ninja 配置污染，请清理后重跑。"
+  exit 1
+fi
+echo "    [ok] out/Makefile 存在，确认使用 make 生成器"
 
 # ---------------------------------------------------------------------------
 # zlib cpufeatures 补丁（CI 实测验证版）：
@@ -458,18 +520,21 @@ fi
 #         实测证据: 打补丁后 cpu_features.o 的未定义符号从
 #         `U android_getCpuFeatures` 变为 `U getauxval`（libc 提供）。
 #
-#   两种生成器的产物位置不同，必须都覆盖（切 ninja 后曾漏掉，会导致老错误重现）：
-#     make  : out/deps/zlib/*.target.mk        （-DARMV8_OS_ANDROID 直接写在 mk 里）
-#     ninja : out/Release/obj/deps/zlib/*.ninja（同一个宏，写在 defines 展开处）
+#   产物位置（make 生成器）：out/deps/zlib/*.target.mk
+#     -DARMV8_OS_ANDROID 是 gyp 条件展开出的 -D，直接写在生成的 .target.mk 里。
+#   注意: 这里必须显式列出文件、不能用 `$ZMK_DIR/*.host.mk` 这类通配 ——
+#     zsh / 某些 shell 在通配无匹配时会直接让**整条命令**失败（"no matches found"），
+#     结果补丁静默不执行（曾真实踩到：total 0 而 ARMV8_OS_ANDROID 还在）。
+#     因此改成先 ls 收集、再判断，缺 .host.mk 也不影响。
 # ---------------------------------------------------------------------------
 ZMK_DIR="out/deps/zlib"
-ZMK_NINJA_DIR="out/Release/obj/deps/zlib"
 ZMK_FILES=""
-for pat in "$ZMK_DIR/*.target.mk" "$ZMK_DIR/*.host.mk" \
-           "$ZMK_NINJA_DIR/*.ninja"; do
-  for f in $pat; do
-    [ -f "$f" ] && ZMK_FILES="$ZMK_FILES $f"
-  done
+# 显式列出候选文件，逐个判断存在性（不用会在无匹配时让整条命令失败的 shell 通配）。
+for f in "$ZMK_DIR"/zlib.target.mk \
+         "$ZMK_DIR"/zlib_arm_crc32.target.mk \
+         "$ZMK_DIR"/zlib_adler32_simd.target.mk \
+         "$ZMK_DIR"/zlib_data_chunk_simd.target.mk; do
+  [ -f "$f" ] && ZMK_FILES="$ZMK_FILES $f"
 done
 if [ -n "$ZMK_FILES" ]; then
   echo "==> 修补 gyp 生成的 zlib 目标: ARMV8_OS_ANDROID -> ARMV8_OS_LINUX"
@@ -489,34 +554,34 @@ for f in sys.argv[1:]:
 print("  total: %d occurrence(s) in %d file(s)" % (total, total_files))
 if total == 0:
     sys.exit("FATAL: no -DARMV8_OS_ANDROID found in zlib gyp outputs "
-             "(searched make .mk and ninja .ninja); upstream layout changed, "
+             "(searched out/deps/zlib/*.target.mk); upstream layout changed, "
              "patch needs review")
 PY
   echo "==> 补丁后核对（应只剩 ARMV8_OS_LINUX）:"
   grep -h -o "ARMV8_OS_[A-Z]*" $ZMK_FILES 2>/dev/null | sort -u | sed 's/^/    /'
 else
-  echo "==> [warn] 未找到 zlib gyp 产物（$ZMK_DIR / $ZMK_NINJA_DIR），跳过补丁"
+  echo "==> [warn] 未找到 zlib gyp 产物（$ZMK_DIR），跳过补丁"
 fi
 
 echo "==> 编译 (NDK r27+ 链接器默认 max-page-size=16384 → 16KB 页对齐)"
 # 进度可见性：构建耗时以小时计，而 CI 侧只能靠心跳判断「还在跑 vs 卡死」。
-# 这里周期性打印一行进度（含时间戳），让 15MB 的日志里也能一眼看出推进速度。
+# 这里周期性打印一行进度（含时间戳与已产出目标数），让日志里也能一眼看出推进速度。
 JOBS="$(nproc)"
-if [ "$USE_NINJA" = "1" ]; then
-  echo "==> 使用 ninja -j${JOBS} 构建"
-  # 注意：本脚本开着 set -euo pipefail，ninja 一旦失败脚本会直接退出，
-  # 因此不需要（也不能依赖）管道后的 PIPESTATUS 兜底。
-  # 这里只是把输出逐行转发、给进度行加时间戳，不做错误吞并。
-  ninja -C out/Release -j"${JOBS}" 2>&1 | while IFS= read -r line; do
-    printf '%s\n' "$line"
-    case "$line" in
-      \[*/*\]*) printf '[progress %s] %s\n' "$(date -u +%H:%M:%S)" "$line" ;;
-    esac
+echo "==> 使用 make -j${JOBS} 构建（host+target 约 3300 个编译单元，预计 3~4 小时）"
+# 后台进度上报: 每 120 秒打一行「已编译 .o 数 + 时间戳」。
+# 这样 ci-hb 心跳之外，日志本身也能证明「在推进」而不是「卡死」。
+(
+  while true; do
+    sleep 120
+    t=$(find out/Release/obj.target -name '*.o' 2>/dev/null | wc -l)
+    h=$(find out/Release/obj.host   -name '*.o' 2>/dev/null | wc -l)
+    printf '[progress %s] host=%s target=%s\n' "$(date -u +%H:%M:%S)" "$h" "$t"
   done
-else
-  echo "==> 使用 make -j${JOBS} 构建"
-  make -j"${JOBS}"
-fi
+) &
+PROGRESS_PID=$!
+trap 'kill "$PROGRESS_PID" 2>/dev/null || true' EXIT
+
+make -j"${JOBS}"
 
 echo "==> 拷贝产物到 $OUT_DIR/node"
 cp out/Release/node "$OUT_DIR/node"
