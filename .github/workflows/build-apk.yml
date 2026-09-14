@@ -82,6 +82,13 @@ jobs:
                 # 是否已经出现 OOM 痕迹（内核会打 oom-kill 或进程报 Killed）
                 echo "oomhits: $(tail -c 200000 /tmp/node-build.log 2>/dev/null | grep -c 'Killed signal\|out of memory\|oom-kill' || echo 0)"
                 echo "lastprog: $(tail -3 /tmp/node-build.log 2>/dev/null | tr '\n' ' ' | cut -c1-160)"
+              else
+                # 缓存命中时 node-build 步骤会被整体跳过，不会有 node-build.log。
+                # 必须显式写出来，否则外部会看到一片空白而无法判断"是跳过了还是卡住了"。
+                echo "logsize: 0 (skipped: node build cache hit)"
+                echo "objs   : n/a"
+                echo "oomhits: n/a"
+                echo "lastprog: (node build skipped — reused cached binary)"
               fi
             } > hb.txt
             git add hb.txt >/dev/null 2>&1
@@ -168,6 +175,11 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          # 缓存 Gradle 的用户目录（~/.gradle）：内含下载过的 Gradle 发行包、
+          # 依赖 jar、transform 结果。上一轮日志里光是下载 gradle-8.9-bin.zip
+          # 就占了不少时间，且每次全新 runner 都要重下。加上它几乎是零成本。
+          # 注意：这里只缓存 Gradle 自身的东西，与上面的 Node 产物缓存互不影响。
+          cache: gradle
 
       # 说明：ubuntu-latest runner 自带 Android SDK（$ANDROID_SDK_ROOT / $ANDROID_HOME 已设置）。
       # 不使用第三方 setup-android action，避免“action 仓库解析不到导致 Set up job 直接失败”。
@@ -268,8 +280,81 @@ jobs:
           print("node-versions.json default ->", tag)
           PY
 
+      # ---------------------------------------------------------------------------
+      # Node 编译产物缓存（关键优化：避免"改一行 Kotlin 就重编 4 小时"）。
+      #
+      # 为什么需要：Node 交叉编译要跑约 6808 个编译单元、耗时 3~4 小时。
+      # 而实际迭代中绝大多数改动只在【下游】—— Kotlin 代码、gradle 配置、
+      # AndroidManifest。这些改动完全不影响 Node 二进制，却每次都把整个
+      # V8/ICU/OpenSSL 从头重编，纯属浪费。（真实教训：连续三轮 CI 失败都发生在
+      # gradle 阶段，每轮都白等近 4 小时编译。）
+      #
+      # 缓存 key 的设计（决定"什么时候该重编"）：
+      #   node-android-<node tag>-<build 脚本哈希>
+      #   - Node 版本变了      -> tag 变 -> 自动重编（符合预期）
+      #   - 编译脚本/补丁改了  -> 哈希变 -> 自动重编（**这点很重要**：
+      #     我们改过 aligned_alloc 补丁、宿主编译器逻辑等，那些改动必须
+      #     触发重编，否则会拿到旧产物，产生"改了却没生效"的诡异现象）
+      #   - 只改 Kotlin/gradle -> key 不变 -> 命中缓存，跳过编译
+      #
+      # 【只缓存最终二进制，刻意不缓存 out/ 目录】
+      #   一开始想把整个 out/ 也缓存起来，好让 make 做增量编译。权衡后放弃：
+      #   1) out/ 含 6808 个 .o，体积 3~6 GB。GitHub 单仓库缓存总额上限就是
+      #      10 GB，一个条目吃掉大半，且 7 天不用就被清理。
+      #   2) 压缩+上传+下载这么大的目录本身要十几分钟，省下的时间被吃掉一大半。
+      #   3) 我们的真实需求不是"增量编译"，而是"下游改动时压根别编" ——
+      #      只缓存 node 二进制（约 100~120 MB）完全够用，传输只要几十秒。
+      #   GitHub Actions 的 cache 本质上也不是增量缓存，它只做整份条目的
+      #   精确匹配 / 前缀回退，缓存中间态并不能带来真正的增量编译。
+      #
+      # restore-keys：本轮 key 未命中时按前缀回退到最近一次缓存。这里刻意
+      #   用同前缀，好处是换了编译脚本时仍能拿到旧二进制作为"应急兜底"；
+      #   但因为 key 变了就说明编译脚本动过，脚本改动很可能影响产物正确性，
+      #   所以【命中回退缓存时额外打一条醒目警告】，不静默使用。
+      # ---------------------------------------------------------------------------
+      - name: Cache compiled Node binary
+        id: nodecache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/dsh-node-cache
+          key: node-android-${{ steps.nodever.outputs.tag }}-${{ hashFiles('scripts/build-node-android.sh') }}
+          restore-keys: |
+            node-android-${{ steps.nodever.outputs.tag }}-
+
+      - name: Restore cached Node binary if present
+        id: restorenode
+        run: |
+          echo "=== 检查缓存的 Node 产物 ==="
+          mkdir -p app/src/main/assets/node-bin/arm64-v8a
+          EXACT_KEY="node-android-${{ steps.nodever.outputs.tag }}-${{ hashFiles('scripts/build-node-android.sh') }}"
+          if [ -f /tmp/dsh-node-cache/node ]; then
+            cp -f /tmp/dsh-node-cache/node app/src/main/assets/node-bin/arm64-v8a/node
+            chmod +x app/src/main/assets/node-bin/arm64-v8a/node
+            echo "cache-hit=yes" >> "$GITHUB_OUTPUT"
+            echo "[ok] 复用已编译的 node 二进制，跳过 3~4 小时交叉编译："
+            ls -la app/src/main/assets/node-bin/arm64-v8a/node
+            file -b app/src/main/assets/node-bin/arm64-v8a/node || true
+            # 区分「精确命中」与「前缀回退命中」。后者意味着编译脚本已变更，
+            # 这个二进制是旧脚本的产物，可能不是我们真正想要的 —— 必须警告。
+            SAVED_KEY="$(cat /tmp/dsh-node-cache/.cache-key 2>/dev/null || echo '<unknown>')"
+            if [ "$SAVED_KEY" = "${EXACT_KEY}:${GITHUB_RUN_ID}" ] || [ "${SAVED_KEY%:*}" = "$EXACT_KEY" ]; then
+              echo "[ok] 精确命中（编译脚本与 Node 版本均未变），复用的二进制即当前脚本的产物。"
+            else
+              echo "[warn] 回退命中（前缀匹配）：编译脚本或 Node 版本可能已变更。"
+              echo "       当前脚本对应的 key: $EXACT_KEY"
+              echo "       缓存实际的 key    : $SAVED_KEY"
+              echo "       本二进制来自较早的编译，若怀疑产物不是最新脚本的结果，"
+              echo "       可强制重编：把 build 脚本里任意一处改一个字符即可（key 随之变化）。"
+            fi
+          else
+            echo "cache-hit=no" >> "$GITHUB_OUTPUT"
+            echo "[miss] 无缓存产物，需要完整编译 Node（预计 3~4 小时）。"
+          fi
+
       - name: Build Node for Android (NDK 交叉编译 arm64-v8a)
         id: nodebuild
+        # 缓存命中则整步跳过 —— 这是本优化能省下 3~4 小时的直接原因。
+        if: steps.restorenode.outputs.cache-hit != 'yes'
         env:
           ANDROID_NDK: ${{ env.ANDROID_NDK }}
           ANDROID_API: "24"
@@ -284,6 +369,38 @@ jobs:
           chmod +x scripts/build-node-android.sh
           # 不用 nproc 拉满，交给脚本按内存自适应（脚本内也会读同样的限额）。
           ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }} 2>&1 | tee /tmp/node-build.log
+
+      - name: Save Node binary to cache
+        # 条件说明（这里的判断很关键，别改错）：
+        #   cache-hit != 'yes'  —— 未命中缓存才保存，避免每次重写同一份。
+        #   steps.nodebuild.outcome == 'success' —— **只要求 Node 编译本身成功**，
+        #      而不是整个 job 成功。
+        # 为什么不用 success()：success() 要求【此前所有步骤】都成功，且一旦后续
+        #   gradle 失败，这个步骤就已经被跳过了。但事实上 Node 二进制在下游
+        #   （Kotlin 编译、APK 打包）失败时【依然是完好的】—— 它本身已经编完，
+        #   跟下游是两回事。
+        #   真实教训：连续三轮失败都出在 gradle，而每一轮里 node 其实都编译成功了。
+        #   若用 success()，这些可复用的编译成果会被全部丢弃，下次还得再编 4 小时。
+        #   用 nodebuild 自身的 outcome 判断，就能把这些成果保下来 —— 这恰好是
+        #   本缓存最重要的价值场景。
+        # 注意：cache-hit == 'yes' 时 nodebuild 是 skipped，outcome 为 'skipped'，
+        #      不等于 'success'，故不会重复保存，符合预期。
+        if: steps.restorenode.outputs.cache-hit != 'yes' && steps.nodebuild.outcome == 'success'
+        run: |
+          echo "=== 保存 Node 产物到缓存目录 ==="
+          mkdir -p /tmp/dsh-node-cache
+          if [ ! -f out/Release/node ]; then
+            echo "[warn] out/Release/node 不存在，跳过缓存保存。"
+            exit 0
+          fi
+          cp -f out/Release/node /tmp/dsh-node-cache/node
+          chmod +x /tmp/dsh-node-cache/node
+          # 记下产出这份缓存时的 key + run id，供下次区分"精确命中/回退命中"。
+          echo "node-android-${{ steps.nodever.outputs.tag }}-${{ hashFiles('scripts/build-node-android.sh') }}:${GITHUB_RUN_ID}" \
+            > /tmp/dsh-node-cache/.cache-key
+          ls -la /tmp/dsh-node-cache/
+          du -sh /tmp/dsh-node-cache/ 2>/dev/null || true
+          echo "[ok] 已写入缓存。即使后续 gradle 步骤失败，这份 Node 二进制也能被下次运行复用。"
 
       - name: Build debug APK
         id: gradlebuild
@@ -373,12 +490,20 @@ jobs:
             echo "host-deps   : ${{ steps.hostdeps.outcome }}"
             echo "node-tag    : ${{ steps.nodever.outcome }}"
             echo "sync-json   : ${{ steps.syncjson.outcome }}"
+            echo "node-cache  : ${{ steps.nodecache.outcome }}"
+            echo "node-restore: ${{ steps.restorenode.outcome }}"
+            echo "node-reused : ${{ steps.restorenode.outputs.cache-hit }}"
             echo "node-build  : ${{ steps.nodebuild.outcome }}"
             echo "gradle-build: ${{ steps.gradlebuild.outcome }}"
             echo
-            echo "=== node-build.log size / tail ==="
-            wc -c /tmp/node-build.log 2>/dev/null || echo "(no node-build.log)"
-            tail -30 /tmp/node-build.log 2>/dev/null | cut -c1-400
+            if [ "${{ steps.restorenode.outputs.cache-hit }}" = "yes" ]; then
+              echo "=== node-build.log ==="
+              echo "(skipped — 复用了缓存中已编译的 node 二进制，未重新编译)"
+            else
+              echo "=== node-build.log size / tail ==="
+              wc -c /tmp/node-build.log 2>/dev/null || echo "(no node-build.log)"
+              tail -30 /tmp/node-build.log 2>/dev/null | cut -c1-400
+            fi
           } > /tmp/ci-last-report.txt
           cd /tmp/lastpush
           git clone --quiet "https://x-access-token:${TOKEN_USE}@github.com/${{ github.repository }}.git" . 2>/dev/null || true
@@ -422,9 +547,15 @@ jobs:
             echo "host-deps   : ${{ steps.hostdeps.outcome }}"
             echo "node-tag    : ${{ steps.nodever.outcome }}"
             echo "sync-json   : ${{ steps.syncjson.outcome }}"
+            echo "node-cache  : ${{ steps.nodecache.outcome }}"
+            echo "node-restore: ${{ steps.restorenode.outcome }}"
+            echo "node-reused : ${{ steps.restorenode.outputs.cache-hit }} (yes=跳过重编)"
             echo "node-build  : ${{ steps.nodebuild.outcome }}"
             echo "gradle-build: ${{ steps.gradlebuild.outcome }}"
             echo
+            if [ "${{ steps.restorenode.outputs.cache-hit }}" = "yes" ]; then
+              echo "（node-build 因命中缓存被跳过，node-build.log 不存在，属正常）"
+            fi
             echo "=== sdk-install.log (filtered tail 60, license noise removed) ==="
             grep -viE "warranty|liability|indemnif|export regulation|severability|pre-release|evaluation license|open source software|MIPS|Accept\? \(y/N\)|YOUR USE OF|Google is the parent|third party beneficiaries|EXPORT RESTRICTIONS|governing law|Santa Clara|conflict of laws" /tmp/sdk-install.log 2>/dev/null | tail -60 \
               || echo "(no sdk-install.log)"
