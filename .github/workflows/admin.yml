@@ -49,10 +49,18 @@ jobs:
           echo "cmd=$CMD"
           echo "cmd=$CMD" >> "$GITHUB_OUTPUT"
           case "$CMD" in
-            cancelall)  echo "kind=cancelall" >> "$GITHUB_OUTPUT" ;;
-            cancel-*)   echo "kind=cancel"; echo "target=${CMD#cancel-}" >> "$GITHUB_OUTPUT" ;;
-            status-*)   echo "kind=status"; echo "target=${CMD#status-}" >> "$GITHUB_OUTPUT" ;;
-            *)          echo "[error] 未知动作: $CMD"; exit 1 ;;
+            cancelall)
+              echo "kind=cancelall" >> "$GITHUB_OUTPUT" ;;
+            cancel-*)
+              echo "kind=cancel"   >> "$GITHUB_OUTPUT"
+              echo "target=${CMD#cancel-}" >> "$GITHUB_OUTPUT" ;;
+            status-*)
+              echo "kind=status"   >> "$GITHUB_OUTPUT"
+              echo "target=${CMD#status-}" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "[error] 未知动作: $CMD"
+              echo "kind=unknown" >> "$GITHUB_OUTPUT"
+              exit 1 ;;
           esac
 
       - name: Execute
