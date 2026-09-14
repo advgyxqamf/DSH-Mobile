@@ -208,13 +208,44 @@ jobs:
             ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
+          # 把「产物指纹」上报到 ci-ok 分支。
+          # 为什么这么做：维护环境（沙箱）无法直连 github.com / objects.githubusercontent.com
+          # 下载 Release 附件，只能靠 CI 自报指纹来远程确认「发出去的包里到底有什么」。
+          # 所以这里必须报告【可验证的事实】，而不是一句"成功"。
           {
             echo "REPACK_REPORT"
             echo "time : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo "from : run ${{ steps.src.outputs.run_id }}"
             echo "job  : ${{ job.status }}"
             echo "note : 注入 libc++_shared.so，修复 cannot locate symbol"
+            echo
+            echo "=== APK 指纹 (/tmp/app-signed.apk) ==="
+            if [ -f /tmp/app-signed.apk ]; then
+              echo "size  : $(stat -c%s /tmp/app-signed.apk) 字节"
+              echo "sha256: $(sha256sum /tmp/app-signed.apk | cut -d' ' -f1)"
+              echo "md5   : $(md5sum /tmp/app-signed.apk | cut -d' ' -f1)"
+            else
+              echo "(APK 不存在 —— 前面某步失败了)"
+            fi
+            echo
+            echo "=== lib/ 内容 ==="
+            if [ -f /tmp/app-signed.apk ]; then
+              unzip -l /tmp/app-signed.apk 2>/dev/null | grep 'lib/' || echo "(无 lib/ 条目)"
+            fi
+            echo
+            echo "=== 签名方案 ==="
+            if [ -f /tmp/app-signed.apk ]; then
+              APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)"
+              "$APKSIGNER" verify --verbose /tmp/app-signed.apk 2>&1 || true
+            fi
+            echo
+            echo "=== Release 里的附件 ==="
+            gh release view "${{ inputs.tag || 'apk-latest' }}" \
+              --repo '${{ github.repository }}' --json assets \
+              --jq '.assets[] | "  \(.name)  \(.size) bytes  digest=\(.digest // "n/a")"' 2>/dev/null || true
           } > /tmp/ci-ok.txt
+
+          cat /tmp/ci-ok.txt
 
           git config user.name  'CI Reporter' || true
           git config user.email 'ci@workbuddy.local' || true
