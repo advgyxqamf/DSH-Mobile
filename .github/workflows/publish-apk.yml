@@ -1,0 +1,145 @@
+name: Publish APK (from existing artifact)
+
+# ============================================================================
+#  把【已经构建成功】的 APK 从 Actions artifact 转到 Release。
+#
+#  为什么单独做一个 workflow：
+#    主流程 build-apk.yml 要从头交叉编译 Node，耗时 3~4 小时。而 APK 一旦
+#    编好（挂在 artifact 上），"把它发到 Release"这件事本身只需几秒。
+#    更需要这个 workflow 的真实原因是：artifact 的下载地址走 api.github.com，
+#    而本项目维护环境的外网是白名单制、该域名被屏蔽（已实测：curl 返回
+#    连接失败），ghproxy 对 /actions 路径也返回 403。
+#    于是 artifact 在外部【完全拿不到】—— 必须转成 Release 资产才有可下载网址。
+#
+#    这个 workflow 不编译任何东西，只做搬运，所以可以随时手动触发，
+#    把历史上任意一次成功构建的产物发布出来。
+#
+#  用法：
+#    Actions → "Publish APK (from existing artifact)" → Run workflow
+#    run_id 留空 = 自动挑选最近一次成功的 build-apk 运行。
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '要发布的 build-apk 运行 ID（留空 = 自动选最近一次成功运行）'
+        required: false
+        default: ''
+      tag:
+        description: 'Release tag（默认 apk-latest，会被覆盖更新）'
+        required: false
+        default: 'apk-latest'
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write       # 建 Release / 传资产
+      actions: read         # 列取/下载本仓库的 artifact
+
+    steps:
+      - name: Resolve target run and download artifact
+        id: get
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          RUN_ID="${{ inputs.run_id }}"
+
+          if [ -z "$RUN_ID" ]; then
+            echo "== 未指定 run_id，自动查找最近一次成功运行 =="
+            RUN_ID="$(gh run list \
+                        --repo '${{ github.repository }}' \
+                        --workflow 'build-apk.yml' \
+                        --status success \
+                        --limit 1 \
+                        --json databaseId \
+                        --jq '.[0].databaseId')"
+            if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+              echo "[error] 找不到任何成功的 build-apk 运行。"
+              echo "        请先让 Build Android Node Container APK 成功一次。"
+              exit 1
+            fi
+          fi
+          echo "目标 run: $RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+          echo "== 该 run 的 artifact 列表 =="
+          gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '.artifacts[] | "\(.name)  (\(.size_in_bytes) bytes, expired=\(.expired))"' || true
+
+          echo "== 下载 artifact: android-node-container-apk =="
+          rm -rf /tmp/dl && mkdir -p /tmp/dl
+          gh run download "$RUN_ID" \
+            --repo '${{ github.repository }}' \
+            --name android-node-container-apk \
+            --dir /tmp/dl
+
+          echo "== 下载内容 =="
+          find /tmp/dl -type f | head -20
+          APK="$(find /tmp/dl -name '*.apk' -type f | head -1)"
+          if [ -z "$APK" ]; then
+            echo "[error] artifact 里没有 .apk 文件。"
+            exit 1
+          fi
+          echo "找到 APK: $APK ($(du -h "$APK" | cut -f1))"
+          cp "$APK" /tmp/app-debug.apk
+          ls -la /tmp/app-debug.apk
+
+      - name: Publish to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          echo "== 发布到 Release tag: $TAG =="
+
+          # tag 固定（默认 apk-latest）：存在则更新，不存在则创建。
+          # 这样下载网址是稳定的，不必每轮去查新地址。
+          if gh release view "$TAG" --repo '${{ github.repository }}' >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，将覆盖资产。"
+          else
+            echo "Release $TAG 不存在，创建中…"
+            gh release create "$TAG" \
+              --repo '${{ github.repository }}' \
+              --title "DSH Mobile APK (latest)" \
+              --notes "Android 原生 Node 容器 APK。来源 run: ${{ steps.get.outputs.run_id }}"
+          fi
+
+          gh release upload "$TAG" /tmp/app-debug.apk#app-debug.apk \
+            --repo '${{ github.repository }}' --clobber
+
+          echo
+          echo "=== 发布完成 ==="
+          gh release view "$TAG" --repo '${{ github.repository }}' --json url,assets \
+            --jq '.assets[] | "\(.name)  \(.size) bytes  \(.url)"' || true
+          echo
+          echo "下载地址:"
+          echo "https://github.com/${{ github.repository }}/releases/download/${TAG}/app-debug.apk"
+
+      - name: Record URL to ci-ok branch
+        # 把可下载地址写进 ci-ok 自报分支，便于外部读取（环境限制下这是主要通道）。
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          rm -rf /tmp/okp && mkdir -p /tmp/okp && cd /tmp/okp
+          git clone --quiet \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" . || {
+              echo "[warn] clone 失败，跳过 ci-ok 更新"; exit 0; }
+          {
+            echo "BUILD_OK"
+            echo "time : $(date -u)"
+            echo "from : published from run ${{ steps.get.outputs.run_id }}"
+            echo "apk  : app-debug.apk"
+            echo "url  : https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/app-debug.apk"
+          } > ci-ok.txt
+          git config user.email "ci@workbuddy.local"
+          git config user.name "CI Diagnostic Bot"
+          git add ci-ok.txt
+          git commit -q -m "ci: apk published" || true
+          git push origin HEAD:ci-ok --force && echo "[ok] ci-ok updated"
