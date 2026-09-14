@@ -788,6 +788,65 @@ echo "==> 拷贝产物到 $OUT_DIR/$OUT_NAME"
 cp out/Release/node "$OUT_DIR/$OUT_NAME"
 chmod +x "$OUT_DIR/$OUT_NAME"
 
+# ---------------------------------------------------------------------------
+# 连带打包 libc++_shared.so —— 这一步曾漏掉，导致真机报：
+#     CANNOT LINK EXECUTABLE ".../libnode.so": cannot locate symbol
+#     "_ZTVNSt6__ndk119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE"
+#
+# 原因：node 动态依赖 libc++_shared.so（readelf -d 可见 NEEDED 项），
+#   std::__ndk1::basic_ostringstream 等符号都由它提供。
+#   而它【不在 Android 系统里】（不是 bionic 的一部分），必须随 APK 一起打包，
+#   否则运行时 linker 找不到符号 —— 症状就是上面那条 "cannot locate symbol"。
+#
+# 注意：必须用【本次编译所用 NDK】里的那一份，版本要匹配；
+#   从别的 NDK 拿可能因 ABI/符号版本不一致而再次失败。
+# ---------------------------------------------------------------------------
+echo "==> 打包 libc++_shared.so（node 运行时的动态依赖，系统不提供）"
+LIBCXX_SRC="$(ls "$ANDROID_NDK"/toolchains/llvm/prebuilt/*/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so 2>/dev/null | head -1)"
+if [ -z "$LIBCXX_SRC" ] || [ ! -f "$LIBCXX_SRC" ]; then
+  echo "==> [error] 在 NDK 里找不到 libc++_shared.so，无法连带打包。"
+  echo "           查找路径: $ANDROID_NDK/toolchains/llvm/prebuilt/*/sysroot/usr/lib/aarch64-linux-android/"
+  exit 1
+fi
+cp -f "$LIBCXX_SRC" "$OUT_DIR/libc++_shared.so"
+chmod +x "$OUT_DIR/libc++_shared.so"
+echo "    源: $LIBCXX_SRC"
+echo "    目标: $OUT_DIR/libc++_shared.so ($(stat -c%s "$OUT_DIR/libc++_shared.so") 字节)"
+
+# ---- 依赖闭环自检：libnode.so 需要的每个 .so 都必须在本目录里备齐 ----
+# 这是本脚本最重要的一道护栏。做法：读 ELF 的 NEEDED 列表，逐个核对。
+#   · bionic 自带的（libc/libm/libdl/liblog/libz 等）由系统提供，跳过；
+#   · 其余（尤其 libc++_shared.so）必须由我们随包提供。
+# 之所以要自动化：这类问题在【编译期毫无征兆】，只有装到真机上才会暴露，
+#   而一轮 CI 要 3 小时 —— 人工核对极易漏，必须让脚本自己兜住。
+echo "==> 依赖闭环自检"
+READELF="$(ls "$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin/llvm-readelf 2>/dev/null | head -1)"
+MISSING=""
+if [ -n "$READELF" ]; then
+  NEEDED="$("$READELF" -d "$OUT_DIR/$OUT_NAME" 2>/dev/null | awk '/NEEDED/{gsub(/[\[\]]/,"",$NF); print $NF}')"
+  for lib in $NEEDED; do
+    case "$lib" in
+      libc.so|libm.so|libdl.so|liblog.so|libz.so|libandroid.so|libGLESv2.so|libEGL.so|libnativewindow.so|libsync.so|libatomic.so|libstdc++.so)
+        echo "    [ok] $lib （bionic/系统提供）" ;;
+      *)
+        if [ -f "$OUT_DIR/$lib" ]; then
+          echo "    [ok] $lib （已随包提供）"
+        else
+          echo "    [FAIL] $lib 被 node 依赖，但 $OUT_DIR 下没有它！"
+          MISSING="$MISSING $lib"
+        fi ;;
+    esac
+  done
+else
+  echo "    [warn] 找不到 llvm-readelf，跳过依赖检查"
+fi
+if [ -n "$MISSING" ]; then
+  echo "==> [error] 缺少运行期依赖:$MISSING"
+  echo "           这些库在 Android 系统里不存在，必须随 APK 打包，"
+  echo "           否则真机启动会报 'cannot locate symbol'。"
+  exit 1
+fi
+
 # ---- 自检：确认产物能满足「在 /data/app lib dir 里被执行」的全部前提 ----
 # 说明：这里的检查要分清「硬条件」和「提示信息」，不要误杀。
 #   · 关键认知修正：被改名为 lib*.so 的这个文件【并不是真的共享库】。
