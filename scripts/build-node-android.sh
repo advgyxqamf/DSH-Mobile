@@ -237,6 +237,103 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# cctest / aligned_alloc 补丁（必须，否则 make 的 node 目标在最后一步失败）：
+#
+#   现象: 编译到 cctest 时停在
+#           ../test/cctest/test_crypto_clienthello.cc:57:40: error:
+#             use of undeclared identifier 'aligned_alloc'
+#              57 |  alloc_base = static_cast<uint8_t*>(aligned_alloc(page, 2 * page));
+#           make[1]: *** [cctest.target.mk:267: .../test_crypto_clienthello.o] Error 1
+#           make: *** [Makefile:143: node] Error 2
+#
+#   根因: aligned_alloc() 是 C11 函数，bionic 从 **API 28** 才提供。
+#         实测矩阵（NDK r27c，aarch64-linux-android<API>-clang++）:
+#             API 24: FAIL   API 28: OK   API 29: OK   API 30: OK
+#         而本工程 ANDROID_API=24（见本脚本顶部），所以必然失败。
+#
+#   为什么必须修而不是"跳过 cctest"：
+#         make 的 `node` 目标会把 cctest 一并编出来（不是独立目标），
+#         想绕开就得改 node.gyp，动上游构建图的风险远大于改这一行测试代码。
+#         而且抬高 ANDROID_API 到 28 会把整个 APK 的最低系统要求提到 Android 9，
+#         属于用功能换编译，不划算 —— 这一行只是测试里的对齐分配，替换掉毫无损失。
+#
+#   修法: aligned_alloc(page, 2*page) → memalign(page, 2*page)。
+#         两者语义在这段用法里完全等价（对齐值 = 页大小，必然是 2 的幂，
+#         且分配大小 2*page 是页大小的整数倍），返回值同样可用 free() 释放。
+#         选 memalign 而不是 posix_memalign 的原因：memalign 返回指针，
+#         可以直接嵌进 static_cast<uint8_t*>(...) 而不必改写控制流；
+#         它自 API 1 起就在 bionic 里（NDK 头 malloc.h:111 无 __INTRODUCED_IN 门槛，
+#         而相邻的 reallocarray 明确标了 __INTRODUCED_IN(29) 作对照），
+#         posix_memalign 同样自 API 1 可用，两者都实测过关。
+#
+#   实测验证（不是推断）：
+#         1) 原始代码 API24 → 报同一条 undeclared identifier；API28 → 通过。
+#         2) 改后代码 API24 编译通过，且
+#              clang -Wl,--no-undefined  链接通过
+#            → 证明 memalign 符号在 API 24 的 bionic 里确实存在（不只是头文件放行）。
+#         3) 动态符号表确认解析到 memalign@LIBC。
+# ---------------------------------------------------------------------------
+CCTEST_HELLO="test/cctest/test_crypto_clienthello.cc"
+if [ -f "$CCTEST_HELLO" ]; then
+  echo "==> 应用 aligned_alloc 补丁（API ${ANDROID_API} < 28，bionic 无该函数）: $CCTEST_HELLO"
+  python3 - "$CCTEST_HELLO" <<'PY'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8', errors='replace').read()
+if 'android-container patch' in s:
+    print("  already patched, skip")
+    sys.exit(0)
+
+old = "alloc_base = static_cast<uint8_t*>(aligned_alloc(page, 2 * page));"
+new = ("// [android-container patch] aligned_alloc() only exists in bionic from API 28;\n"
+       "    // this build targets API 24. memalign() has been available since API 1 and\n"
+       "    // is equivalent here (alignment == page size, a power of two; size is a\n"
+       "    // multiple of the alignment; result is free()-able).\n"
+       "    alloc_base = static_cast<uint8_t*>(memalign(page, 2 * page));")
+if old not in s:
+    sys.exit("FATAL: aligned_alloc anchor not found in %s; upstream layout "
+             "changed, patch needs review" % p)
+s = s.replace(old, new, 1)
+open(p, 'w', encoding='utf-8').write(s)
+print("  patched: aligned_alloc -> memalign (1 occurrence)")
+PY
+  # 自动断言：不允许【可编译的调用点】再出现 aligned_alloc（防止上游又加一处）。
+  # 注意：必须排除注释行 —— 我们自己的补丁说明里就写着 "aligned_alloc()"，
+  # 若用裸 grep 会误报（这个坑实测踩到过）。这里只匹配非注释行中的调用形态。
+  ALIGNED_CALLS="$(grep -n "aligned_alloc[[:space:]]*(" "$CCTEST_HELLO" \
+                     | grep -v ":[[:space:]]*//" \
+                     | grep -v ":[[:space:]]*\*" || true)"
+  if [ -n "$ALIGNED_CALLS" ]; then
+    echo "==> [error] $CCTEST_HELLO 里仍有 aligned_alloc 调用："
+    echo "$ALIGNED_CALLS" | sed 's/^/        | /'
+    echo "            API ${ANDROID_API} 下会再次报 'use of undeclared identifier'。"
+    exit 1
+  fi
+  echo "    [ok] 已无 aligned_alloc 调用点（注释中的说明文字已排除）"
+  # 自动断言：memalign 必须能在 API ${ANDROID_API} 下真链接（--no-undefined 是硬校验）。
+  NDKBIN_FOR_CHECK="$(ls -d "$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin 2>/dev/null | head -1)"
+  if [ -n "$NDKBIN_FOR_CHECK" ] && [ -x "$NDKBIN_FOR_CHECK/aarch64-linux-android${ANDROID_API}-clang" ]; then
+    cat > "$WORK/memalign_probe.c" <<'PROBE'
+#include <malloc.h>
+#include <stdlib.h>
+int main(void) { void* p = memalign(4096, 8192); free(p); return 0; }
+PROBE
+    if "$NDKBIN_FOR_CHECK/aarch64-linux-android${ANDROID_API}-clang" -Wl,--no-undefined \
+         "$WORK/memalign_probe.c" -o "$WORK/memalign_probe" >/dev/null 2>&1; then
+      echo "    [ok] memalign 在 API ${ANDROID_API} 下可链接（--no-undefined 校验通过）"
+    else
+      echo "==> [warn] memalign 在 API ${ANDROID_API} 下 --no-undefined 校验未通过，"
+      echo "            输出如下（若真失败，需改用其他对齐分配方案）："
+      "$NDKBIN_FOR_CHECK/aarch64-linux-android${ANDROID_API}-clang" -Wl,--no-undefined \
+        "$WORK/memalign_probe.c" -o "$WORK/memalign_probe" 2>&1 | head -5 | sed 's/^/        | /'
+    fi
+    rm -f "$WORK/memalign_probe.c" "$WORK/memalign_probe"
+  fi
+else
+  echo "==> [warn] $CCTEST_HELLO 不存在，跳过 aligned_alloc 补丁"
+fi
+
+# ---------------------------------------------------------------------------
 # 宿主工具链分离（必须在 android-configure 之前 export，否则 build 会在 ICU 阶段崩）：
 #
 #   现象: /bin/sh: 1: .../out/Release/icupkg: Exec format error
