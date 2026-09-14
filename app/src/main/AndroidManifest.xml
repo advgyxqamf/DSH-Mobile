@@ -19,7 +19,26 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.NodeContainer"
-        tools:targetApi="34">
+        tools:targetApi="34"
+        tools:ignore="UnusedAttribute"
+        android:extractNativeLibs="true">
+        <!--
+          android:extractNativeLibs="true" 是必须的，且与 packaging.jniLibs.
+          useLegacyPackaging = true 是同一件事的两种写法（两处都写，双保险）。
+
+          原因：我们要 exec 的 node 二进制，以 jniLibs/arm64-v8a/libnode.so 的形式
+          打包。只有 extractNativeLibs=true，Android 才会在【安装时】把这个 .so
+          从 APK 里解压到
+              /data/app/~~xxxx/<pkg>-yyyy/lib/arm64-v8a/libnode.so
+          而那个目录是 SELinux 唯一允许 exec 的应用目录（label exec_type）。
+
+          若为 false（AGP 3.6+ 的默认），.so 会以压缩形式留在 APK 内、运行时直接
+          mmap 加载，不会在文件系统上落盘 —— 我们就拿不到可执行的路径，
+          ProcessBuilder 会以 error=2 (No such file) 或 error=13 失败。
+
+          顺带说明：这个属性只影响「.so 是否解压落盘」，不改变任何权限语义，
+          也不影响 minSdk/兼容性。
+        -->
 
         <!-- Node 运行时：独立进程 :node，与 UI 进程隔离；exported=false 防外部拉起 -->
         <service

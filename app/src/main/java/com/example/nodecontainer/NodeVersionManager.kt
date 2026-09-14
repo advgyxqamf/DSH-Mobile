@@ -74,8 +74,27 @@ class NodeVersionManager(private val context: Context) {
         tmp.renameTo(currentPointer)
     }
 
-    fun isInstalled(version: String): Boolean =
-        NodeProvisioner.nodeExecutable(context, version).canExecute()
+    /**
+     * 某版本是否"可用"。
+     *
+     * 语义变更说明（配合 W^X 修复）：
+     *  - bundled 版本：可用性来自 nativeLibraryDir 里的 libnode.so。注意 lib dir 里
+     *    永远只有【安装 APK 时打包的那一份】，所以这里只能判断"内置运行时在不在"，
+     *    无法用版本来区分 —— 因此返回值带上了 default 的语义。
+     *  - 非 bundled 版本：看 OTA 解压到 filesDir 的那份是否存在。
+     *    但必须提醒：那份【不可执行】（Android 10+ 禁止 exec 可写目录），
+     *    所以这个 true 只表示"数据已就位"，不代表能跑起来。
+     *    不要用它来做"能否启动"的决策。
+     */
+    fun isInstalled(version: String): Boolean {
+        val m = loadManifest()
+        val meta = m.versions.firstOrNull { it.version == version }
+        return if (meta?.bundled == true) {
+            NodeProvisioner.bundledExecutable(context).exists()
+        } else {
+            NodeProvisioner.otaExecutable(context, version).exists()
+        }
+    }
 
     /** 已安装到沙箱的版本目录名列表。 */
     fun installedVersions(): List<String> {

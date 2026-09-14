@@ -18,19 +18,52 @@
 
 ```
 APK (com.example.nodecontainer)
-├─ assets/node-bin/arm64-v8a/node      ← NDK 编出的 node（构建时注入，首启离线可用）
+├─ jniLibs/arm64-v8a/libnode.so        ← NDK 编出的 node（构建时注入，首启离线可用）
+│                                         安装时由系统解压到 /data/app/.../lib/<abi>/
 ├─ assets/node/server.js               ← 容器探针（后续换成你的负载，如 DSH Web UI）
 ├─ assets/node-versions.json           ← 版本清单（驱动 OTA 升级）
 └─ Kotlin 层
    ├─ NodeContainerApp       通知渠道
    ├─ NodeRuntimeService(:node 独立进程，前台服务)
-   │     └─ ProcessBuilder → exec node server.js --port 3080
-   ├─ NodeProvisioner        把 assets/node-bin 解压到 files/node/<v>/，chmod +x
+   │     └─ ProcessBuilder → exec ${nativeLibraryDir}/libnode.so server.js --port 3080
+   ├─ NodeProvisioner        定位 lib dir 里的 libnode.so（不再复制到 filesDir）
    ├─ NodeVersionManager     读清单 / 当前版本指针 / OTA 下载+sha256 校验+原子切换
    └─ MainActivity           WebView 加载 http://127.0.0.1:3080
 ```
 
 进程模型：`MainActivity`（UI 进程）→ 启动 `NodeRuntimeService`（独立 `:node` 进程，前台服务保活）→ 它 `exec` 出一个 `node` 子进程监听回环端口 → WebView 渲染本地 UI。
+
+### ⚠️ 为什么 node 必须放在 jniLibs 而不是 assets
+
+这是本项目踩过的最大一个坑，也是**真机 `error=13, Permission denied` 的根因**，改动前务必先读：
+
+Android 10 (API 29) 起 SELinux 强制 **W^X** 策略：
+
+| 路径 | SELinux label | 能否 `execve` |
+|---|---|---|
+| `/data/data/<pkg>/files/`（`getFilesDir()`） | `app_data_file` | ❌ 禁止 |
+| `/data/data/<pkg>/cache/`（`getCacheDir()`） | `app_data_file` | ❌ 禁止 |
+| `/data/app/<pkg>/lib/<abi>/`（`nativeLibraryDir`） | `exec_type` | ✅ 允许 |
+
+把 node 解压到 `filesDir` 再 `ProcessBuilder` 启动，会得到：
+
+```
+IOException: Cannot run program ".../files/node/24.21.0/node": error=13, Permission denied
+```
+
+官方认定这是**设计如此**（Google issuetracker 128554619）：
+
+> Calling exec() on writable application files is a W^X violation... While exec() no longer works on files within the application home directory, it continues to be supported for files within the read-only /data/app directory. In particular, it should be possible to package the binaries into your application's native libs directory and enable android:extractNativeLibs=true, and then call exec() on the /data/app artifacts.
+
+因此方案是：**把 node 命名为 `libnode.so` 放进 `jniLibs/<abi>/`，开启 `extractNativeLibs`，运行时从 `applicationInfo.nativeLibraryDir` 执行。** 三个配套条件缺一不可：
+
+1. 文件名必须是 `lib*.so` 形式，否则 AGP 不会当 native lib 处理；
+2. `android:extractNativeLibs="true"`（本项目在 Manifest 与 gradle 两处都写了）—— 否则 AGP 3.6+ 默认把 `.so` 压缩在 APK 内不落盘，文件系统上根本没有可执行路径；
+3. 二进制解释器必须是 Android 的 `/system/bin/linker64`（我们的交叉编译产物天然满足）。
+
+> **一个隐蔽的陷阱**：`File.canExecute()` 对上述限制**完全无感** —— 它只查 stat 的 x 权限位，不知道 noexec 挂载、更不知道 SELinux 策略。所以它在 `filesDir` 那份文件上照样返回 `true`，造成"诊断显示可执行、真 exec 却失败"的假阳性。**判断能否执行，唯一可靠的办法是真去执行一次**（本项目在启动前跑一次 `node -v` 来验证）。
+
+> **对 OTA 的影响**：`nativeLibraryDir` 是安装时固定、运行期只读的，且每次 APK 更新路径中的随机串都会变。这意味着"在沙箱放多个版本目录、切指针"的 OTA 方案在该路径上不成立。当前策略是以内置版本保证首启可用；OTA 通道的下载/校验/解压链路保留，但解压到 `filesDir` 的 node 在当前 Android 上无法直接 exec。
 
 ---
 
@@ -45,7 +78,7 @@ APK (com.example.nodecontainer)
 ```bash
 # 默认编 Node 24 LTS
 ANDROID_NDK=/path/to/ndk ./scripts/build-node-android.sh 24.21.0
-# 产物 -> app/src/main/assets/node-bin/arm64-v8a/node
+# 产物 -> app/src/main/jniLibs/arm64-v8a/libnode.so
 ```
 
 脚本内部：克隆 Node 官方源码 → `./android-configure $NDK arm64 24` → `make`。
@@ -89,7 +122,7 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 - 逐阶段、带时间戳地打印：`init → manifest → version → provision → script → exec → port`。
 - **成功**：端口就绪后自动切换到 Node 探针 Web UI。
 - **失败**：对应阶段标 `[FAIL]`，并附真实错误。最常见两类：
-  - `provision [FAIL]`：`assets/node-bin/arm64-v8a/node` 缺失 → 说明没跑 `build-node-android.sh`（CI/本地脚本已处理）。
+  - `provision [FAIL]`：`nativeLibraryDir` 下找不到 `libnode.so` → 说明构建产物没进 APK，或 `extractNativeLibs` 未生效（见第 2 节 W^X 说明）。
   - `node-stderr [FAIL]`：node 进程自己报的错（如二进制非 16KB 页对齐、ROM 不兼容）→ 看完整 stderr 即可定位。
 
 点探针页 `/api/version` 应返回类似：

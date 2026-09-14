@@ -325,15 +325,30 @@ jobs:
         id: restorenode
         run: |
           echo "=== 检查缓存的 Node 产物 ==="
-          mkdir -p app/src/main/assets/node-bin/arm64-v8a
+          # 目标路径与构建脚本的 OUT_DIR 保持一致：jniLibs/arm64-v8a/libnode.so
+          # （不是 assets！原因见 build-node-android.sh 里的 W^X 说明）
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          DEST="app/src/main/jniLibs/arm64-v8a/libnode.so"
           EXACT_KEY="node-android-${{ steps.nodever.outputs.tag }}-${{ hashFiles('scripts/build-node-android.sh') }}"
           if [ -f /tmp/dsh-node-cache/node ]; then
-            cp -f /tmp/dsh-node-cache/node app/src/main/assets/node-bin/arm64-v8a/node
-            chmod +x app/src/main/assets/node-bin/arm64-v8a/node
+            cp -f /tmp/dsh-node-cache/node "$DEST"
+            chmod +x "$DEST"
             echo "cache-hit=yes" >> "$GITHUB_OUTPUT"
             echo "[ok] 复用已编译的 node 二进制，跳过 3~4 小时交叉编译："
-            ls -la app/src/main/assets/node-bin/arm64-v8a/node
-            file -b app/src/main/assets/node-bin/arm64-v8a/node || true
+            ls -la "$DEST"
+            file -b "$DEST" || true
+            # 复用缓存二进制时做一次形态校验。
+            # 注意：这里【不】强制要求 linker64 解释器 —— 该文件本质是普通 ELF
+            # 可执行文件，被系统当 native lib 解压落盘后直接 exec，并非作为共享库
+            # 加载，所以理论上静态链接也能跑。真正要防的是「缓存里存的是远古形态
+            # 的产物」（比如最初那版 assets 用的东西）；用体积和多架构特征做粗筛。
+            if file -b "$DEST" | grep -qiE "ARM aarch64|aarch64"; then
+              echo "[ok] 架构为 aarch64，与 arm64-v8a 匹配。"
+            else
+              echo "[error] 缓存中的二进制不是 aarch64：$(file -b "$DEST")"
+              echo "        与 APK 的 arm64-v8a 不匹配，拒绝使用（本步骤失败以阻止出包）。"
+              exit 1
+            fi
             # 区分「精确命中」与「前缀回退命中」。后者意味着编译脚本已变更，
             # 这个二进制是旧脚本的产物，可能不是我们真正想要的 —— 必须警告。
             SAVED_KEY="$(cat /tmp/dsh-node-cache/.cache-key 2>/dev/null || echo '<unknown>')"
@@ -401,6 +416,42 @@ jobs:
           ls -la /tmp/dsh-node-cache/
           du -sh /tmp/dsh-node-cache/ 2>/dev/null || true
           echo "[ok] 已写入缓存。即使后续 gradle 步骤失败，这份 Node 二进制也能被下次运行复用。"
+
+      - name: Verify node binary is in place (pre-gradle gate)
+        id: verifybin
+        run: |
+          echo "=== 打包前门禁：确认 node 二进制以 jniLibs 形态就位 ==="
+          DEST="app/src/main/jniLibs/arm64-v8a/libnode.so"
+          if [ ! -f "$DEST" ]; then
+            echo "[error] 缺少 $DEST"
+            echo "        这意味着 node 既没从缓存恢复、也没有新编译出来。"
+            echo "        直接失败，避免打出一个没有运行时的 APK。"
+            echo "输出："
+            echo "  jniLibs 目录:"; ls -la app/src/main/jniLibs/arm64-v8a/ 2>/dev/null || echo "  (不存在)"
+            echo "  out/Release:"; ls -la out/Release/node 2>/dev/null || echo "  (不存在)"
+            exit 1
+          fi
+          SZ=$(stat -c %s "$DEST")
+          echo "文件: $DEST"
+          echo "大小: $SZ 字节 ($(( SZ / 1024 / 1024 )) MB)"
+          # 完整性判断：交叉编译出的 node 大约 100MB 上下，若明显偏小说明产物被截断。
+          if [ "$SZ" -lt 20000000 ]; then
+            echo "[error] 产物异常偏小（<20MB），疑似拷贝中断或被截断。"
+            exit 1
+          fi
+          file -b "$DEST" | sed 's/^/file: /'
+          # 关键前提：必须是 aarch64 的 ELF，否则装到 arm64 设备上无法执行。
+          # （不强制 linker64 解释器：该文件是普通 ELF 可执行文件，系统只是把它
+          #   当 native lib 解压落盘，并非作为共享库加载。）
+          if ! file -b "$DEST" | grep -qiE "aarch64"; then
+            echo "[error] 该产物不是 aarch64 ELF，与 APK 的 arm64-v8a 不匹配。"
+            exit 1
+          fi
+          echo "[ok] 门禁通过：产物形态正确，可以进入 gradle 打包。"
+          # 明确记录：真机上它将被解压到 nativeLibraryDir，路径于此可见（构建期无法
+          # 预知运行时随机串，故仅说明装配位置）。
+          echo "    装配位置: /data/app/.../<pkg>-.../lib/arm64-v8a/libnode.so"
+          echo "    运行期由 applicationInfo.nativeLibraryDir 定位并 exec。"
 
       - name: Build debug APK
         id: gradlebuild

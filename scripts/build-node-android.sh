@@ -3,8 +3,12 @@ set -euo pipefail
 
 # ============================================================================
 #  用官方 Node.js 源码 + Android NDK 交叉编译 ARM64 的 node 可执行文件
-#  产出: app/src/main/assets/node-bin/arm64-v8a/node
+#  产出: app/src/main/jniLibs/arm64-v8a/libnode.so
 #        (bionic 链接；NDK r27+ 默认 16KB 页对齐，满足 Android 15+ 的 dlopen 要求)
+#
+#  为什么产物是 jniLibs 下的 libnode.so 而不是 assets 里的 node：
+#    见下方 OUT_DIR 处的详细说明 —— Android 10+ 的 SELinux W^X 禁止执行
+#    应用可写目录(files/)中的文件，只有 /data/app/.../lib/ 允许 exec。
 #
 #  前置依赖（主机侧）:
 #    git, python3, ninja, cmake, make, zip
@@ -26,7 +30,33 @@ ANDROID_API="${ANDROID_API:-24}"
 ARCH="arm64"   # 仅 arm64-v8a；如需 32 位改为 arm（并同步扩展 app/build.gradle.kts 的 abiFilters）
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT_DIR="$ROOT/app/src/main/assets/node-bin/arm64-v8a"
+# ---------------------------------------------------------------------------
+# 产物落地目录：jniLibs/arm64-v8a/libnode.so —— 不是 assets。
+#
+# 【为什么必须是 jniLibs，不能放 assets】
+# Android 10 (API 29) 起 SELinux 对「可写目录」强制 W^X：
+#   /data/data/<pkg>/files/  (label app_data_file) → execve() 被拒 (EACCES/error=13)
+#   /data/app/<pkg>/lib/<abi>/ (label exec_type)   → 允许执行
+# 真机实证（Android 16 / API 36）：
+#   IOException: Cannot run program ".../files/node/24.21.0/node": error=13, Permission denied
+# 这是「设计如此」，不是权限位问题 —— 官方 issuetracker 128554619 明确回复：
+#   "Calling exec() on writable application files is a W^X violation... exec() no
+#    longer works on files within the application home directory, it continues to
+#    be supported for files within the read-only /data/app directory. In particular,
+#    it should be possible to package the binaries into your application's native
+#    libs directory and enable android:extractNativeLibs=true, and then call exec()
+#    on the /data/app artifacts."
+# 所以走 jniLibs：安装时系统把库解压到 /data/app/.../lib/arm64-v8a/（只读、可执行）。
+#
+# 三点配套要求（缺一不可）：
+#   1. 文件名必须是 lib*.so 形式，否则 AGP 不会把它当作 native lib 解压到 lib dir。
+#   2. android:extractNativeLibs="true" 或 jniLibs.useLegacyPackaging=true，
+#      否则 AGP 3.6+ 默认「压缩 .so 且不落盘」，运行时 lib dir 里根本没有这个文件。
+#   3. 二进制解释器必须是 Android 的 linker（/system/bin/linker64）——
+#      我们交叉编译出来的 node 正是 bionic 链接，已用 `file` 验证满足。
+# ---------------------------------------------------------------------------
+OUT_DIR="$ROOT/app/src/main/jniLibs/arm64-v8a"
+OUT_NAME="libnode.so"
 mkdir -p "$OUT_DIR"
 
 WORK="$(mktemp -d)"
@@ -754,10 +784,40 @@ trap 'kill "$PROGRESS_PID" 2>/dev/null || true' EXIT
 # 用 make -j${JOBS} 走完全程。make 失败会非零退出，配合 set -e 让脚本干净收尾。
 make -j"${JOBS}"
 
-echo "==> 拷贝产物到 $OUT_DIR/node"
-cp out/Release/node "$OUT_DIR/node"
-chmod +x "$OUT_DIR/node"
+echo "==> 拷贝产物到 $OUT_DIR/$OUT_NAME"
+cp out/Release/node "$OUT_DIR/$OUT_NAME"
+chmod +x "$OUT_DIR/$OUT_NAME"
 
-echo "==> 完成。文件: $OUT_DIR/node"
+# ---- 自检：确认产物能满足「在 /data/app lib dir 里被执行」的全部前提 ----
+# 说明：这里的检查要分清「硬条件」和「提示信息」，不要误杀。
+#   · 关键认知修正：被改名为 lib*.so 的这个文件【并不是真的共享库】。
+#     系统不会去 dlopen/加载它，只是在安装 APK 时把它从 lib/<abi>/ 目录
+#     解压到文件系统上（因为 extractNativeLibs=true）。之后我们直接 exec 它。
+#     所以「必须是 linker64 解释器」并不是系统强制的前提，只是个一致性提示。
+#   · 真正的硬条件是：文件存在于 lib/<abi>/ 且解压落盘 —— 由打包配置保证。
+echo "==> 产物自检"
+file -b "$OUT_DIR/$OUT_NAME" | sed 's/^/    file: /'
+"$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin/llvm-readelf -l "$OUT_DIR/$OUT_NAME" 2>/dev/null \
+  | grep -i "interpreter\|LOAD" | head -6 | sed 's/^/    /' || true
+if "$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin/llvm-readelf -l "$OUT_DIR/$OUT_NAME" 2>/dev/null \
+     | grep -q "interpreter.*linker64"; then
+  echo "    [ok] 解释器为 Android linker64（bionic 动态链接，可正常 exec）"
+else
+  echo "    [info] 未检出 linker64 解释器。这不一定是问题："
+  echo "           该文件本质是普通 ELF 可执行文件，被系统当作 native lib 解压落盘后直接 exec，"
+  echo "           并非作为共享库加载。若是静态链接的二进制，同样可以执行。"
+  echo "           但 Node 正常应为 bionic 动态链接 —— 若非预期，请核对 android-configure 参数。"
+fi
+# 16KB 页对齐：Android 15+ 的要求。注意这条对「可执行 ELF」依然有意义 ——
+# 15+ 的设备若页大小是 16KB，4KB 对齐的可执行文件可能无法被内核加载（ELIBBAD）。
+if "$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin/llvm-readelf -l "$OUT_DIR/$OUT_NAME" 2>/dev/null \
+     | grep -qE "0x4000"; then
+  echo "    [ok] 检出 16KB (0x4000) 对齐的 LOAD 段（满足 Android 15+ 要求）"
+else
+  echo "    [warn] 未检出 16KB 对齐 LOAD 段。Android 15+ 在 16KB 页设备上可能"
+  echo "           返回 ELIBBAD/Exec format error；NDK r27+ 默认应满足，若为旧 NDK 请升级后重编。"
+fi
+
+echo "==> 完成。文件: $OUT_DIR/$OUT_NAME"
 echo "    下一步: ./gradlew assembleDebug 即可把该 Node 打进 APK（首启离线可跑）。"
 echo "    若要做 OTA 升级包: ./scripts/make-release.sh ${NODE_VERSION}"

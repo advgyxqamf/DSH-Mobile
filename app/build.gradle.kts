@@ -55,12 +55,33 @@ android {
     }
     packaging {
         jniLibs {
-            // Node 二进制作为运行时资源（assets）解压，不进 jniLibs，因此这里保持默认即可。
-            useLegacyPackaging = false
+            // =====================================================================
+            //  这是「node 能否在真机跑起来」的开关，别改。
+            // =====================================================================
+            // 背景：Android 10+ 的 SELinux 禁止 exec 应用可写目录里的文件
+            //   (files/ → app_data_file，execve 返回 EACCES)
+            // 唯一被允许执行的是系统在安装时解压出来的 native lib 目录：
+            //   /data/app/<pkg>/lib/<abi>/  (exec_type)
+            // 真机实证（Android 16/API 36）：
+            //   IOException: Cannot run program ".../files/node/24.21.0/node":
+            //   error=13, Permission denied
+            //
+            // 所以 node 以 jniLibs/arm64-v8a/libnode.so 的形式打包，
+            // 运行时执行 applicationInfo.nativeLibraryDir/libnode.so。
+            //
+            // useLegacyPackaging 必须为 true：
+            //   AGP 3.6+ 默认(false)会把 .so 以【压缩】形式放进 APK，
+            //   安装时不解压到 lib dir，而是在 APK 内直接 mmap 加载。
+            //   那种模式下列表 dir 根本看不到文件，File.exists() 为 false，
+            //   更不可能被 exec。置 true 后系统才会把 .so 真正解压落盘到
+            //   /data/app/.../lib/arm64-v8a/libnode.so，我们才能 ProcessBuilder 启动它。
+            //   代价是 APK 体积变大（不压缩），这对本地运行时是必要且可接受的。
+            useLegacyPackaging = true
         }
     }
-    // 注意：assets/node-bin/** 下的 node 可执行文件必须原样打进 APK，
-    // 切勿做 resources.excludes（否则运行时会找不到 node 二进制）。
+    // 注意：node 二进制现位于 jniLibs/arm64-v8a/libnode.so。
+    // 它的文件名必须以 lib 开头、.so 结尾，否则 AGP 不会把它当 native lib 处理，
+    // 也就不会被解压到可执行的 lib dir 里去。
 }
 
 dependencies {

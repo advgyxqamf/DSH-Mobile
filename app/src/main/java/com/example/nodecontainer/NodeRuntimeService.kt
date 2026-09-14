@@ -71,42 +71,75 @@ class NodeRuntimeService : Service() {
             RuntimeDiagnostics.append(this, "version", true, "当前生效版本=$version", "指针=${version}")
 
             // 3) 确保 node 二进制就位
-            val nodeBin = NodeProvisioner.nodeExecutable(this, version)
-            if (!nodeBin.canExecute()) {
-                val bundled = manifest.versions.firstOrNull { it.version == version }?.bundled == true
-                if (bundled) {
-                    RuntimeDiagnostics.append(
-                        this, "provision", null,
-                        "解压内置 node 二进制 (assets/node-bin/${manifest.abi}/node)"
-                    )
-                    try {
-                        NodeProvisioner.ensureBundledNode(this, version)
-                        RuntimeDiagnostics.append(this, "provision", true, "内置 node 已解压并可执行", nodeBin.absolutePath)
-                    } catch (e: Exception) {
-                        RuntimeDiagnostics.append(this, "provision", false, "内置 node 解压失败", err(e))
-                        return
-                    }
-                } else {
-                    RuntimeDiagnostics.append(
-                        this, "provision", false, "node 二进制缺失且该版本非内置",
-                        "期望路径: ${nodeBin.absolutePath}\n" +
-                            "该版本(bundled=false)需先经 OTA 安装，或把 default 改回 bundled=true 的版本。\n" +
-                            "若是自己构建：请先运行 ./scripts/build-node-android.sh $version 生成并放入 assets/node-bin/${manifest.abi}/node"
-                    )
-                    return
-                }
-            } else {
-                RuntimeDiagnostics.append(this, "provision", true, "node 二进制已就绪", nodeBin.absolutePath)
-            }
-
-            if (!nodeBin.canExecute()) {
-                RuntimeDiagnostics.append(this, "provision", false, "node 仍不可执行（权限或架构不符）", nodeBin.absolutePath)
+            //    注意：这里【不能】用 canExecute() 来判断可用性。
+            //    canExecute() 只查 stat 的 x 权限位，对 SELinux W^X 完全无感 ——
+            //    旧版本正是因此在诊断面板显示"可执行"，真去 exec 却被回
+            //    error=13 (EACCES)。判断能否执行的唯一可靠方式是真执行一次，
+            //    所以在下面 exec 成功/失败时再给结论。
+            val nodeBin = NodeProvisioner.bundledExecutable(this)
+            RuntimeDiagnostics.append(
+                this, "provision", null, "定位内置 node 二进制",
+                "nativeLibraryDir=${applicationInfo.nativeLibraryDir}\n" +
+                    "目标路径=${nodeBin.absolutePath}"
+            )
+            try {
+                NodeProvisioner.ensureBundledNode(this, version)
+                RuntimeDiagnostics.append(
+                    this, "provision", true, "内置 node 就位（已由系统解压到可执行目录）",
+                    "${nodeBin.absolutePath}\n" +
+                        "大小=${nodeBin.length()} 字节, " +
+                        "可读=${nodeBin.canRead()}, " +
+                        "x位=${
+                            // 仅作信息展示。务必记住：这个值【不代表】真的能 exec，
+                            // 只反映权限位；能否执行由 SELinux 策略决定，见下方 exec 结果。
+                            nodeBin.canExecute()
+                        }"
+                )
+            } catch (e: Exception) {
+                RuntimeDiagnostics.append(this, "provision", false, "内置 node 不可用", err(e))
                 return
             }
 
             // 4) server.js 探针
             val script = NodeProvisioner.ensureServerScript(this)
             RuntimeDiagnostics.append(this, "script", true, "server.js 探针就位", script.absolutePath)
+
+            // 4.5) 先跑一次 `node -v`：这是对「能否 exec」的确定性验证。
+            //      比 canExecute() 可靠得多 —— 它真去执行了。成功说明 W^X 这关过了，
+            //      顺便把二进制的真实版本号显示出来（与清单里的 version 可能不同，
+            //      因为 lib dir 里只有安装 APK 时打包的那一份）。
+            //
+            //      这里刻意【不用 runCatching】：它会吞掉所有 Throwable，包括
+            //      InterruptedException / OutOfMemoryError 这类不该被当成
+            //      "exec 失败"处理的异常，会把诊断引向错误方向。
+            //      只精确捕获 IOException（即进程根本无法创建 —— 这正是
+            //      error=13 Permission denied 的形态）。
+            try {
+                val probe = ProcessBuilder(nodeBin.absolutePath, "-v")
+                    .redirectErrorStream(true).start()
+                val out = probe.inputStream.bufferedReader().readText().trim()
+                val exit = probe.waitFor()
+                val ok = exit == 0
+                RuntimeDiagnostics.append(
+                    this, "exec-probe", ok,
+                    if (ok) "node -v 执行成功（可执行性已验证）" else "node -v 退出码非 0",
+                    "输出: ${out.ifBlank { "(空)" }}, exitCode=$exit"
+                )
+                if (!ok) return
+            } catch (e: java.io.IOException) {
+                // 这一步失败通常就是 exec 被拒。把错误码和排查方向一次说清楚。
+                RuntimeDiagnostics.append(
+                    this, "exec-probe", false,
+                    "无法执行 node 二进制",
+                    err(e) + "\n" +
+                        "排查方向：\n" +
+                        "  · error=13 Permission denied → 该路径被 SELinux 禁止 exec。\n" +
+                        "    请确认执行的是 nativeLibraryDir 下的 libnode.so，而不是 files/ 里的副本。\n" +
+                        "  · error=2 No such file → extractNativeLibs 未生效，.so 没被解压到 lib dir。\n" +
+                        "  · error=8 Exec format error → ABI 不匹配或页对齐不满足。"
+                )
+                return
+            }
 
             // 5) 启动 node
             val pb = ProcessBuilder(
