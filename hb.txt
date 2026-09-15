@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 141
-time : Tue Sep 15 21:49:06 UTC 2026
+beat : 142
+time : Tue Sep 15 21:49:52 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.3GB
+mem  : avail=12.6GB
 cgmax: n/a
-load : 3.00 3.02 3.00
-logsize: 11556745
-objs   : host=1975 target=2128
+load : 3.04 3.03 3.00
+logsize: 11593269
+objs   : host=1992 target=2128
 oomhits: 0
 0
-lastprog: 2 warnings generated.   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_initializers/gen/torque-generated/src/builtins/set-is-disjoint-from
+lastprog: /usr/bin/../lib/gcc/x86_64-linux-gnu/14/../../../../include/x86_64-linux-gnu/c++/14/bits/c++config.h:100:19: note: expanded from macro '_GLIBCXX_DEPRECATED_SUGG
