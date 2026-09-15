@@ -209,7 +209,11 @@ jobs:
         id: wfvalidate
         run: |
           echo "2/9 validate-workflow" > /tmp/ci-stage
-          python3 scripts/validate-workflow.py .github/workflows/build-apk.yml
+          # 校验【全部】workflow，而不是只校验自己。
+          # 只校验自己时，新建/改动的其它 workflow 出问题就没人管 ——
+          # 校验范围本身成了盲区（这里真实踩过：新加的 workflow 有重复
+          # on.push key，导致推任意 tag 都会误触发构建）。
+          python3 scripts/validate-workflow.py
 
       - name: Set up JDK 17
         id: setupjava

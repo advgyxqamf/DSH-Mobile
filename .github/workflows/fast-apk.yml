@@ -25,12 +25,16 @@ name: Fast APK (no Node rebuild)
 # ============================================================================
 
 on:
+  # ⚠️ 一个 workflow 的 on.push 只能出现【一次】。写成两个 push: 块时，
+  #    YAML 里后一个会覆盖前一个（重复 key），触发条件就变得不可预期 ——
+  #    本文件就踩过这个坑：branches/paths 被 tags 覆盖，导致推任意 tag
+  #    都可能意外跑起来。所有 push 条件必须合并到同一个块里。
   push:
     branches: [main, master]
     # 只在【真正影响 APK 内容】的路径变更时触发。
-    # 这里用 paths 白名单（而非 build-node.yml 的 paths-ignore 黑名单）：
-    # 白名单的默认语义是"不匹配就不跑"，对于日常出包这条高频路径，
-    # 宁可漏跑（可手动触发）也不要因为新增了某个目录就莫名其妙跑起来。
+    # 用 paths 白名单（而非 build-node.yml 的 paths-ignore 黑名单）：
+    # 白名单的默认语义是"不匹配就不跑"，对日常出包这条高频路径，
+    # 宁可漏跑（可手动/ tag 触发）也不要因新增目录而莫名跑起来。
     paths:
       - 'app/**'
       - 'gradle/**'
@@ -39,6 +43,11 @@ on:
       - 'gradle.properties'
       - 'gradlew'
       - 'gradlew.bat'
+    # 额外的 tag 触发：推 fast-<任意> 即可手动跑一次，不必改代码。
+    # 维护环境（沙箱）无法操作网页、workflow_dispatch 点不了，
+    # tag 是最干净的显式触发手段。
+    tags:
+      - 'fast-*'
   workflow_dispatch:
     inputs:
       node_version:
@@ -49,13 +58,6 @@ on:
         description: '目标 ABI'
         required: false
         default: 'arm64-v8a'
-  # tag 触发：推 fast-<任意> 即可手动跑一次，不必改代码。
-  # 维护环境（沙箱）无法操作网页，workflow_dispatch 点不了；
-  # 而用"改个文件触发"的办法会让 paths 过滤与触发意图纠缠在一起，
-  # 容易误触发别的构建。tag 是最干净的显式触发手段。
-  push:
-    tags:
-      - 'fast-*'
 
 # 同一个 ref 上只允许一个在跑。日常出包很快，取消旧的没有损失。
 concurrency:
