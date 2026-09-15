@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 117
-time : Tue Sep 15 21:30:29 UTC 2026
+beat : 118
+time : Tue Sep 15 21:31:16 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=14.1GB
+mem  : avail=13.4GB
 cgmax: n/a
-load : 3.02 3.02 3.00
-logsize: 10667678
-objs   : host=1764 target=2124
+load : 3.01 3.02 3.00
+logsize: 10730408
+objs   : 104
 oomhits: 0
 0
-lastprog:   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_base_without_compiler/deps/v8/src/heap/cppgc/object-allocator.o ../deps/v8/src/heap/cppgc
+lastprog: ar crsT /tmp/tmp.FUXM8odFff/node/out/Release/obj.target/libnode.a @/tmp/tmp.FUXM8odFff/node/out/Release/obj.target/libnode.a.ar-file-list   /usr/bin/clang++ -o 
