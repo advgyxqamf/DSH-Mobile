@@ -1,41 +1,53 @@
 package com.example.nodecontainer
 
 import android.content.Context
-import android.util.Log
 import org.json.JSONObject
-import java.io.File
-import java.net.URL
-import java.security.MessageDigest
 
 /**
- * Node 版本管理 —— “可升级容器”的核心。
+ * 内置 Node 版本的元信息读取。
  *
- * 职责：
- *  1. 读取 assets/node-versions.json 版本清单（哪些 Node 版本可用、OTA 地址、sha256）。
- *  2. 维护“当前生效版本”指针文件 files/node/CURRENT。
- *  3. 安装(升级)：从 OTA 下载 zip → sha256 校验 → 解压到 files/node/<version>/。
- *     校验失败直接抛异常、绝不切换指针 —— “坏包永不生效”。
- *  4. 列出已安装版本。
+ * ============================================================================
+ *  为什么这里只剩「读」这一件事
+ * ============================================================================
+ * 早期版本叫 NodeVersionManager，带一整套 OTA 链路：从远端下载 zip →
+ * sha256 校验 → 解压到 filesDir/node/<version>/ → 切换 CURRENT 指针。
  *
- * 由此：未来升级 Node = 往清单追加一条记录 + 用 scripts/make-release.sh 生成发布包上传，
- *       App 端即可在不发新版 APK 的前提下完成 Node 升级。
+ * 那套设计在 Android 10+ 上【从根上不成立】，已整体删除：
+ *   · filesDir 的 SELinux label 是 app_data_file，**禁止 execve**。
+ *     所以解压出来的 node 永远无法被 ProcessBuilder 启动，"升级到新版本"
+ *     这个目标根本无法达成（详见 NodeProvisioner 顶部的 W^X 说明）。
+ *   · 清单里的 OTA 地址一直是占位符（REPLACE_WITH_YOUR_OTA_HOST），
+ *     这段代码从未真正跑通过一次。
+ *   · 更糟的是 isInstalled() 会在 filesDir 里看到文件就返回 true，
+ *     而那个文件不可执行 —— 一个"看起来成功、实际必然失败"的接口。
+ *
+ * 现在的运行时来源只有一个、且是确定的：
+ *   APK 里的 jniLibs/arm64-v8a/libnode.so，安装时由系统解压到
+ *   nativeLibraryDir，从那里直接执行。它随 APK 版本走 —— 升级 Node
+ *   等价于重新出一次 APK（这也正是 fast-apk.yml 存在的意义：
+ *   换 Node 二进制不需要重编 Node，只要下载新的预编译产物）。
+ *
+ * 保留本类的原因：启动诊断需要显示"当前是哪个 Node 版本"，
+ * 这仍然要从 assets 里的清单读。仅此而已。
+ * ============================================================================
  */
 class NodeVersionManager(private val context: Context) {
 
+    /** 清单里的一条版本记录。bundled 恒为 true —— 见类注释。 */
     data class NodeVersion(
         val version: String,
         val channel: String,
-        val minAndroidApi: Int,
-        val bundled: Boolean,   // true = 已随 APK 打包在 assets，首启离线可用
-        val url: String,
-        val sha256: String?,
-        val size: Long
+        val minAndroidApi: Int
     )
 
     data class Manifest(val default: String, val abi: String, val versions: List<NodeVersion>)
 
-    private val currentPointer = File(context.filesDir, "node/CURRENT")
-
+    /**
+     * 读取 assets/node-versions.json。
+     *
+     * 失败时抛异常（由调用方展示到诊断面板）—— 不要在这里静默兜底成某个
+     * 默认版本号，那会掩盖"清单被改坏了"这个事实，反而更难排查。
+     */
     fun loadManifest(): Manifest {
         val text = context.assets.open("node-versions.json")
             .bufferedReader().use { it.readText() }
@@ -46,11 +58,7 @@ class NodeVersionManager(private val context: Context) {
                 NodeVersion(
                     version = o.getString("version"),
                     channel = o.optString("channel", "unknown"),
-                    minAndroidApi = o.optInt("minAndroidApi", 24),
-                    bundled = o.optBoolean("bundled", false),
-                    url = o.getString("url"),
-                    sha256 = o.optString("sha256", "").takeIf { it.isNotBlank() },
-                    size = o.optLong("size", 0L)
+                    minAndroidApi = o.optInt("minAndroidApi", 24)
                 )
             }
         }
@@ -61,107 +69,15 @@ class NodeVersionManager(private val context: Context) {
         )
     }
 
-    /** 当前生效版本：读指针文件，缺省回落到清单 default。 */
-    fun currentVersion(): String =
-        if (currentPointer.exists()) currentPointer.readText().trim() else loadManifest().default
-
-    /** 切换当前版本（原子写）。调用前需保证目标版本已 install 成功。 */
-    fun setCurrentVersion(version: String) {
-        currentPointer.parentFile?.mkdirs()
-        // 先写临时文件再 rename，保证指针写入的原子性
-        val tmp = File(currentPointer.parentFile, "CURRENT.tmp")
-        tmp.writeText(version)
-        tmp.renameTo(currentPointer)
-    }
-
     /**
-     * 某版本是否"可用"。
+     * 当前生效的 Node 版本号。
      *
-     * 语义变更说明（配合 W^X 修复）：
-     *  - bundled 版本：可用性来自 nativeLibraryDir 里的 libnode.so。注意 lib dir 里
-     *    永远只有【安装 APK 时打包的那一份】，所以这里只能判断"内置运行时在不在"，
-     *    无法用版本来区分 —— 因此返回值带上了 default 的语义。
-     *  - 非 bundled 版本：看 OTA 解压到 filesDir 的那份是否存在。
-     *    但必须提醒：那份【不可执行】（Android 10+ 禁止 exec 可写目录），
-     *    所以这个 true 只表示"数据已就位"，不代表能跑起来。
-     *    不要用它来做"能否启动"的决策。
+     * 语义很直接：就是清单里的 default。不存在"运行期切换版本"这回事，
+     * 因为可执行的运行时只能来自 APK 的 nativeLibraryDir（见类注释）。
+     *
+     * 注意这个值【仅用于展示】。真正跑的二进制版本以实际 `node -v` 输出为准，
+     * 两者理论上应该一致（构建时会同步清单，见 build-node.yml 的 sync 步骤），
+     * 但诊断面板上以 `node -v` 的实测输出为最终依据。
      */
-    fun isInstalled(version: String): Boolean {
-        val m = loadManifest()
-        val meta = m.versions.firstOrNull { it.version == version }
-        return if (meta?.bundled == true) {
-            NodeProvisioner.bundledExecutable(context).exists()
-        } else {
-            NodeProvisioner.otaExecutable(context, version).exists()
-        }
-    }
-
-    /** 已安装到沙箱的版本目录名列表。 */
-    fun installedVersions(): List<String> {
-        val dir = File(context.filesDir, "node")
-        return dir.list()?.filter {
-            it != "CURRENT" && File(dir, it).isDirectory
-        } ?: emptyList()
-    }
-
-    /**
-     * 安装(升级)一个 OTA 版本。
-     * 注：内置(bundled=true)版本用 NodeProvisioner.ensureBundledNode 解压，不走此下载路径。
-     */
-    suspend fun install(version: NodeVersion) {
-        val zipFile = File(context.cacheDir, "node-${version.version}.zip")
-        download(version.url, zipFile)
-        version.sha256?.let { expected ->
-            val actual = sha256(zipFile)
-            require(actual.equals(expected, ignoreCase = true)) {
-                "sha256 校验失败: 期望 $expected, 实际 $actual"
-            }
-        }
-        val targetDir = File(context.filesDir, "node/${version.version}").apply { mkdirs() }
-        unzip(zipFile, targetDir)
-        val node = File(targetDir, "node")
-        require(node.exists()) { "发布包内缺少 node 可执行文件" }
-        node.setExecutable(true)
-        zipFile.delete()
-        Log.i(TAG, "已安装 Node ${version.version} -> ${targetDir.absolutePath}")
-    }
-
-    // ---- 下载 / 校验 / 解压 ----
-
-    private fun download(url: String, dest: File) {
-        URL(url).openStream().use { input ->
-            dest.outputStream().use { out -> input.copyTo(out) }
-        }
-    }
-
-    private fun sha256(file: File): String {
-        val md = MessageDigest.getInstance("SHA-256")
-        file.inputStream().use { fis ->
-            val buf = ByteArray(8192)
-            var n: Int
-            while (fis.read(buf).also { n = it } != -1) md.update(buf, 0, n)
-        }
-        return md.digest().joinToString("") { "%02x".format(it) }
-    }
-
-    private fun unzip(zip: File, dest: File) {
-        val zis = java.util.zip.ZipInputStream(zip.inputStream())
-        var entry = zis.nextEntry
-        while (entry != null) {
-            val outFile = File(dest, entry.name)
-            if (entry.isDirectory) {
-                outFile.mkdirs()
-            } else {
-                outFile.parentFile?.mkdirs()
-                outFile.outputStream().use { os -> zis.copyTo(os) }
-            }
-            zis.closeEntry()
-            entry = zis.nextEntry
-        }
-        zis.close()
-    }
-
-    companion object {
-        const val TAG = "NodeVersionManager"
-    }
+    fun currentVersion(): String = loadManifest().default
 }

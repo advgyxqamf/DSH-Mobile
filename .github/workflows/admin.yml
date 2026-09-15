@@ -15,10 +15,16 @@ name: Admin (cancel / status)
 #  tag 语法（命令 → 动作）
 #    admin-cancel-<run_id>    取消指定 run
 #    admin-status-<run_id>    查询指定 run 状态 + artifact 列表
+#    admin-logs-<run_id>      拉取指定 run 的失败步骤日志（排查 CI 失败用）
+#    admin-release[-<tag>]    查询 Release 附件（默认 apk-latest）
 #    admin-cancelall          取消所有 queued/in_progress 的 run（除自己）
 #
 #  例：git push origin HEAD:refs/tags/admin-cancel-34880060734
 #      结果会写进 ci-admin 分支，沙箱侧 fetch 该分支即可读到。
+#
+#  为什么要 logs：CI 一次失败动辄要等几十分钟，而失败原因在外部
+#  （沙箱屏蔽 api.github.com）读不到。没有这个命令就只能靠猜着改、
+#  再等一轮，代价极高。
 # ============================================================================
 
 on:
@@ -63,6 +69,9 @@ jobs:
             release)
               echo "kind=release"  >> "$GITHUB_OUTPUT"
               echo "target=apk-latest" >> "$GITHUB_OUTPUT" ;;
+            logs-*)
+              echo "kind=logs"     >> "$GITHUB_OUTPUT"
+              echo "target=${CMD#logs-}" >> "$GITHUB_OUTPUT" ;;
             *)
               echo "[error] 未知动作: $CMD"
               echo "kind=unknown" >> "$GITHUB_OUTPUT"
@@ -148,6 +157,29 @@ jobs:
                 --jq '"  tag  : \(.tagName)\n  name : \(.name)\n  url  : \(.url)\n  pub  : \(.publishedAt)\n\n附件:"' >> "$OUT" 2>&1 || true
               gh release view "$TARGET" --repo "$REPO" --json assets \
                 --jq '.assets[] | "  \(.name)  \(.size) 字节  state=\(.state)  digest=\(.digest // "n/a")\n    updatedAt=\(.updatedAt)"' >> "$OUT" 2>&1 || true
+              ;;
+
+            logs)
+              # 拉取失败 run 的日志。没有这个能力时，CI 失败只能靠猜 —— 
+              # 这在"每次失败要等几十分钟"的场景下代价极高。
+              echo "== run $TARGET 的失败日志 ==" >> "$OUT"
+              gh run view "$TARGET" --repo "$REPO" \
+                --json status,conclusion,workflowName,headSha,url \
+                --jq '"  wf    : \(.workflowName)\n  sha   : \(.headSha[0:7])\n  status: \(.status)\n  concl : \(.conclusion)\n  url   : \(.url)"' >> "$OUT" 2>&1 || true
+
+              echo >> "$OUT"
+              echo "=== 各步骤结果 ===" >> "$OUT"
+              gh run view "$TARGET" --repo "$REPO" \
+                --json jobs \
+                --jq '.jobs[] | .name as $j | .steps[] | "  [\(.conclusion // .status)] \($j) :: \(.name)"' >> "$OUT" 2>&1 || true
+
+              echo >> "$OUT"
+              echo "=== 失败步骤日志（仅 failed 步骤） ===" >> "$OUT"
+              # --log-failed 只输出失败步骤，避免几百 KB 噪音。
+              gh run view "$TARGET" --repo "$REPO" --log-failed >> "$OUT" 2>&1 || {
+                echo "(--log-failed 不可用，回退到全量日志的尾部)" >> "$OUT"
+                gh run view "$TARGET" --repo "$REPO" --log 2>&1 | tail -120 >> "$OUT" || true
+              }
               ;;
 
             *)
