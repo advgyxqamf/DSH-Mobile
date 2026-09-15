@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 112
-time : Tue Sep 15 21:26:37 UTC 2026
+beat : 113
+time : Tue Sep 15 21:27:23 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.2GB
+mem  : avail=13.8GB
 cgmax: n/a
 load : 3.00 3.00 3.00
-logsize: 10240794
-objs   : host=1712 target=2124
+logsize: 10314335
+objs   : host=1737 target=2124
 oomhits: 0
 0
-lastprog:   100 |   __attribute__ ((__deprecated__ ("use '" ALT "' instead")))       |                   ^   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.
+lastprog:   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_base_without_compiler/gen/torque-generated/src/objects/shared-function-info-tq.o /tmp/tmp
