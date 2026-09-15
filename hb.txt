@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 159
-time : Tue Sep 15 22:03:04 UTC 2026
+beat : 160
+time : Tue Sep 15 22:03:50 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.6GB
+mem  : avail=13.5GB
 cgmax: n/a
 load : 3.00 3.03 3.00
-logsize: 12182179
-objs   : host=2090 target=2128
+logsize: 12218688
+objs   : host=2105 target=2128
 oomhits: 0
 0
-lastprog:   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_initializers/gen/torque-generated/src/objects/struct-tq-csa.o /tmp/tmp.FUXM8odFff/node/ou
+lastprog:   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_initializers/gen/torque-generated/src/objects/torque-defined-classes-tq-csa.o /tmp/tmp.FU
