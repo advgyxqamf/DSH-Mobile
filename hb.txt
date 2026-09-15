@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 135
-time : Tue Sep 15 21:44:27 UTC 2026
+beat : 136
+time : Tue Sep 15 21:45:13 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.9GB
+mem  : avail=12.6GB
 cgmax: n/a
-load : 3.24 3.07 3.02
-logsize: 11350547
+load : 3.11 3.06 3.01
+logsize: 11382395
 objs   : host=1944 target=2128
 oomhits: 0
 0
-lastprog:   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_initializers/gen/torque-generated/src/builtins/promise-all-tq-csa.o /tmp/tmp.FUXM8odFff/n
+lastprog: /usr/bin/../lib/gcc/x86_64-linux-gnu/14/../../../../include/x86_64-linux-gnu/c++/14/bits/c++config.h:100:19: note: expanded from macro '_GLIBCXX_DEPRECATED_SUGG
