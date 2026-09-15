@@ -57,6 +57,12 @@ jobs:
             status-*)
               echo "kind=status"   >> "$GITHUB_OUTPUT"
               echo "target=${CMD#status-}" >> "$GITHUB_OUTPUT" ;;
+            release-*)
+              echo "kind=release"  >> "$GITHUB_OUTPUT"
+              echo "target=${CMD#release-}" >> "$GITHUB_OUTPUT" ;;
+            release)
+              echo "kind=release"  >> "$GITHUB_OUTPUT"
+              echo "target=apk-latest" >> "$GITHUB_OUTPUT" ;;
             *)
               echo "[error] 未知动作: $CMD"
               echo "kind=unknown" >> "$GITHUB_OUTPUT"
@@ -133,6 +139,15 @@ jobs:
               echo "=== artifact 列表 ===" >> "$OUT"
               gh api "repos/$REPO/actions/runs/$TARGET/artifacts" \
                 --jq '.artifacts[] | "  id=\(.id)  \(.name)  \(.size_in_bytes)B  expired=\(.expired)  digest=\(.digest // "n/a")"' >> "$OUT" 2>&1 || true
+              ;;
+
+            release)
+              echo "== Release: $TARGET 的附件 ==" >> "$OUT"
+              gh release view "$TARGET" --repo "$REPO" \
+                --json tagName,name,createdAt,publishedAt,url,assets \
+                --jq '"  tag  : \(.tagName)\n  name : \(.name)\n  url  : \(.url)\n  pub  : \(.publishedAt)\n\n附件:"' >> "$OUT" 2>&1 || true
+              gh release view "$TARGET" --repo "$REPO" --json assets \
+                --jq '.assets[] | "  \(.name)  \(.size) 字节  state=\(.state)  digest=\(.digest // "n/a")\n    updatedAt=\(.updatedAt)"' >> "$OUT" 2>&1 || true
               ;;
 
             *)
