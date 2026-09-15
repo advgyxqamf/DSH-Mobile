@@ -1,0 +1,351 @@
+name: Pin Node runtime (publish prebuilt .so as fixed release)
+
+# ============================================================================
+#  把【已经编译并真机验证通过】的 Node 运行时固化成一份不可变的 Release 资产。
+#
+#  这条 workflow 是「不再每次等 3 小时」的基石。它只做搬运与固化：
+#    从某次成功的 build-node 运行里取出 libnode.so + libc++_shared.so，
+#    校验 ELF 架构与 16KB 页对齐，算出 sha256，发布到固定 Release：
+#        node-runtime-<version>-<abi>        例如 node-runtime-24.21.0-arm64
+#
+#  之后 fast-apk.yml 只要按 (version, abi) 下载这份资产即可出包 —— 完全
+#  不需要触碰 Node 源码，分钟级完成。
+#
+#  为什么不用 Actions cache 而用 Release：
+#    · cache 有 7 天过期，且是 per-repo 的不透明二进制块，外部读不到；
+#    · cache 命中与否受 key/容量/淘汰策略影响，不可控（本项目已实测遇到
+#      "key 没变却没命中"的情况）；
+#    · Release 资产的 URL 稳定、可外部下载、可校验 sha256、可长期保存，
+#      并且「用了哪个版本的二进制」这件事在发布历史里一目了然。
+#
+#  触发方式（tag，便于无网页环境操作）：
+#      pin-node-<run_id>          固化指定 run 的产物
+#      pin-node-latest            固化最近一次成功的 build-node 运行
+#   也可用 workflow_dispatch 手动指定 run_id / version / abi。
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: '源 build-node 运行 ID（留空 = 自动选最近一次成功运行）'
+        required: false
+        default: ''
+      version:
+        description: 'Node 版本号（用于拼 Release tag，如 24.21.0）'
+        required: false
+        default: '24.21.0'
+      abi:
+        description: '目标 ABI（目前仅 arm64-v8a）'
+        required: false
+        default: 'arm64-v8a'
+  push:
+    tags:
+      - 'pin-node-*'
+
+permissions:
+  contents: write     # 建 Release / 传资产
+  actions: read       # 列取/下载 artifact
+
+jobs:
+  pin:
+    runs-on: ubuntu-latest
+    # 纯搬运，几分钟足够。给 30 分钟余量（要下载 ~50MB artifact）。
+    timeout-minutes: 30
+
+    steps:
+      - name: Resolve source run and inputs
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          RUN_ID="${{ inputs.run_id }}"
+          VERSION="${{ inputs.version }}"
+          ABI="${{ inputs.abi }}"
+
+          # tag 触发解析：pin-node-<run_id> 或 pin-node-latest
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            REF_TAG="${GITHUB_REF_NAME:-}"
+            echo "== 由 tag 触发: $REF_TAG =="
+            CAND="${REF_TAG#pin-node-}"
+            if [ "$CAND" != "latest" ] && printf '%s' "$CAND" | grep -qE '^[0-9]+$'; then
+              RUN_ID="$CAND"
+              echo "从 tag 解析出 run_id=$RUN_ID"
+            else
+              echo "tag 未指定 run_id，改为自动查找最近一次成功运行。"
+            fi
+          fi
+
+          if [ -z "$RUN_ID" ]; then
+            echo "== 自动查找最近一次成功的构建运行 =="
+            # 优先找新的 build-node.yml（拆分后的 Node 专用构建）；
+            # 找不到就回退到旧的 build-apk.yml（拆分前的一体化构建，
+            # 它的产物同样是完好的，可直接固化 —— 这正是本次固化要做的事）。
+            for WF in build-node.yml build-apk.yml; do
+              RUN_ID="$(gh run list \
+                          --repo '${{ github.repository }}' \
+                          --workflow "$WF" \
+                          --status success \
+                          --limit 1 \
+                          --json databaseId \
+                          --jq '.[0].databaseId' 2>/dev/null || true)"
+              if [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ]; then
+                echo "命中 workflow: $WF  (run $RUN_ID)"
+                break
+              fi
+            done
+          fi
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "[error] 找不到成功的 build-node 运行。"
+            echo "        先跑一次 Build Node runtime，再固化。"
+            exit 1
+          fi
+
+          # 版本号缺省时，尝试从该 run 的 ci-ok/ci-last 自报里取；取不到用默认值。
+          if [ -z "$VERSION" ]; then VERSION="24.21.0"; fi
+          if [ -z "$ABI" ]; then ABI="arm64-v8a"; fi
+
+          echo "源 run  : $RUN_ID"
+          echo "版本    : $VERSION"
+          echo "ABI     : $ABI"
+
+          {
+            echo "run_id=$RUN_ID"
+            echo "version=$VERSION"
+            echo "abi=$ABI"
+          } >> "$GITHUB_OUTPUT"
+
+          echo
+          echo "== 该 run 的 artifact 列表 =="
+          gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '.artifacts[] | "\(.name)  (\(.size_in_bytes) bytes, expired=\(.expired))"'
+
+      - name: Download artifact and extract .so files
+        id: extract
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID="${{ steps.resolve.outputs.run_id }}"
+
+          rm -rf /tmp/pin && mkdir -p /tmp/pin/dl /tmp/pin/out
+
+          # 该 run 的 Node 二进制以 artifact 形式挂在 job 上。
+          # 名字见 build-node.yml 的 upload 步骤；下载整个 artifact 再挑文件，
+          # 比按名字猜更稳（名字一旦调整这里不会静默漏文件）。
+          echo "== 下载 artifact 列表 =="
+          gh api "repos/${{ github.repository }}/actions/runs/${RUN_ID}/artifacts" \
+            --jq '.artifacts[].name' | tee /tmp/pin/artifact-names.txt
+
+          while IFS= read -r NAME; do
+            [ -z "$NAME" ] && continue
+            echo "--- 下载: $NAME ---"
+            mkdir -p "/tmp/pin/dl/$NAME"
+            gh run download "$RUN_ID" \
+              --repo '${{ github.repository }}' \
+              --name "$NAME" \
+              --dir "/tmp/pin/dl/$NAME" || echo "[warn] $NAME 下载失败，跳过"
+          done < /tmp/pin/artifact-names.txt
+
+          echo
+          echo "== 下载内容总览 =="
+          find /tmp/pin/dl -type f -printf '%s  %p\n' | sort -rn | head -20
+
+          # 找出两个 .so。用 find 而非固定路径，容忍 artifact 内部的目录层级差异。
+          NODE_SO="$(find /tmp/pin/dl -type f -name 'libnode.so*' | head -1)"
+          CXX_SO="$(find /tmp/pin/dl -type f -name 'libc++_shared.so*' | head -1)"
+
+          # 兜底：某些 artifact 可能只含 APK。那就从 APK 的 lib/ 里取。
+          if [ -z "$NODE_SO" ]; then
+            APK="$(find /tmp/pin/dl -type f -name '*.apk' | head -1)"
+            if [ -n "$APK" ]; then
+              echo "== 未找到裸 .so，改从 APK 中提取 =="
+              mkdir -p /tmp/pin/unzip
+              unzip -o -q "$APK" 'lib/arm64-v8a/*' -d /tmp/pin/unzip
+              NODE_SO="$(find /tmp/pin/unzip -type f -name 'libnode.so*' | head -1)"
+              CXX_SO="$(find /tmp/pin/unzip -type f -name 'libc++_shared.so*' | head -1)"
+            fi
+          fi
+
+          if [ -z "$NODE_SO" ]; then
+            echo "[error] 在 run $RUN_ID 的产物里找不到 libnode.so。"
+            echo "        artifact 内容见上（已按大小排序）。"
+            exit 1
+          fi
+          if [ -z "$CXX_SO" ]; then
+            echo "[error] 找不到 libc++_shared.so —— 它是 node 的运行期依赖，"
+            echo "        缺它打出的包在真机上会报 cannot locate symbol。拒绝固化。"
+            exit 1
+          fi
+
+          cp -f "$NODE_SO" /tmp/pin/out/libnode.so
+          cp -f "$CXX_SO"  /tmp/pin/out/libc++_shared.so
+          chmod +x /tmp/pin/out/libnode.so /tmp/pin/out/libc++_shared.so
+
+          echo
+          echo "== 提取结果 =="
+          ls -la /tmp/pin/out/
+
+      - name: Verify extracted binaries (fail loudly, never pin a bad runtime)
+        run: |
+          set -euo pipefail
+          cd /tmp/pin/out
+
+          echo "=== 1) ELF 架构 ==="
+          file libnode.so libc++_shared.so
+
+          # 必须是 AArch64 ELF。架构错了装到真机上就是 exec format error。
+          if ! file libnode.so | grep -q 'ARM aarch64'; then
+            echo "[error] libnode.so 不是 ARM aarch64 ELF，拒绝固化。"
+            exit 1
+          fi
+          echo "[ok] 架构正确：ARM aarch64"
+
+          echo
+          echo "=== 2) 解释器必须指向 Android linker64 ==="
+          readelf -l libnode.so 2>/dev/null | grep -i interpreter || true
+          if ! readelf -l libnode.so 2>/dev/null | grep -qi 'linker64'; then
+            echo "[error] 未找到 /system/bin/linker64 解释器。"
+            echo "        这说明它是用 glibc 工具链链接的，不是 Android bionic —— "
+            echo "        真机上无法 exec。拒绝固化。"
+            exit 1
+          fi
+          echo "[ok] 解释器正确"
+
+          echo
+          echo "=== 3) 16KB 页对齐（Android 15+ 要求；不满足则新设备无法加载）==="
+          readelf -l libnode.so 2>/dev/null | grep -E '^\s+LOAD' || true
+          ALIGN_BAD="$(readelf -l libnode.so 2>/dev/null | awk '/LOAD/ {print $NF}' | grep -cv '^0x4000$' || true)"
+          if [ "${ALIGN_BAD:-0}" -gt 0 ]; then
+            echo "[error] 存在非 0x4000 对齐的 LOAD 段，Android 15+ 上无法加载。"
+            exit 1
+          fi
+          echo "[ok] 全部 LOAD 段均为 0x4000 对齐"
+
+          echo
+          echo "=== 4) 动态依赖闭环 ==="
+          # 遍历 DT_NEEDED，除 bionic 提供的系统库外，其余必须由随包文件提供。
+          NEEDED="$(readelf -d libnode.so 2>/dev/null | awk '/NEEDED/ {gsub(/[\[\]]/,"",$5); print $5}')"
+          echo "NEEDED 列表："
+          echo "$NEEDED" | sed 's/^/  /'
+          MISSING=""
+          while IFS= read -r lib; do
+            [ -z "$lib" ] && continue
+            case "$lib" in
+              libc.so|libm.so|libdl.so|liblog.so|libz.so|libandroid.so|\
+              libGLESv2.so|libEGL.so|libnativewindow.so|libsync.so|\
+              libatomic.so|libstdc++.so)
+                echo "  [ok] $lib （bionic/系统提供）" ;;
+              *)
+                if [ -f "./$lib" ]; then
+                  echo "  [ok] $lib （已随包提供）"
+                else
+                  echo "  [MISSING] $lib"
+                  MISSING="$MISSING $lib"
+                fi ;;
+            esac
+          done <<< "$NEEDED"
+          if [ -n "$MISSING" ]; then
+            echo "[error] 以下依赖既不在系统里、也没随包提供：$MISSING"
+            echo "        固化了也跑不起来，拒绝。"
+            exit 1
+          fi
+          echo "[ok] 依赖闭环完整"
+
+          echo
+          echo "=== 5) 记录指纹 ==="
+          sha256sum libnode.so libc++_shared.so | tee /tmp/pin/out/SHA256SUMS
+
+      - name: Publish as immutable release
+        id: pub
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.resolve.outputs.version }}"
+          ABI="${{ steps.resolve.outputs.abi }}"
+          TAG="node-runtime-${VERSION}-${ABI}"
+
+          cd /tmp/pin/out
+
+          # 生成 manifest：fast-apk.yml 靠它决定"下载什么、校验什么"。
+          # 把校验和写进 manifest 而不是让下游自己算，是为了让"用了哪个二进制"
+          # 这件事可追溯 —— 出问题时能一眼看出 APK 里装的是哪份产物。
+          NODE_SHA="$(sha256sum libnode.so | awk '{print $1}')"
+          NODE_SIZE="$(stat -c%s libnode.so)"
+          CXX_SHA="$(sha256sum libc++_shared.so | awk '{print $1}')"
+          CXX_SIZE="$(stat -c%s libc++_shared.so)"
+
+          # 用 python 生成 manifest，而不是 heredoc 或内联多行脚本。
+          # 原因：YAML 块标量里嵌 heredoc 极易因缩进破坏结构（这里踩过）。
+          # 单行 python -c 最稳。
+          python3 -c "import json,datetime,sys; v,a,r,ns,nz,cs,cz=sys.argv[1:8]; m={'schema':1,'version':v,'abi':a,'source_run':r,'created_at':datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),'files':{'libnode.so':{'sha256':ns,'size':int(nz)},'libc++_shared.so':{'sha256':cs,'size':int(cz)}}}; json.dump(m,open('manifest.json','w'),indent=2,ensure_ascii=False); print(json.dumps(m,indent=2,ensure_ascii=False))" \
+            "$VERSION" "$ABI" "${{ steps.resolve.outputs.run_id }}" \
+            "$NODE_SHA" "$NODE_SIZE" "$CXX_SHA" "$CXX_SIZE"
+
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
+
+          if gh release view "$TAG" --repo '${{ github.repository }}' >/dev/null 2>&1; then
+            echo "[warn] Release $TAG 已存在。"
+            echo "       该 tag 的语义是【不可变】—— 同一版本+ABI 的二进制不应被替换，"
+            echo "       否则已发布的 APK 与它所依赖的运行时版本就对不上了。"
+            echo "       如需固化的新产物，请提升 version。此处仅更新资产内容以备重发。"
+          else
+            echo "创建 Release $TAG"
+            # 注意：--notes 的值必须写成【单行】。
+            # YAML 块标量（run: |）里出现跨行字符串时，续行一旦顶格就会破坏
+            # YAML 结构（本文件在这一点上踩过坑：报 "could not find expected ':'"）。
+            # 需要换行就用 \n 转义，交给 shell 展开。
+            NOTES="预编译的 Node ${VERSION} 安卓原生运行时（bionic 链接，arm64-v8a）。\n\n"
+            NOTES="${NOTES}来源：build-node 运行 ${{ steps.resolve.outputs.run_id }}\n\n"
+            NOTES="${NOTES}包含：\n"
+            NOTES="${NOTES}- libnode.so —— Node 可执行文件（经 jniLibs 通道落盘到 nativeLibraryDir）\n"
+            NOTES="${NOTES}- libc++_shared.so —— 运行期动态依赖，符号由它提供\n"
+            NOTES="${NOTES}- manifest.json / SHA256SUMS —— 校验与溯源\n\n"
+            NOTES="${NOTES}本资产为不可变引用：fast-apk.yml 按此 tag 下载，不再重编 Node。"
+            gh release create "$TAG" \
+              --repo '${{ github.repository }}' \
+              --title "Node ${VERSION} runtime for Android ${ABI} (prebuilt)" \
+              --notes "$(printf '%b' "$NOTES")"
+          fi
+
+          gh release upload "$TAG" \
+            libnode.so libc++_shared.so manifest.json SHA256SUMS \
+            --repo '${{ github.repository }}' --clobber
+
+          echo
+          echo "=== 固化完成 ==="
+          gh release view "$TAG" --repo '${{ github.repository }}' \
+            --json assets --jq '.assets[] | "\(.name)  \(.size) bytes"'
+
+      - name: Report to ci-ok
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          rm -rf /tmp/pinok && mkdir -p /tmp/pinok && cd /tmp/pinok
+          git clone --quiet \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" . || {
+              echo "[warn] clone 失败，跳过上报"; exit 0; }
+
+          TAG="${{ env.TAG }}"
+          {
+            echo "NODE_PINNED"
+            echo "time    : $(date -u)"
+            echo "tag     : $TAG"
+            echo "version : ${{ steps.resolve.outputs.version }}"
+            echo "abi     : ${{ steps.resolve.outputs.abi }}"
+            echo "run     : ${{ steps.resolve.outputs.run_id }}"
+            echo
+            echo "== 资产 =="
+            cd /tmp/pin/out && sha256sum libnode.so libc++_shared.so
+          } > ci-ok.txt
+
+          git config user.email "ci@workbuddy.local"
+          git config user.name "CI Diagnostic Bot"
+          git add ci-ok.txt
+          git commit -q -m "ci: node runtime pinned ($TAG)" || true
+          git push origin HEAD:ci-ok --force && echo "[ok] ci-ok 已更新"
