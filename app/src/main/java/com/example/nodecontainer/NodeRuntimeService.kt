@@ -138,6 +138,40 @@ class NodeRuntimeService : Service() {
                 RuntimeDiagnostics.append(this, "libdir", false, "列举 nativeLibraryDir 失败", err(e))
             }
 
+            // 4.45) 再看一眼【APK 内部】有没有这个文件。
+            //
+            //       4.4 只看了解压后的目录。但要定位问题究竟出在哪一环，必须把
+            //       「打包」与「安装解压」分开看：
+            //         · APK 里有、lib 目录里没有 → 是安装期没解压出来
+            //           （多半是 extractNativeLibs 或 useLegacyPackaging 没生效）
+            //         · APK 里就没有            → 是打包期就丢了
+            //           （构建脚本没拷 / AGP 把文件 strip 掉或丢了）
+            //       两者排查方向完全相反，所以必须分开确认。
+            //
+            //       读法：APK 本身就是个 zip，直接列 applicationInfo.sourceDir 的条目。
+            try {
+                val apkPath = applicationInfo.sourceDir
+                val entries = java.util.zip.ZipFile(apkPath).use { zf ->
+                    zf.entries().asSequence()
+                        .map { it.name }
+                        .filter { it.startsWith("lib/") }
+                        .sorted()
+                        .toList()
+                }
+                val inApk = entries.any { it.endsWith("libc++_shared.so") }
+                val apkSize = File(apkPath).length()
+                RuntimeDiagnostics.append(
+                    this, "apk-libs", inApk,
+                    if (inApk) "APK 内确实打包了 libc++_shared.so"
+                    else "⚠ APK 内【没有】libc++_shared.so —— 问题出在打包阶段，不是安装解压",
+                    "APK=$apkPath\n大小=$apkSize 字节\n" +
+                        "lib/ 条目数=${entries.size}\n" +
+                        entries.joinToString("\n") { "  $it" }
+                )
+            } catch (e: Exception) {
+                RuntimeDiagnostics.append(this, "apk-libs", false, "读取 APK 条目失败", err(e))
+            }
+
             // 4.5) 先跑一次 `node -v`：这是对「能否 exec」的确定性验证。
             //      比 canExecute() 可靠得多 —— 它真去执行了。成功说明 W^X 这关过了，
             //      顺便把二进制的真实版本号显示出来（与清单里的 version 可能不同，
@@ -148,16 +182,47 @@ class NodeRuntimeService : Service() {
             //      "exec 失败"处理的异常，会把诊断引向错误方向。
             //      只精确捕获 IOException（即进程根本无法创建 —— 这正是
             //      error=13 Permission denied 的形态）。
+            //
+            // -----------------------------------------------------------------
+            // LD_LIBRARY_PATH 是这一轮修复的关键，别删。
+            //
+            // 真机报：
+            //   CANNOT LINK EXECUTABLE ".../lib/arm64-v8a/libnode.so":
+            //   cannot locate symbol "_ZTVNSt6__ndk119basic_ostringstream..."
+            //
+            // readelf 的结论：libnode.so 的 DT_NEEDED 里有 libc++_shared.so，
+            // 而它自身既没有 DT_RPATH 也没有 DT_RUNPATH（动态段 29 个条目里
+            // 只有 NEEDED/FLAGS/RELA/... 没有路径项）。
+            //
+            // 这意味着：这个子进程被 exec 起来后，Android 的 linker 在解析
+            // libnode.so 的 NEEDED 时，【不会】自动去 nativeLibraryDir 找 ——
+            // 那个目录只在 Java 层 dlopen / System.loadLibrary 时才进搜索路径，
+            // 对「exec 一个可执行文件、由它自己拉起依赖」是完全另一套规则。
+            // 于是它只能查系统默认路径（/system/lib64 等），那里没有
+            // libc++_shared.so（它不是 bionic 的一部分），符号解析失败。
+            //
+            // 解法就是在进程环境里显式告诉 linker 去哪找：
+            //   LD_LIBRARY_PATH = nativeLibraryDir
+            // 两个 .so 都在这个目录里（libnode.so 自己也在），一举解决问题。
+            //
+            // 注意：ProcessBuilder 是直接 exec，不经过 shell，所以环境变量的
+            // 值就是路径原文，不涉及任何 shell 展开或引号处理。
+            // -----------------------------------------------------------------
+            val libSearchPath = applicationInfo.nativeLibraryDir
+
             try {
                 val probe = ProcessBuilder(nodeBin.absolutePath, "-v")
-                    .redirectErrorStream(true).start()
+                    .redirectErrorStream(true)
+                    .apply { environment()["LD_LIBRARY_PATH"] = libSearchPath }
+                    .start()
                 val out = probe.inputStream.bufferedReader().readText().trim()
                 val exit = probe.waitFor()
                 val ok = exit == 0
                 RuntimeDiagnostics.append(
                     this, "exec-probe", ok,
                     if (ok) "node -v 执行成功（可执行性已验证）" else "node -v 退出码非 0",
-                    "输出: ${out.ifBlank { "(空)" }}, exitCode=$exit"
+                    "输出: ${out.ifBlank { "(空)" }}, exitCode=$exit\n" +
+                        "LD_LIBRARY_PATH=$libSearchPath"
                 )
                 if (!ok) return
             } catch (e: java.io.IOException) {
@@ -184,6 +249,9 @@ class NodeRuntimeService : Service() {
                 put("HOME", filesDir.absolutePath)
                 put("TMPDIR", cacheDir.absolutePath)
                 put("NODE_PATH", File(filesDir, "node_modules").absolutePath)
+                // 与上面的探针保持一致：必须让 linker 知道去哪找 libc++_shared.so。
+                // 漏了这一行，node 会在动态链接期直接失败（cannot locate symbol）。
+                put("LD_LIBRARY_PATH", libSearchPath)
             }
             nodeProcess = pb.start()
             RuntimeDiagnostics.append(this, "exec", true, "node 进程已启动", "pid=${currentPid(nodeProcess)}, 监听 127.0.0.1:$PORT")
