@@ -26,44 +26,87 @@
 ```
 android-node-container/
 ├─ app/src/main/
+│  ├─ jniLibs/arm64-v8a/libnode.so        # NDK 编出的 node（构建时注入，首启离线可用）
+│  │                                       #   ⚠ 必须是 lib*.so 且放 jniLibs（见 §2.1，改动前必读）
 │  ├─ assets/
-│  │  ├─ node-bin/arm64-v8a/node          # NDK 编出的 node（构建时注入，首启离线可用）
+│  │  ├─ node/server.js                   # 容器探针（无内核包时首启验证 Node 原生链路）
 │  │  ├─ node-versions.json               # Node 运行时版本清单（驱动 Node OTA）
 │  │  ├─ ota-public.pem                   # ★焊接的 OTA 验签公钥（设备端唯一信任源）
 │  ├─ java/com/example/nodecontainer/
 │  │  ├─ NodeContainerApp                 # 通知渠道
-│  │  ├─ NodeRuntimeService(:node)        # 前台服务：写 runtime.json → 拉起内核 → 健康→退避重启
+│  │  ├─ NodeRuntimeService(:node)        # 前台服务：预置体检 → 写 runtime.json → 拉起内核 → 退避重启
 │  │  ├─ HostBridgeService                # ★UDS 能力桥（JSON-RPC 2.0，8 组方法 + 审计）
+│  │  ├─ ProvisioningProbe                # ★预置自检探针（PROVISIONING §4，落 provisioning.json）
 │  │  ├─ KernelManager                    # kernel/ CURRENT 指针 + 基线内核落地
-│  │  ├─ NodeProvisioner / NodeVersionManager  # Node 运行时解压 / 版本管理
+│  │  ├─ NodeProvisioner / NodeVersionManager  # Node 运行时定位 / 版本管理
 │  │  ├─ BootReceiver                     # ★开机自启容器
 │  │  ├─ DeviceAdminReceiver              # ★Device Owner（静默装卸/锁屏/密码/Kiosk）
-│  │  ├─ DshAccessibilityService          # ★无障碍（bridge:ui_automation 能力）
+│  │  ├─ DshAccessibilityService          # ★无障碍：手势/节点树/文本注入（bridge:ui_automation）
 │  │  └─ MainActivity                     # 诊断面板 + 加载内核同源宿主帧 /__host + dsh:kernel-update 桥
 │  └─ res/xml/{device_admin, accessibility_service_config, network_security_config}.xml
 ├─ container-engine/                      # ★可测 OTA 引擎（Node，零依赖）
 │  ├─ src/  zip / keys / sign / verify / kernel-bundle / ota-engine / runtime-json
 │  │        / boot / bridge/{protocol,methods,uds-transport,server}.js
-│  ├─ test/ 9 个测试套件（102 passed）
+│  ├─ test/ 9 个测试套件（107 passed）
 │  └─ bin/build-bundle.js                 # 内核包签名构建 CLI
 ├─ scripts/  keygen / build-node-android / build-apk-local / make-release / build-kernel-bundle
 ├─ keys/ota-private.pem                   # 开发期 ed25519 私钥（gitignored；CI 用 secret）
-└─ .github/workflows/  build-apk.yml / kernel-ota.yml
+└─ .github/workflows/  build-apk.yml / fast-apk.yml / kernel-ota.yml
 ```
 
+### 2.1 ⚠️ 为什么 node 必须放在 jniLibs 而不是 assets
+
+这是本项目踩过的最大一个坑，也是**真机 `error=13, Permission denied` 的根因**，改动前务必先读。
+
+Android 10 (API 29) 起 SELinux 强制 **W^X** 策略：
+
+| 路径 | SELinux label | 能否 `execve` |
+|---|---|---|
+| `/data/data/<pkg>/files/`（`getFilesDir()`） | `app_data_file` | ❌ 禁止 |
+| `/data/data/<pkg>/cache/`（`getCacheDir()`） | `app_data_file` | ❌ 禁止 |
+| `/data/app/<pkg>/lib/<abi>/`（`nativeLibraryDir`） | `exec_type` | ✅ 允许 |
+
+把 node 解压到 `filesDir` 再 `ProcessBuilder` 启动，会得到：
+
+```
+IOException: Cannot run program ".../files/node/24.21.0/node": error=13, Permission denied
+```
+
+官方认定这是**设计如此**（Google issuetracker 128554619）：
+
+> Calling exec() on writable application files is a W^X violation... While exec() no longer works on files within the application home directory, it continues to be supported for files within the read-only /data/app directory. In particular, it should be possible to package the binaries into your application's native libs directory and enable android:extractNativeLibs=true, and then call exec() on the /data/app artifacts.
+
+因此方案是：**把 node 命名为 `libnode.so` 放进 `jniLibs/<abi>/`，开启 `extractNativeLibs`，运行时从 `applicationInfo.nativeLibraryDir` 执行。** 三个配套条件缺一不可：
+
+1. 文件名必须是 `lib*.so` 形式，否则 AGP 不会当 native lib 处理；
+2. `android:extractNativeLibs="true"`（本项目在 Manifest 与 gradle 两处都写了）—— 否则 AGP 3.6+ 默认把 `.so` 压缩在 APK 内不落盘，文件系统上根本没有可执行路径；
+3. 二进制解释器必须是 Android 的 `/system/bin/linker64`（交叉编译产物天然满足）。
+
+> **还有一个必设的环境变量**：`LD_LIBRARY_PATH = nativeLibraryDir`。Android linker 查找依赖库的目录只有 `$LD_LIBRARY_PATH` / DT_RUNPATH / 系统默认路径三者，`nativeLibraryDir` **不在其中**（它只在 Java 层 `dlopen` 时进搜索路径）。而 `libnode.so` 自身既无 DT_RPATH 也无 DT_RUNPATH，若不设这个变量，`libc++_shared.so` 的符号解析会直接失败：
+> ```
+> CANNOT LINK EXECUTABLE ".../libnode.so": cannot locate symbol "_ZTVNSt6__ndk119basic_ostringstream..."
+> ```
+
+> **一个隐蔽的陷阱**：`File.canExecute()` 对上述限制**完全无感** —— 它只查 stat 的 x 权限位，不知道 noexec 挂载、更不知道 SELinux 策略。所以它在不可 exec 的文件上照样返回 `true`，造成"诊断显示可执行、真 exec 却失败"的假阳性。**判断能否执行，唯一可靠的办法是真去执行一次**（本项目在启动前跑一次 `node -v` 来验证，见 `runExecProbe`）。
+
+> **对 OTA 的影响**：`nativeLibraryDir` 是安装时固定、运行期只读的，且每次 APK 更新路径中的随机串都会变。这意味着"在沙箱放多个 Node 版本目录、切指针"的 Node OTA 方案在该路径上**不成立**。当前策略是以内置版本保证首启可用。**本文的 OTA 通道（签名验签/解包/原子指针）服务于内核包（L1）**——内核是 `filesDir` 下的 JS 代码，由 `node` 解释执行，不涉及 `execve`，因此不受 W^X 限制。
+
 ---
+
 
 ## 3. 内核启动流程（BASE_SPEC §9）
 
 `NodeRuntimeService`（独立 `:node` 进程，`START_STICKY` 前台保活）在 App 启动或 `BootReceiver` 收到开机广播时：
 
-1. 启动 **HostBridgeService**（UDS 监听，内核侧主动 connect）。
-2. 读 `files/kernel/CURRENT` 指针；若无内核则落地 `assets/kernel/baseline.zip`（首启离线可用）。
-3. 取冻结的 Node 运行时（`files/node/CURRENT`）。
-4. 写 **runtime.json（schema 2，容器写内核读）** 到 `files/supervisor/runtime.json`。
-5. 注入安卓环境：`DSH_ANDROID=1` / `DSH_PLATFORM=android` / `DSH_SUPERVISOR_HOME` / `DSH_UI_DIR` / `PATH` / `HOME` / `TMPDIR`。
-6. `spawn node bin/dsh-supervisor daemon`（内核入口）。
-7. HTTP `/status` 健康检查；失败/进程退出 → **退避重启**（1s→…→30s 上限）。
+1. **预置体检**（`ProvisioningProbe`，PROVISIONING §4）：device-owner / accessibility / shizuku / mediaprojection / special-perms 五项落 `diagnostics.txt` + `provisioning.json`，保证内核起不来时也能看清设备能力。
+2. 启动 **HostBridgeService**（UDS 监听，内核侧主动 connect）。
+3. 读 `files/kernel/CURRENT` 指针；若无内核则落地 `assets/kernel/baseline.zip`（首启离线可用）。
+4. 确认内置 node 就位（`nativeLibraryDir/libnode.so`）→ 自检两个 `.so` → **exec-probe 真跑一次 `node -v`**。
+5. 取冻结的 Node 运行时（`files/node/CURRENT`）。
+6. 写 **runtime.json（schema 2，容器写内核读）** 到 `files/supervisor/runtime.json`。
+7. 注入安卓环境：`DSH_ANDROID=1` / `DSH_PLATFORM=android` / `DSH_SUPERVISOR_HOME` / `DSH_UI_DIR` / `PATH` / `HOME` / `TMPDIR` / `LD_LIBRARY_PATH`。
+8. `spawn node bin/dsh-supervisor daemon`（内核入口）；无内核包时回落到 `assets/node/server.js` 探针（:3080）。
+9. 轮询控制面（有内核看 `36360/status`；探针模式看 `3080`）；失败/进程退出 → **退避重启**（1s→…→30s 上限）。
 
 > 一次内核升级 = 重启 `:node` 进程（用户侧“热”的，无 APK 重编）。
 
@@ -78,8 +121,20 @@ android-node-container/
 - **审计**：所有特权操作（装卸应用/锁屏/shell/读屏/通知读取，见 BRIDGE_PROTOCOL §5）落 `files/bridge-audit.log`（持久，不随内核包切换丢失）。
 - **内核侧客户端**：内核仓 `src/platform/host-bridge/`（本次已互通）；`notify.post`/`app.openUrl` 分别承接内核的通知与「打开浏览器」。
 
+**落地进度（2026-09）**：
+
+| 方法组 | 状态 | 说明 |
+|---|---|---|
+| `app_control` / `notification` / `system` | ✅ | 真实实现 |
+| `device_policy` | ✅ | 13 个 `dpm.*` 方法真实调用（需 Device Owner） |
+| `ui_automation` | ✅ | **P2 落地**：无障碍服务真实手势/节点树/文本注入 |
+| `storage` | ⏳ | Manifest 已声明权限，`fs.*` 方法体待实现 |
+| `shell` | ⏳ | 需 Shizuku SDK（P4） |
+| `build` | ⏳ | 需内置构建链（P3，待方案决策） |
+
 > 协议细节、方法表、错误码见 [`docs/BRIDGE_PROTOCOL.md`](docs/BRIDGE_PROTOCOL.md)；实现与 [`container-engine/src/bridge/*`](container-engine/src/bridge) 对齐。
 > 跨仓互通由 `container-engine/test/bridge-interop-test.js` 实测（内核真实客户端 ←→ 容器参考桥，真实 UDS）。
+> 权限预置与自检见 [`docs/PROVISIONING.md`](docs/PROVISIONING.md)；`Device Owner` 激活：`adb shell dpm set-device-owner com.example.nodecontainer/.DeviceAdminReceiver`。
 
 ---
 
@@ -153,8 +208,8 @@ CI 等价流程见 `.github/workflows/kernel-ota.yml`（用 `OTA_PRIVATE_KEY_PEM
 ```bash
 cd container-engine && npm test
 # sign-verify 6 / kernel-bundle 9 / ota-engine 12 / runtime-json 8 /
-# bridge-protocol 14 / bridge-e2e 9 / bridge-interop 14 / kernel-update-bridge 22 / e2e-mock-kernel 8
-# ⇒ 102 passed, 0 failed（9 套件）
+# bridge-protocol 14 / bridge-e2e 14 / bridge-interop 14 / kernel-update-bridge 22 / e2e-mock-kernel 8
+# ⇒ 107 passed, 0 failed（9 套件）
 ```
 
 覆盖：ed25519 签名/验签、内核包打包、OTA 验签+解包+原子指针切换+坏包拦截、runtime.json 契约、HostBridge 协议编解码/握手/方法能力/审计、**内核↔容器桥真实 UDS 互通**、**更新桥协议契约**，以及**真实 spawn 内核 + 健康检查**的端到端。

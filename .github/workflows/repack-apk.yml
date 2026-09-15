@@ -1,0 +1,257 @@
+name: Repack APK (inject libc++_shared.so)
+
+# ============================================================================
+#  为什么需要这个 workflow
+# ============================================================================
+#  真机（Android 16）报：
+#      CANNOT LINK EXECUTABLE ".../lib/arm64-v8a/libnode.so":
+#      cannot locate symbol
+#      "_ZTVNSt6__ndk119basic_ostringstreamIcNS_11char_traitsIcEENS_9allocatorIcEEEE"
+#
+#  根因：libnode.so 动态依赖 libc++_shared.so，但 APK 里漏打包了后者。
+#       （libc++_shared.so 不在 Android 系统里，必须随包提供。）
+#
+#  修复思路：不重新编译 Node（那要 3 小时），而是
+#      1) 下载既有成功 run 的 artifact（里面已有编好的 libnode.so）；
+#      2) 用 scripts/inject-libcxx-into-apk.py 把 libc++_shared.so
+#         以 Stored（不压缩）方式注入到 lib/arm64-v8a/ 下；
+#      3) apksigner 重新签名（注入会剥离原 v2 签名）；
+#      4) 推到 Release。
+#
+#  触发方式（两条任选）
+#    · 网页手动：Actions → 本 workflow → Run workflow，填 source_run_id
+#    · tag 触发：git push origin <某个 commit>:refs/tags/repack-<source_run_id>
+#      例：源 run 是 34852369904 → 推 tag `repack-34852369904`
+#      （维护环境无法操作网页，tag 触发是唯一能自动化的入口）
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: '源 build-apk run ID（留空则自动取最近一次成功）'
+        required: false
+        default: ''
+      tag:
+        description: '发布到哪个 Release tag（默认 apk-latest，会覆盖更新）'
+        required: false
+        default: 'apk-latest'
+  push:
+    tags:
+      - 'repack-*'
+
+concurrency:
+  group: repack-apk
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  repack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve source run id
+        id: src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID="${{ inputs.source_run_id }}"
+
+          # tag 触发：repack-<run_id>
+          if [ -z "$RUN_ID" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            REF_TAG="${GITHUB_REF_NAME:-}"
+            echo "== 由 tag 触发: $REF_TAG =="
+            CAND="${REF_TAG#repack-}"
+            if printf '%s' "$CAND" | grep -qE '^[0-9]+$'; then
+              RUN_ID="$CAND"
+            fi
+          fi
+
+          if [ -z "$RUN_ID" ]; then
+            echo "== 未指定，自动查找最近一次成功的 Build APK =="
+            RUN_ID="$(gh run list \
+                        --repo '${{ github.repository }}' \
+                        --workflow 'build-apk.yml' \
+                        --status success --limit 1 \
+                        --json databaseId --jq '.[0].databaseId')"
+          fi
+          [ -n "$RUN_ID" ] && [ "$RUN_ID" != "null" ] || { echo "[error] 找不到源 run"; exit 1; }
+          echo "源 run: $RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download source artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RUN_ID="${{ steps.src.outputs.run_id }}"
+          rm -rf /tmp/dl && mkdir -p /tmp/dl
+          gh run download "$RUN_ID" \
+            --repo '${{ github.repository }}' \
+            --name android-node-container-apk \
+            --dir /tmp/dl
+          APK="$(find /tmp/dl -name '*.apk' -type f | head -1)"
+          [ -n "$APK" ] || { echo "[error] artifact 内无 .apk"; exit 1; }
+          echo "源 APK: $APK ($(du -h "$APK" | cut -f1))"
+          cp "$APK" /tmp/app-src.apk
+
+      - name: Inject libc++_shared.so
+        run: |
+          set -euo pipefail
+          # 从 NDK 里取 libc++_shared.so（arm64-v8a）
+          LIBCXX="$(find "$ANDROID_NDK_LATEST_HOME" -path '*sysroot/usr/lib/aarch64-linux-android/libc++_shared.so' | head -1)"
+          if [ -z "$LIBCXX" ]; then
+            # 兜底：从 runner 上已安装的任意 NDK 里找
+            LIBCXX="$(find /usr/local/lib/android/sdk/ndk -path '*sysroot/usr/lib/aarch64-linux-android/libc++_shared.so' 2>/dev/null | head -1)"
+          fi
+          [ -n "$LIBCXX" ] || { echo "[error] 找不到 libc++_shared.so"; exit 1; }
+          echo "libc++_shared.so: $LIBCXX ($(stat -c%s "$LIBCXX") 字节)"
+
+          python3 scripts/inject-libcxx-into-apk.py \
+            --apk /tmp/app-src.apk \
+            --out /tmp/app-injected.apk \
+            --libcxx "$LIBCXX"
+          ls -la /tmp/app-injected.apk
+
+      - name: Verify injected APK
+        run: |
+          set -euo pipefail
+          cat > /tmp/verify.py <<'PY'
+          import zipfile, sys
+          z = zipfile.ZipFile('/tmp/app-injected.apk')
+          names = [i.filename for i in z.infolist()]
+          for want in ('lib/arm64-v8a/libnode.so', 'lib/arm64-v8a/libc++_shared.so'):
+              if want not in names:
+                  sys.exit('[error] 缺少 %s' % want)
+              print('[ok] %s' % want)
+          if any('node-bin' in n for n in names):
+              sys.exit('[error] 仍存在旧的 assets/node-bin 条目')
+          bad = z.testzip()
+          if bad:
+              sys.exit('[error] CRC 校验失败: %s' % bad)
+          print('[ok] CRC 全部通过')
+          PY
+          python3 /tmp/verify.py
+
+      - name: Sign APK
+        run: |
+          set -euo pipefail
+          # 用仓库 Actions secret 里的 keystore（若有），否则生成一个临时 debug 签名。
+          # 说明：本包仅用于自测，debug 签名足够；要长期升级可换成固定 keystore。
+          KS="$RUNNER_TEMP/release.keystore"
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ]; then
+            echo "== 使用仓库配置的 keystore =="
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > "$KS"
+            KS_PASS="${{ secrets.ANDROID_KEYSTORE_PASSWORD }}"
+            KS_ALIAS="${{ secrets.ANDROID_KEY_ALIAS }}"
+            KS_KEYPASS="${{ secrets.ANDROID_KEY_PASSWORD }}"
+          else
+            echo "== 未配置 keystore，生成本次专用的 debug 签名 =="
+            keytool -genkeypair -v -keystore "$KS" \
+              -storepass android -keypass android \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US" >/dev/null 2>&1
+            KS_PASS=android; KS_ALIAS=androiddebugkey; KS_KEYPASS=android
+          fi
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)"
+          "$APKSIGNER" sign \
+            --ks "$KS" --ks-pass "pass:$KS_PASS" \
+            --ks-key-alias "$KS_ALIAS" --key-pass "pass:$KS_KEYPASS" \
+            --min-sdk-version 24 --max-sdk-version 35 \
+            --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
+            --out /tmp/app-signed.apk /tmp/app-injected.apk
+
+          "$APKSIGNER" verify --verbose /tmp/app-signed.apk
+          ls -la /tmp/app-signed.apk
+
+      - name: Publish to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.tag }}"
+          [ -n "$TAG" ] || TAG="apk-latest"
+          echo "== 发布到 tag: $TAG =="
+
+          if gh release view "$TAG" --repo '${{ github.repository }}' >/dev/null 2>&1; then
+            if gh release view "$TAG" --repo '${{ github.repository }}' --json assets \
+                 --jq '.assets[].name' | grep -qx 'app-debug.apk'; then
+              gh release delete-asset "$TAG" app-debug.apk \
+                --repo '${{ github.repository }}' --yes
+            fi
+            gh release upload "$TAG" /tmp/app-signed.apk#app-debug.apk \
+              --repo '${{ github.repository }}' --clobber
+          else
+            gh release create "$TAG" /tmp/app-signed.apk#app-debug.apk \
+              --repo '${{ github.repository }}' \
+              --title "Node Container APK ($TAG)" \
+              --notes "repack from run ${{ steps.src.outputs.run_id }}：注入 libc++_shared.so，修复 cannot locate symbol。"
+          fi
+
+          echo "== 发布完成 =="
+          gh release view "$TAG" --repo '${{ github.repository }}' --json url,assets \
+            --jq '"\(.url)\n" + (.assets[] | "  \(.name)  \(.size) bytes")'
+
+      - name: Report to ci-ok
+        if: always()
+        env:
+          GH_TOKEN: >-
+            ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          # 把「产物指纹」上报到 ci-ok 分支。
+          # 为什么这么做：维护环境（沙箱）无法直连 github.com / objects.githubusercontent.com
+          # 下载 Release 附件，只能靠 CI 自报指纹来远程确认「发出去的包里到底有什么」。
+          # 所以这里必须报告【可验证的事实】，而不是一句"成功"。
+          {
+            echo "REPACK_REPORT"
+            echo "time : $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "from : run ${{ steps.src.outputs.run_id }}"
+            echo "job  : ${{ job.status }}"
+            echo "note : 注入 libc++_shared.so，修复 cannot locate symbol"
+            echo
+            echo "=== APK 指纹 (/tmp/app-signed.apk) ==="
+            if [ -f /tmp/app-signed.apk ]; then
+              echo "size  : $(stat -c%s /tmp/app-signed.apk) 字节"
+              echo "sha256: $(sha256sum /tmp/app-signed.apk | cut -d' ' -f1)"
+              echo "md5   : $(md5sum /tmp/app-signed.apk | cut -d' ' -f1)"
+            else
+              echo "(APK 不存在 —— 前面某步失败了)"
+            fi
+            echo
+            echo "=== lib/ 内容 ==="
+            if [ -f /tmp/app-signed.apk ]; then
+              unzip -l /tmp/app-signed.apk 2>/dev/null | grep 'lib/' || echo "(无 lib/ 条目)"
+            fi
+            echo
+            echo "=== 签名方案 ==="
+            if [ -f /tmp/app-signed.apk ]; then
+              APKSIGNER="$(find "$ANDROID_HOME/build-tools" -name apksigner | sort -V | tail -1)"
+              "$APKSIGNER" verify --verbose /tmp/app-signed.apk 2>&1 || true
+            fi
+            echo
+            echo "=== Release 里的附件 ==="
+            gh release view "${{ inputs.tag || 'apk-latest' }}" \
+              --repo '${{ github.repository }}' --json assets \
+              --jq '.assets[] | "  \(.name)  \(.size) bytes  digest=\(.digest // "n/a")"' 2>/dev/null || true
+          } > /tmp/ci-ok.txt
+
+          cat /tmp/ci-ok.txt
+
+          git config user.name  'CI Reporter' || true
+          git config user.email 'ci@workbuddy.local' || true
+          git checkout --orphan ci-ok-tmp 2>/dev/null || git checkout ci-ok-tmp
+          git rm -rf . >/dev/null 2>&1 || true
+          cp /tmp/ci-ok.txt ci-ok.txt
+          git add -f ci-ok.txt
+          git commit -m "repack report (run ${{ steps.src.outputs.run_id }}, ${{ job.status }})" || true
+          git push -f origin HEAD:ci-ok

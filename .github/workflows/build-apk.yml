@@ -13,6 +13,50 @@ on:
   workflow_dispatch:
   push:
     branches: [main, master]
+    # -----------------------------------------------------------------------
+    # paths-ignore：只改 CI/文档/脚本时【不要】触发这条路。
+    #
+    # 为什么要加（真实教训）：
+    #   这条 workflow 一旦跑起来就是 ~3 小时的 Node 全量交叉编译
+    #   （要编两份 V8：host x64 + target aarch64）。而在此之前，
+    #   任何一次推到 main 都会触发它 —— 包括「只改了发布流程」「只改了
+    #   README」这类根本不需要重编 Node 的提交。白白占机时、还会因为
+    #   cancel-in-progress 把别人正在跑的构建掐掉。
+    #
+    #   所以：CI 自身的文件（.github/**）、文档（*.md）、以及纯打包/发布
+    #   辅助脚本（scripts/inject-*.py、scripts/make-release.sh）都不触发。
+    #   真正决定 Node 二进制的 scripts/build-node-android.sh 与 app/ 仍在
+    #   触发范围内 —— 改它们本来就该重编。
+    #
+    # 需要强制重编时：用 Actions 页面的 Run workflow（workflow_dispatch 不受
+    # paths 过滤影响），或推一个空提交改到非忽略路径。
+    # -----------------------------------------------------------------------
+    paths-ignore:
+      - '.github/**'
+      - '**.md'
+      - 'docs/**'
+      - 'scripts/validate-workflow.py'
+      - 'scripts/inject-*.py'
+      - 'scripts/make-release.sh'
+      - 'scripts/gh-access.sh'
+
+# ---------------------------------------------------------------------------
+# 并发控制：同一个 ref 上只允许一个构建在跑。
+#
+# 为什么要加（真实教训）：曾经在上一轮尚未结束时就推了新 commit，导致三个 run
+# 同时存在、同时往 ci-hb 这一个分支推心跳，互相覆盖 —— 外部监控于是彻底看不清
+# 「哪一轮在跑、跑到哪了」，我甚至无法判断新推的那轮是死是活。
+# 更糟的是它们还会争抢同一台机器的资源，把彼此拖慢。
+#
+# cancel-in-progress: true 的取舍：
+#   推新提交时直接取消旧的（旧的那个已经没有意义了，代码都变了），
+#   保证「最新代码 = 唯一在跑的构建」，监控永远指向正确目标。
+#   代价是旧构建的 Node 编译成果丢失 —— 但它本来也对应旧脚本，
+#   缓存 key 不同，留着也用不上。
+# ---------------------------------------------------------------------------
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -46,6 +90,9 @@ jobs:
           cat > /tmp/heartbeat.sh <<'HB'
           #!/usr/bin/env bash
           # 后台心跳：独立进程，每 45s 推一次 ci-hb。失败静默重试，绝不干扰主构建。
+          #
+          # 注意间隔别调太大：上一轮 job 在「远早于 timeout 的时刻」突然消失，
+          # 最后一个心跳就是唯一的现场证据。45s 的粒度能看清内存趋势。
           set +e
           export GIT_TERMINAL_PROMPT=0
           cd /tmp/hbrepo 2>/dev/null || exit 0
@@ -60,12 +107,32 @@ jobs:
               echo "stage: $stage"
               echo "run  : $RUN_ID"
               echo "sha  : $SHA"
-              # 日志体积与「编译行数」：判断「卡死」还是「在推进」的最直接依据。
-              # 15MB 的编译日志只看 tail 看不出速度，这两个数字能。
-              # 用 tail -c 限制扫描范围，避免每 45 秒全量扫 15MB 拖慢 runner。
+              # 内存水位：这是判断「会不会被 OOM 杀掉」的关键指标。
+              # 上一轮就是内存耗尽导致进程被内核杀掉、连收尾步骤都没记录，
+              # 而当时的心跳里完全没有内存信息，只能靠猜。现在把它带上。
+              # MemAvailable 取 /proc/meminfo；cgroup 限额另记一行便于对照。
+              echo "mem  : $(awk '/^MemAvailable:/{printf "avail=%.1fGB", $2/1048576}' /proc/meminfo 2>/dev/null)"
+              echo "cgmax: $(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo n/a)"
+              echo "load : $(cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3)"
+              # 日志体积 + 已编译目标数：判断「卡死」还是「在推进」的最直接依据。
+              # 编 6800 个 TU 的日志有十几 MB，只看 tail 看不出速度，这两个数字能。
+              # objs 优先数脚本自己打的 [progress ...] 行（含 host/target 计数）；
+              # 退回数编译命令行数量。用 tail -c 限制扫描范围，避免每 45 秒
+              # 全量扫十几 MB 拖慢 runner。
               if [ -f /tmp/node-build.log ]; then
                 echo "logsize: $(wc -c < /tmp/node-build.log 2>/dev/null || echo 0)"
-                echo "objs   : $(tail -c 400000 /tmp/node-build.log 2>/dev/null | grep -c 'Building CXX object\|clang++\|ninja' || echo 0)"
+                prog="$(tail -c 200000 /tmp/node-build.log 2>/dev/null | grep -o 'host=[0-9]* target=[0-9]*' | tail -1)"
+                echo "objs   : ${prog:-$(tail -c 400000 /tmp/node-build.log 2>/dev/null | grep -c 'clang++\|cc1plus' || echo 0)}"
+                # 是否已经出现 OOM 痕迹（内核会打 oom-kill 或进程报 Killed）
+                echo "oomhits: $(tail -c 200000 /tmp/node-build.log 2>/dev/null | grep -c 'Killed signal\|out of memory\|oom-kill' || echo 0)"
+                echo "lastprog: $(tail -3 /tmp/node-build.log 2>/dev/null | tr '\n' ' ' | cut -c1-160)"
+              else
+                # 缓存命中时 node-build 步骤会被整体跳过，不会有 node-build.log。
+                # 必须显式写出来，否则外部会看到一片空白而无法判断"是跳过了还是卡住了"。
+                echo "logsize: 0 (skipped: node build cache hit)"
+                echo "objs   : n/a"
+                echo "oomhits: n/a"
+                echo "lastprog: (node build skipped — reused cached binary)"
               fi
             } > hb.txt
             git add hb.txt >/dev/null 2>&1
@@ -167,7 +234,11 @@ jobs:
         id: wfvalidate
         run: |
           echo "2/9 validate-workflow" > /tmp/ci-stage
-          python3 scripts/validate-workflow.py .github/workflows/build-apk.yml
+          # 校验【全部】workflow，而不是只校验自己。
+          # 只校验自己时，新建/改动的其它 workflow 出问题就没人管 ——
+          # 校验范围本身成了盲区（这里真实踩过：新加的 workflow 有重复
+          # on.push key，导致推任意 tag 都会误触发构建）。
+          python3 scripts/validate-workflow.py
 
       - name: Set up JDK 17
         id: setupjava
@@ -175,6 +246,11 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
+          # 缓存 Gradle 的用户目录（~/.gradle）：内含下载过的 Gradle 发行包、
+          # 依赖 jar、transform 结果。上一轮日志里光是下载 gradle-8.9-bin.zip
+          # 就占了不少时间，且每次全新 runner 都要重下。加上它几乎是零成本。
+          # 注意：这里只缓存 Gradle 自身的东西，与上面的 Node 产物缓存互不影响。
+          cache: gradle
 
       # 说明：ubuntu-latest runner 自带 Android SDK（$ANDROID_SDK_ROOT / $ANDROID_HOME 已设置）。
       # 不使用第三方 setup-android action，避免“action 仓库解析不到导致 Set up job 直接失败”。
@@ -188,11 +264,14 @@ jobs:
 
       - name: Install SDK packages (platform-tools / platform / build-tools; NDK reused if present)
         id: sdkinstall
-        env:
-          ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           echo "4/9 sdk-install" > /tmp/ci-stage
           set -o pipefail
+          # 不显式设置 ANDROID_HOME/ANDROID_SDK_ROOT：runner 镜像自带正确的值。
+          # 曾经写成 ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}，而 workflow 级没有
+          # 定义该变量 → 展开为空 → 反而把 runner 自带的值覆盖成空。
+          echo "== ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          echo "== ANDROID_HOME=${ANDROID_HOME:-<unset>}"
           SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           echo "== sdkmanager: $SDKMANAGER"
           "$SDKMANAGER" --version 2>&1 | tee -a /tmp/sdk-install.log | tail -1
@@ -200,12 +279,18 @@ jobs:
           # 接受 license（输出进日志，避免刷屏）
           yes | "$SDKMANAGER" --licenses 2>&1 | tee -a /tmp/sdk-install.log | tail -2 || true
 
-          echo "== installing platform-tools / platform-34 / build-tools-34.0.0"
-          if ! "$SDKMANAGER" "platform-tools" "platforms;android-34" "build-tools;34.0.0" 2>&1 | tee -a /tmp/sdk-install.log | tail -5; then
+          echo "== installing platform-tools / platform-35 / build-tools;35.0.0"
+          # compileSdk 必须 >= 35：androidx.core 1.15.0 / core-ktx 1.15.0 的 AAR metadata
+          # 明确要求依赖方 compileSdk >= 35，否则 gradle 在 :app:checkDebugAarMetadata
+          # 阶段直接失败（"requires ... compile against version 35 or later"）。
+          # 注意 compileSdk 与 minSdk 是两件独立的事：提 compileSdk 只影响"用哪个
+          # API 头来编译"，不会抬高 APK 的最低系统要求（minSdk 仍保持 24）。
+          if ! "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0" 2>&1 | tee -a /tmp/sdk-install.log | tail -5; then
             echo "[error] sdkmanager base install failed"
             exit 1
           fi
           echo "== base packages installed OK"
+          echo "== 已安装的 platforms:"; ls "$ANDROID_SDK_ROOT/platforms" 2>/dev/null | sed 's/^/    /'
 
           # NDK：runner 镜像通常已自带（如 /usr/local/lib/android/sdk/ndk/<ver>）。
           # 已有就直接复用，避免因某个具体 build 号在远端不存在而导致安装失败。
@@ -266,26 +351,300 @@ jobs:
           print("node-versions.json default ->", tag)
           PY
 
+      # ---------------------------------------------------------------------------
+      # Node 编译产物缓存（关键优化：避免"改一行 Kotlin 就重编 4 小时"）。
+      #
+      # 为什么需要：Node 交叉编译要跑约 6808 个编译单元、耗时 3~4 小时。
+      # 而实际迭代中绝大多数改动只在【下游】—— Kotlin 代码、gradle 配置、
+      # AndroidManifest。这些改动完全不影响 Node 二进制，却每次都把整个
+      # V8/ICU/OpenSSL 从头重编，纯属浪费。（真实教训：连续三轮 CI 失败都发生在
+      # gradle 阶段，每轮都白等近 4 小时编译。）
+      #
+      # 缓存 key 的设计（决定"什么时候该重编"）：
+      #   node-android-<node tag>-<build 脚本哈希>
+      #   - Node 版本变了      -> tag 变 -> 自动重编（符合预期）
+      #   - 编译脚本/补丁改了  -> 哈希变 -> 自动重编（**这点很重要**：
+      #     我们改过 aligned_alloc 补丁、宿主编译器逻辑等，那些改动必须
+      #     触发重编，否则会拿到旧产物，产生"改了却没生效"的诡异现象）
+      #   - 只改 Kotlin/gradle -> key 不变 -> 命中缓存，跳过编译
+      #
+      # 【只缓存最终二进制，刻意不缓存 out/ 目录】
+      #   一开始想把整个 out/ 也缓存起来，好让 make 做增量编译。权衡后放弃：
+      #   1) out/ 含 6808 个 .o，体积 3~6 GB。GitHub 单仓库缓存总额上限就是
+      #      10 GB，一个条目吃掉大半，且 7 天不用就被清理。
+      #   2) 压缩+上传+下载这么大的目录本身要十几分钟，省下的时间被吃掉一大半。
+      #   3) 我们的真实需求不是"增量编译"，而是"下游改动时压根别编" ——
+      #      只缓存 node 二进制（约 100~120 MB）完全够用，传输只要几十秒。
+      #   GitHub Actions 的 cache 本质上也不是增量缓存，它只做整份条目的
+      #   精确匹配 / 前缀回退，缓存中间态并不能带来真正的增量编译。
+      #
+      # restore-keys：本轮 key 未命中时按前缀回退到最近一次缓存。这里刻意
+      #   用同前缀，好处是换了编译脚本时仍能拿到旧二进制作为"应急兜底"；
+      #   但因为 key 变了就说明编译脚本动过，脚本改动很可能影响产物正确性，
+      #   所以【命中回退缓存时额外打一条醒目警告】，不静默使用。
+      # ---------------------------------------------------------------------------
+      - name: Cache compiled Node binary
+        id: nodecache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/dsh-node-cache
+          key: node-android-${{ steps.nodever.outputs.tag }}-${{ hashFiles('scripts/build-node-android.sh') }}
+          restore-keys: |
+            node-android-${{ steps.nodever.outputs.tag }}-
+
+      - name: Restore cached Node binary if present
+        id: restorenode
+        run: |
+          echo "=== 检查缓存的 Node 产物 ==="
+          # 目标路径与构建脚本的 OUT_DIR 保持一致：jniLibs/arm64-v8a/libnode.so
+          # （不是 assets！原因见 build-node-android.sh 里的 W^X 说明）
+          mkdir -p app/src/main/jniLibs/arm64-v8a
+          DEST="app/src/main/jniLibs/arm64-v8a/libnode.so"
+          EXACT_KEY="node-android-${{ steps.nodever.outputs.tag }}-${{ hashFiles('scripts/build-node-android.sh') }}"
+          if [ -f /tmp/dsh-node-cache/node ]; then
+            cp -f /tmp/dsh-node-cache/node "$DEST"
+            chmod +x "$DEST"
+            echo "cache-hit=yes" >> "$GITHUB_OUTPUT"
+            echo "[ok] 复用已编译的 node 二进制，跳过 3~4 小时交叉编译："
+            ls -la "$DEST"
+            file -b "$DEST" || true
+
+            # ------------------------------------------------------------------
+            # 连带恢复 libc++_shared.so —— 这一步曾漏掉，是个隐蔽的坑。
+            #
+            # libnode.so 动态依赖 libc++_shared.so（readelf -d 可见 NEEDED 项），
+            # 而它不在 Android 系统里，必须随 APK 一起打包。
+            # 若缓存里只存了 node 本体、这里只恢复 node 本体，那么【一旦命中缓存】，
+            # jniLibs 目录里就只有 libnode.so 而没有 libc++_shared.so，
+            # 打出来的 APK 到真机上必然报：
+            #     cannot locate symbol "_ZTVNSt6__ndk119basic_ostringstream..."
+            # 而未命中缓存（完整编译）时却又是好的 —— 于是表现为
+            # 「第一次能跑、命中缓存后反而不行」这种极难排查的间歇性故障。
+            #
+            # 所以：缓存里必须同时存这两个文件，恢复时也一并还原。
+            # ------------------------------------------------------------------
+            CXX_DEST="app/src/main/jniLibs/arm64-v8a/libc++_shared.so"
+            if [ -f /tmp/dsh-node-cache/libc++_shared.so ]; then
+              cp -f /tmp/dsh-node-cache/libc++_shared.so "$CXX_DEST"
+              chmod +x "$CXX_DEST"
+              echo "[ok] 连带恢复 libc++_shared.so:"
+              ls -la "$CXX_DEST"
+            else
+              # 旧缓存（本修复之前写入的）里没有这个文件。
+              # 不能静默放过 —— 那会打出一个真机跑不起来的包。
+              echo "[warn] 缓存里没有 libc++_shared.so（多半是旧缓存）。"
+              echo "       将尝试从本机 NDK 补一份……"
+              CXX_SRC="$(find "${ANDROID_NDK_LATEST_HOME:-}" \
+                           "${ANDROID_NDK_HOME:-}" \
+                           "${ANDROID_NDK_ROOT:-}" \
+                           "$ANDROID_HOME/ndk" \
+                           /usr/local/lib/android/sdk/ndk \
+                           -path '*sysroot/usr/lib/aarch64-linux-android/libc++_shared.so' 2>/dev/null | head -1)"
+              if [ -n "$CXX_SRC" ] && [ -f "$CXX_SRC" ]; then
+                cp -f "$CXX_SRC" "$CXX_DEST"
+                chmod +x "$CXX_DEST"
+                echo "[ok] 已从 NDK 补齐: $CXX_SRC"
+                ls -la "$CXX_DEST"
+              else
+                echo "[error] 缓存与本机 NDK 都没有 libc++_shared.so。"
+                echo "        继续下去会打出无法启动的 APK，故在此失败。"
+                echo "        解法：重新完整编译一次（脚本已会连带打包该库），"
+                echo "        或让缓存 key 变化以避开这份旧缓存。"
+                exit 1
+              fi
+            fi
+            # 复用缓存二进制时做一次形态校验。
+            # 注意：这里【不】强制要求 linker64 解释器 —— 该文件本质是普通 ELF
+            # 可执行文件，被系统当 native lib 解压落盘后直接 exec，并非作为共享库
+            # 加载，所以理论上静态链接也能跑。真正要防的是「缓存里存的是远古形态
+            # 的产物」（比如最初那版 assets 用的东西）；用体积和多架构特征做粗筛。
+            if file -b "$DEST" | grep -qiE "ARM aarch64|aarch64"; then
+              echo "[ok] 架构为 aarch64，与 arm64-v8a 匹配。"
+            else
+              echo "[error] 缓存中的二进制不是 aarch64：$(file -b "$DEST")"
+              echo "        与 APK 的 arm64-v8a 不匹配，拒绝使用（本步骤失败以阻止出包）。"
+              exit 1
+            fi
+            # 区分「精确命中」与「前缀回退命中」。后者意味着编译脚本已变更，
+            # 这个二进制是旧脚本的产物，可能不是我们真正想要的 —— 必须警告。
+            SAVED_KEY="$(cat /tmp/dsh-node-cache/.cache-key 2>/dev/null || echo '<unknown>')"
+            if [ "$SAVED_KEY" = "${EXACT_KEY}:${GITHUB_RUN_ID}" ] || [ "${SAVED_KEY%:*}" = "$EXACT_KEY" ]; then
+              echo "[ok] 精确命中（编译脚本与 Node 版本均未变），复用的二进制即当前脚本的产物。"
+            else
+              echo "[warn] 回退命中（前缀匹配）：编译脚本或 Node 版本可能已变更。"
+              echo "       当前脚本对应的 key: $EXACT_KEY"
+              echo "       缓存实际的 key    : $SAVED_KEY"
+              echo "       本二进制来自较早的编译，若怀疑产物不是最新脚本的结果，"
+              echo "       可强制重编：把 build 脚本里任意一处改一个字符即可（key 随之变化）。"
+            fi
+          else
+            echo "cache-hit=no" >> "$GITHUB_OUTPUT"
+            echo "[miss] 无缓存产物，需要完整编译 Node（预计 3~4 小时）。"
+          fi
+
       - name: Build Node for Android (NDK 交叉编译 arm64-v8a)
         id: nodebuild
+        # 缓存命中则整步跳过 —— 这是本优化能省下 3~4 小时的直接原因。
+        if: steps.restorenode.outputs.cache-hit != 'yes'
         env:
           ANDROID_NDK: ${{ env.ANDROID_NDK }}
           ANDROID_API: "24"
         run: |
           echo "7/9 NODE-BUILD (longest, V8 compile)" > /tmp/ci-stage
+          # 记录 runner 的真实内存与并行度决策，便于事后判断是否又是内存问题。
+          echo "=== runner 资源 ==="
+          nproc; free -m | head -2
+          cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "(no cgroup v2 limit)"
+          echo "=== 开始编译 ==="
           set -o pipefail
           chmod +x scripts/build-node-android.sh
+          # 不用 nproc 拉满，交给脚本按内存自适应（脚本内也会读同样的限额）。
           ./scripts/build-node-android.sh ${{ steps.nodever.outputs.tag }} 2>&1 | tee /tmp/node-build.log
+
+      - name: Save Node binary to cache
+        # 条件说明（这里的判断很关键，别改错）：
+        #   cache-hit != 'yes'  —— 未命中缓存才保存，避免每次重写同一份。
+        #   steps.nodebuild.outcome == 'success' —— **只要求 Node 编译本身成功**，
+        #      而不是整个 job 成功。
+        # 为什么不用 success()：success() 要求【此前所有步骤】都成功，且一旦后续
+        #   gradle 失败，这个步骤就已经被跳过了。但事实上 Node 二进制在下游
+        #   （Kotlin 编译、APK 打包）失败时【依然是完好的】—— 它本身已经编完，
+        #   跟下游是两回事。
+        #   真实教训：连续三轮失败都出在 gradle，而每一轮里 node 其实都编译成功了。
+        #   若用 success()，这些可复用的编译成果会被全部丢弃，下次还得再编 4 小时。
+        #   用 nodebuild 自身的 outcome 判断，就能把这些成果保下来 —— 这恰好是
+        #   本缓存最重要的价值场景。
+        # 注意：cache-hit == 'yes' 时 nodebuild 是 skipped，outcome 为 'skipped'，
+        #      不等于 'success'，故不会重复保存，符合预期。
+        if: steps.restorenode.outputs.cache-hit != 'yes' && steps.nodebuild.outcome == 'success'
+        run: |
+          echo "=== 保存 Node 产物到缓存目录 ==="
+          mkdir -p /tmp/dsh-node-cache
+          if [ ! -f out/Release/node ]; then
+            echo "[warn] out/Release/node 不存在，跳过缓存保存。"
+            exit 0
+          fi
+          cp -f out/Release/node /tmp/dsh-node-cache/node
+          chmod +x /tmp/dsh-node-cache/node
+
+          # 连带保存 libc++_shared.so。
+          # 它是 node 的运行期动态依赖、且不在 Android 系统里，必须随包提供。
+          # 只存 node 本体的话，下次命中缓存就会打出缺少该库的 APK ——
+          # 真机表现为 cannot locate symbol，见恢复段的详细说明。
+          CXX_SRC="app/src/main/jniLibs/arm64-v8a/libc++_shared.so"
+          if [ -f "$CXX_SRC" ]; then
+            cp -f "$CXX_SRC" /tmp/dsh-node-cache/libc++_shared.so
+            echo "[ok] 连带保存 libc++_shared.so ($(stat -c%s "$CXX_SRC") 字节)"
+          else
+            echo "[warn] $CXX_SRC 不存在，缓存里将没有 libc++_shared.so。"
+            echo "       下次命中缓存时会尝试从 NDK 补齐（见 Restore 步骤）。"
+          fi
+          # 记下产出这份缓存时的 key + run id，供下次区分"精确命中/回退命中"。
+          echo "node-android-${{ steps.nodever.outputs.tag }}-${{ hashFiles('scripts/build-node-android.sh') }}:${GITHUB_RUN_ID}" \
+            > /tmp/dsh-node-cache/.cache-key
+          ls -la /tmp/dsh-node-cache/
+          du -sh /tmp/dsh-node-cache/ 2>/dev/null || true
+          echo "[ok] 已写入缓存。即使后续 gradle 步骤失败，这份 Node 二进制也能被下次运行复用。"
+
+      - name: Verify node binary is in place (pre-gradle gate)
+        id: verifybin
+        run: |
+          echo "=== 打包前门禁：确认 node 二进制以 jniLibs 形态就位 ==="
+          DEST="app/src/main/jniLibs/arm64-v8a/libnode.so"
+          if [ ! -f "$DEST" ]; then
+            echo "[error] 缺少 $DEST"
+            echo "        这意味着 node 既没从缓存恢复、也没有新编译出来。"
+            echo "        直接失败，避免打出一个没有运行时的 APK。"
+            echo "输出："
+            echo "  jniLibs 目录:"; ls -la app/src/main/jniLibs/arm64-v8a/ 2>/dev/null || echo "  (不存在)"
+            echo "  out/Release:"; ls -la out/Release/node 2>/dev/null || echo "  (不存在)"
+            exit 1
+          fi
+          SZ=$(stat -c %s "$DEST")
+          echo "文件: $DEST"
+          echo "大小: $SZ 字节 ($(( SZ / 1024 / 1024 )) MB)"
+          # 完整性判断：交叉编译出的 node 大约 100MB 上下，若明显偏小说明产物被截断。
+          if [ "$SZ" -lt 20000000 ]; then
+            echo "[error] 产物异常偏小（<20MB），疑似拷贝中断或被截断。"
+            exit 1
+          fi
+          file -b "$DEST" | sed 's/^/file: /'
+          # 关键前提：必须是 aarch64 的 ELF，否则装到 arm64 设备上无法执行。
+          # （不强制 linker64 解释器：该文件是普通 ELF 可执行文件，系统只是把它
+          #   当 native lib 解压落盘，并非作为共享库加载。）
+          if ! file -b "$DEST" | grep -qiE "aarch64"; then
+            echo "[error] 该产物不是 aarch64 ELF，与 APK 的 arm64-v8a 不匹配。"
+            exit 1
+          fi
+          echo "[ok] 门禁通过：产物形态正确，可以进入 gradle 打包。"
+          # 明确记录：真机上它将被解压到 nativeLibraryDir，路径于此可见（构建期无法
+          # 预知运行时随机串，故仅说明装配位置）。
+          echo "    装配位置: /data/app/.../<pkg>-.../lib/arm64-v8a/libnode.so"
+          echo "    运行期由 applicationInfo.nativeLibraryDir 定位并 exec。"
 
       - name: Build debug APK
         id: gradlebuild
-        env:
-          ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}
         run: |
           echo "8/9 gradle-apk" > /tmp/ci-stage
           set -o pipefail
           chmod +x gradlew
+          # 注意：这里【不要】写 env: ANDROID_SDK_ROOT: ${{ env.ANDROID_SDK_ROOT }}。
+          # workflow 级从未定义过 ANDROID_SDK_ROOT，该表达式展开为空字符串，
+          # 于是把 runner 自带的正确值覆盖成空 —— gradle 随即告警
+          #   "WARNING: The following problems were found when resolving the SDK
+          #    location: Set with empty value"（上一轮日志里真实出现过）。
+          # 本步骤没显式传 env，runner 自带的 ANDROID_SDK_ROOT/ANDROID_HOME 自然生效。
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
           ./gradlew assembleDebug --no-daemon 2>&1 | tee /tmp/gradle-build.log
+
+      - name: Audit APK contents (must contain libc++_shared.so)
+        run: |
+          echo "=== 打包后审计：APK 里到底有没有运行期依赖 ==="
+          # 为什么要这一步（真实教训）：
+          #   真机报 cannot locate symbol "_ZTVNSt6__ndk119basic_ostringstream..."，
+          #   这是【运行期动态链接】找不到 libc++_shared.so 的表现。
+          #   而此前的门禁只检查了 jniLibs 目录里有没有 libnode.so，
+          #   完全没有校验 libc++_shared.so 是否真的被 AGP 收进了 APK ——
+          #   于是"编译成功"和"真机可跑"之间有一道没人守的门。
+          #
+          #   这一步把门补上：直接解开产出的 APK 查验，不在就当场失败。
+          APK="$(find app/build/outputs/apk/debug -name '*.apk' -type f | head -1)"
+          if [ -z "$APK" ]; then
+            echo "[error] 找不到 APK"
+            exit 1
+          fi
+          echo "APK: $APK ($(stat -c%s "$APK") 字节)"
+          echo
+          echo "--- lib/ 下的条目 ---"
+          unzip -l "$APK" | grep 'lib/' || echo "(没有 lib/ 条目 —— 严重异常)"
+          echo
+
+          HAVE_NODE=$(unzip -l "$APK" | grep -c 'lib/arm64-v8a/libnode.so' || true)
+          HAVE_CXX=$(unzip -l "$APK" | grep -c 'lib/arm64-v8a/libc++_shared.so' || true)
+          echo "libnode.so        : $HAVE_NODE"
+          echo "libc++_shared.so  : $HAVE_CXX"
+
+          if [ "$HAVE_NODE" -lt 1 ]; then
+            echo "[error] APK 里没有 lib/arm64-v8a/libnode.so —— 运行时缺失，无法启动。"
+            exit 1
+          fi
+          if [ "$HAVE_CXX" -lt 1 ]; then
+            echo "[error] APK 里没有 lib/arm64-v8a/libc++_shared.so。"
+            echo "        这正是真机 'cannot locate symbol _ZTVNSt6__ndk119basic_ostringstream' 的直接原因："
+            echo "        libnode.so 动态依赖 libc++_shared.so，而它不在 Android 系统里，"
+            echo "        必须随 APK 打包。请检查 scripts/build-node-android.sh 的打包段"
+            echo "        与 app/build.gradle.kts 的 jniLibs 配置。"
+            exit 1
+          fi
+
+          # 压缩方式检查：useLegacyPackaging=true 时 .so 会被压成 Deflate（这没问题，
+          # 系统安装时会解压落盘）。这里只把事实打印出来，便于对照排查。
+          echo
+          echo "--- 压缩方式（Stored=未压缩 / Defl=压缩） ---"
+          unzip -v "$APK" | awk '$NF ~ /lib\/arm64-v8a\// {print "  " $NF "  " $2 "  " $3 "  " $4}'
+          echo
+          echo "[ok] APK 审计通过：两个 .so 都在包里。"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -293,6 +652,49 @@ jobs:
           name: android-node-container-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      # ---------------------------------------------------------------------------
+      # 发布到 Release（让 APK 有一个【可直接下载】的稳定网址）。
+      #
+      # 为什么需要：Actions 的 artifact 只能从网页界面下载，而下载地址走的是
+      # api.github.com（会 302 到 objects.githubusercontent.com）。本项目的
+      # 维护环境对外网是白名单制，api.github.com 被屏蔽、ghproxy 对 /actions
+      # 路径也返回 403 —— 也就是说 **artifact 在外部拿不到**。
+      # Release 的资产则可经 github.com/<owner>/<repo>/releases/download/...
+      # 访问，且这个路径能被通常的镜像/代理转发，是唯一"外部可达"的分发方式。
+      #
+      # 用 tag 命名（每轮覆盖同一个 tag）：这样下载网址是稳定的，
+      # 不必每轮去查新网址。文件名带 run 号，便于区分是哪次构建。
+      #
+      # 注意：用 workflow 自带的 GITHUB_TOKEN + permissions:contents=write，
+      # 不依赖 PAT Secret（PAT 在本环境里有时读不到）。
+      # ---------------------------------------------------------------------------
+      - name: Publish APK to Release
+        id: release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          TAG="apk-latest"
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          ls -la app/build/outputs/apk/debug/ || true
+          if [ ! -f "$APK" ]; then
+            echo "[error] 未找到 $APK，跳过发布"
+            exit 1
+          fi
+          SIZE="$(du -h "$APK" | cut -f1)"
+          echo "APK 大小: $SIZE"
+          # tag 固定为 apk-latest：存在则更新，不存在则创建。
+          gh release view "$TAG" >/dev/null 2>&1 \
+            || gh release create "$TAG" --title "DSH Mobile APK (latest)" \
+                 --notes "自动构建产物，持续覆盖更新。"
+          gh release upload "$TAG" "$APK#app-debug.apk" --clobber
+          echo "=== 发布完成 ==="
+          gh release view "$TAG" --json url,assets 2>/dev/null || true
+          echo "下载地址: https://github.com/${{ github.repository }}/releases/download/${TAG}/app-debug.apk"
+          # 把网址写进 ci-ok 便于外部读取
+          echo "APK_URL=https://github.com/${{ github.repository }}/releases/download/${TAG}/app-debug.apk" >> "$GITHUB_OUTPUT"
 
       # ---------------------------------------------------------------------------
       # 成功自报：把构建成功标记推到 ci-ok 分支（raw 通道可读）。
@@ -313,6 +715,8 @@ jobs:
             echo "time : $(date -u)"
             echo "node : ${{ steps.nodever.outputs.tag }}"
             echo "apk  : app/build/outputs/apk/debug/app-debug.apk"
+            # 可直接下载的稳定网址（Release 资产，见上方 Publish APK 步骤的说明）。
+            echo "url  : https://github.com/${{ github.repository }}/releases/download/apk-latest/app-debug.apk"
           } > ci-ok.txt
           git config user.email "ci@workbuddy.local"
           git config user.name "CI Diagnostic Bot"
@@ -359,12 +763,20 @@ jobs:
             echo "host-deps   : ${{ steps.hostdeps.outcome }}"
             echo "node-tag    : ${{ steps.nodever.outcome }}"
             echo "sync-json   : ${{ steps.syncjson.outcome }}"
+            echo "node-cache  : ${{ steps.nodecache.outcome }}"
+            echo "node-restore: ${{ steps.restorenode.outcome }}"
+            echo "node-reused : ${{ steps.restorenode.outputs.cache-hit }}"
             echo "node-build  : ${{ steps.nodebuild.outcome }}"
             echo "gradle-build: ${{ steps.gradlebuild.outcome }}"
             echo
-            echo "=== node-build.log size / tail ==="
-            wc -c /tmp/node-build.log 2>/dev/null || echo "(no node-build.log)"
-            tail -30 /tmp/node-build.log 2>/dev/null | cut -c1-400
+            if [ "${{ steps.restorenode.outputs.cache-hit }}" = "yes" ]; then
+              echo "=== node-build.log ==="
+              echo "(skipped — 复用了缓存中已编译的 node 二进制，未重新编译)"
+            else
+              echo "=== node-build.log size / tail ==="
+              wc -c /tmp/node-build.log 2>/dev/null || echo "(no node-build.log)"
+              tail -30 /tmp/node-build.log 2>/dev/null | cut -c1-400
+            fi
           } > /tmp/ci-last-report.txt
           cd /tmp/lastpush
           git clone --quiet "https://x-access-token:${TOKEN_USE}@github.com/${{ github.repository }}.git" . 2>/dev/null || true
@@ -408,9 +820,15 @@ jobs:
             echo "host-deps   : ${{ steps.hostdeps.outcome }}"
             echo "node-tag    : ${{ steps.nodever.outcome }}"
             echo "sync-json   : ${{ steps.syncjson.outcome }}"
+            echo "node-cache  : ${{ steps.nodecache.outcome }}"
+            echo "node-restore: ${{ steps.restorenode.outcome }}"
+            echo "node-reused : ${{ steps.restorenode.outputs.cache-hit }} (yes=跳过重编)"
             echo "node-build  : ${{ steps.nodebuild.outcome }}"
             echo "gradle-build: ${{ steps.gradlebuild.outcome }}"
             echo
+            if [ "${{ steps.restorenode.outputs.cache-hit }}" = "yes" ]; then
+              echo "（node-build 因命中缓存被跳过，node-build.log 不存在，属正常）"
+            fi
             echo "=== sdk-install.log (filtered tail 60, license noise removed) ==="
             grep -viE "warranty|liability|indemnif|export regulation|severability|pre-release|evaluation license|open source software|MIPS|Accept\? \(y/N\)|YOUR USE OF|Google is the parent|third party beneficiaries|EXPORT RESTRICTIONS|governing law|Santa Clara|conflict of laws" /tmp/sdk-install.log 2>/dev/null | tail -60 \
               || echo "(no sdk-install.log)"

@@ -5,50 +5,91 @@ import android.os.Build
 import java.io.File
 
 /**
- * 负责把“打包在 assets 里的 node 二进制”与“server.js 探针”解压到应用沙箱
- * （/data/data/<pkg>/files），并赋予可执行权限。幂等、可重复调用。
+ * 让 Node 可执行文件就位的唯一入口。
  *
- * 设计要点：node 二进制不写死在 jniLibs，而是作为【运行时资源】放在 files/node/<version>/。
- * 这让“升级 Node”只需在沙箱里多放一份新版本目录、切换指针即可，无需重新发 APK。
+ * ============================================================================
+ *  核心约束：Android 上的应用私有可执行文件只有一个合法去处
+ * ============================================================================
+ * SELinux 强制 W^X 策略（Android 10+）：
+ *   /data/data/<pkg>/files/     label = app_data_file  →  **禁止 execve**
+ *   /data/app/<pkg>/lib/<abi>/  label = exec_type      →  允许 exec
+ *
+ * 所以 node 不能解压到 filesDir 再执行（那会在真机上以
+ * `error=13, Permission denied` 失败），唯一可行路径是：
+ *   以 jniLibs/arm64-v8a/libnode.so 打包 → 安装时系统解压到
+ *   nativeLibraryDir → 直接从那里 exec。
+ *
+ * 两个必须同时满足的打包开关（本仓库两处都写了，见 docs/ARCHITECTURE.md）：
+ *   AndroidManifest 的 android:extractNativeLibs="true"
+ *   gradle 的 packaging.jniLibs.useLegacyPackaging = true
+ *
+ * ⚠️ File.canExecute() 在上述约束下【完全不可信】：它只查 stat 的 x 权限位，
+ *    对 noexec 挂载和 SELinux 策略无感，会在 filesDir 那份文件上返回 true。
+ *    判断"能否执行"的唯一可靠办法是真去执行一次 —— 见 NodeRuntimeService
+ *    的 exec-probe 步骤。
+ *
+ * 完整的踩坑记录（linker 搜索路径、LD_LIBRARY_PATH、缓存漏存 libc++ 等）
+ * 见 docs/ARCHITECTURE.md。这里只保留改动代码时必须知道的约束。
+ * ============================================================================
  */
 object NodeProvisioner {
-    private val SUPPORTED_ABIS = setOf("arm64-v8a", "armeabi-v7a", "x86_64", "x86")
 
-    /** 选本机 ABI（当前只编了 arm64-v8a；其他架构回退并提示）。 */
-    fun currentAbi(): String {
-        for (abi in Build.SUPPORTED_ABIS) {
-            if (abi in SUPPORTED_ABIS) return abi
-        }
-        return "arm64-v8a"
-    }
-
-    /** 某版本 node 可执行文件的绝对路径（沙箱内）。 */
-    fun nodeExecutable(context: Context, version: String): File =
-        File(context.filesDir, "node/$version/node")
+    /** 本机首选 ABI，仅用于诊断展示。 */
+    fun currentAbi(): String =
+        Build.SUPPORTED_ABIS.firstOrNull() ?: "unknown"
 
     /**
-     * 确保“内置(assets)版本”已解压到沙箱且可执行。首启走这里。
-     * 若已存在且可执行则跳过（幂等）。
+     * 内置 node 在设备上的真实路径：nativeLibraryDir 下的 libnode.so。
+     *
+     * 这个文件由系统在安装 APK 时解压生成。它位于 label 为 exec_type 的
+     * 只读目录，是 Android 上唯一被允许 exec 的应用私有路径。
+     *
+     * 文件名必须以 lib 开头、.so 结尾 —— 否则 AGP 不会把它当 native lib
+     * 处理，也就不会被解压到可执行目录里去。
      */
-    fun ensureBundledNode(context: Context, version: String) {
-        val target = nodeExecutable(context, version)
-        if (target.exists() && target.canExecute()) return
-        val abi = currentAbi()
-        val assetPath = "node-bin/$abi/node"
-        context.assets.open(assetPath).use { input ->
-            target.parentFile?.mkdirs()
-            target.outputStream().use { out -> input.copyTo(out) }
-        }
-        target.setExecutable(true)
+    fun bundledExecutable(context: Context): File =
+        File(context.applicationInfo.nativeLibraryDir, "libnode.so")
+
+    /**
+     * 确保内置 node 可用。首启走这里。
+     *
+     * 刻意【不做任何复制】：node 已在安装 APK 时由系统放到 nativeLibraryDir，
+     * 这里只确认它在。复制反而有害 —— 复制到 filesDir 的那份不可执行。
+     *
+     * @return 可执行的 node 文件
+     * @throws IllegalStateException lib dir 里找不到 libnode.so 时。
+     *         异常信息里带上目录实况，便于一眼判断是"没解压"还是"ABI 不匹配"。
+     */
+    fun ensureBundledNode(context: Context): File {
+        val target = bundledExecutable(context)
+        if (target.exists()) return target
+
+        val dir = File(context.applicationInfo.nativeLibraryDir)
+        val listing = dir.list()?.joinToString(", ") ?: "(无法列出)"
+        throw IllegalStateException(
+            "内置 node 不存在: ${target.absolutePath}\n" +
+                "nativeLibraryDir = ${dir.absolutePath}\n" +
+                "该目录实际内容   = [$listing]\n" +
+                "可能原因：\n" +
+                "  1) APK 打包时 extractNativeLibs 未生效（未被解压落盘）—— " +
+                "检查 Manifest/打包配置；\n" +
+                "  2) 设备 ABI 与 APK 内的 ABI 不匹配（当前仅打包 arm64-v8a，设备是 " +
+                "${Build.SUPPORTED_ABIS.joinToString()}）；\n" +
+                "  3) jniLibs 里缺少 arm64-v8a/libnode.so（构建产物未拷贝）。"
+        )
     }
 
-    /** 把 server.js 探针复制到 filesDir（所有版本共享），供 node 启动时加载。 */
+    /**
+     * 把 server.js 探针复制到 filesDir。
+     *
+     * 纯数据文件（不是可执行文件），不受 W^X 影响，放 filesDir 完全没问题。
+     * 每次启动都覆盖写 —— 这样换了 APK 里的 server.js 就能立即生效，
+     * 不会因为残留旧文件而出现"改了没反应"。
+     */
     fun ensureServerScript(context: Context): File {
         val script = File(context.filesDir, "server.js")
-        if (!script.exists()) {
-            context.assets.open("node/server.js").use { input ->
-                script.outputStream().use { out -> input.copyTo(out) }
-            }
+        context.assets.open("node/server.js").use { input ->
+            script.outputStream().use { out -> input.copyTo(out) }
         }
         return script
     }
