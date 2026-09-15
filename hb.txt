@@ -1,13 +1,14 @@
 CI_HEARTBEAT
-beat : 1
-time : Tue Sep 15 20:00:30 UTC 2026
-stage: boot
+beat : 2
+time : Tue Sep 15 20:01:16 UTC 2026
+stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=14.7GB
+mem  : avail=14.4GB
 cgmax: n/a
-load : 0.08 0.05 0.01
-logsize: 0 (skipped: node build cache hit)
-objs   : n/a
-oomhits: n/a
-lastprog: (node build skipped — reused cached binary)
+load : 0.70 0.22 0.07
+logsize: 4956
+objs   : 3
+oomhits: 0
+0
+lastprog: ==> 宿主编译器确定: CXX_host=/usr/bin/clang++  CC_host=/usr/bin/clang ==> 宿主工具链: CC_host=/usr/bin/clang  CXX_host=/usr/bin/clang++  AR_host=/us
