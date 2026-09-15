@@ -20,9 +20,11 @@ import androidx.core.content.ContextCompat
 /**
  * 入口 Activity，也是“可观测”面板 + 内核 UI 宿主帧：
  *  - 内核未就绪时显示“启动诊断”文本（逐阶段、带时间戳的状态，来自 RuntimeDiagnostics）。
- *  - 探测到 127.0.0.1:3080 就绪后，切换到 WebView 加载 host.html（内嵌内核 UI 的 iframe）。
- *  - 宿主帧经 JavascriptInterface 桥接内核的 dsh:kernel-update-request，
- *    处理完（此处为重启 :node 进程以重读 CURRENT / 触发 OTA）后回灌 dsh:kernel-update-result。
+ *  - 探测到内核控制面（127.0.0.1:KERNEL_CONTROL_PORT）就绪后，切换到 WebView 加载**内核同源托管的宿主帧**
+ *    （http://127.0.0.1:<port>/__host）。宿主帧内以 iframe 嵌内核面板（同源）—— 这样面板既满足
+ *    `hasHostBridge()`（window.parent !== window），又满足内核 Origin 闸（同源→写操作不被 403）。
+ *  - 面板经 postMessage 发 dsh:kernel-update-request → 宿主帧转交本 Activity（DshNative.onRequest）
+ *    → 重启 :node 进程（重读 CURRENT / 触发 OTA）→ 回灌 dsh:kernel-update-result（**严格按内核契约**）。
  *  - 提供“重试”按钮：清空诊断、重启 NodeRuntimeService 重新走全流程。
  */
 class MainActivity : AppCompatActivity() {
@@ -32,7 +34,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var retryBtn: Button
     private val handler = Handler(Looper.getMainLooper())
-    private var uiMode = false // false=诊断面板, true=WebView(host.html + 内核 iframe)
+    private var uiMode = false // false=诊断面板, true=WebView(内核 /__host 宿主帧 + 面板 iframe)
+
+    /** 内核更新桥协议版本：必须与内核 kernelUpdateBridge.ts 的 BRIDGE_PROTOCOL_VERSION 一致。 */
+    private val kernelUpdateProtocol = 1
 
     private val requestNotif = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -68,24 +73,55 @@ class MainActivity : AppCompatActivity() {
         webView.addJavascriptInterface(DshBridge(this), "DshNative")
     }
 
-    /** 原生侧接收内核发来的 dsh:kernel-update-request，处理并回灌结果。 */
+    /**
+     * 原生侧接收内核发来的 dsh:kernel-update-request，处理并回灌结果。
+     * 回灌**严格按内核 kernelUpdateBridge.ts 的契约**：{v,type,requestId,ok,stage,version,restartUncertain,error}。
+     * ⚠ 缺 v / ok 会导致内核侧直接丢弃消息（面板超时）。
+     */
     fun handleKernelUpdateRequest(json: String) {
         try {
             val req = org.json.JSONObject(json)
             val requestId = req.optString("requestId", "")
+            // 重启前先尽力读一次内核只读版本端点（供面板展示；失败不阻断）。
+            val version = tryReadKernelVersion()
             // 处理：重启 :node 进程（重读 CURRENT / OTA 钩子由 Node 侧承接），拉起最新内核。
             restartRuntime()
             val result = org.json.JSONObject().apply {
+                put("v", kernelUpdateProtocol)
                 put("type", "dsh:kernel-update-result")
                 put("requestId", requestId)
-                put("status", "restarting")
-                put("message", "已重启运行时以加载内核更新")
+                put("ok", true)
+                put("stage", "restarting")
+                if (version != null) put("version", version) else put("version", org.json.JSONObject.NULL)
+                // 重启是「结果不确定」操作：拉起后是否真的加载了新版本由内核自行确认。
+                put("restartUncertain", true)
+                put("error", org.json.JSONObject.NULL)
             }
+            val jsonStr = result.toString()
             webView.post {
-                webView.evaluateJavascript("dshDeliverResult($result)", null)
+                // 宿主帧暴露 dshDeliverResult(json)；用 JSON 字符串安全注入（避免拼接注入）。
+                webView.evaluateJavascript(
+                    "window.dshDeliverResult && window.dshDeliverResult(${org.json.JSONObject.quote(jsonStr)})",
+                    null
+                )
             }
         } catch (_: Throwable) {
         }
+    }
+
+    /** 读取内核只读版本端点（GET /guard/version）。失败返回 null（不阻断更新流程）。 */
+    private fun tryReadKernelVersion(): String? = try {
+        val c = java.net.URL("http://127.0.0.1:$KERNEL_CONTROL_PORT/guard/version").openConnection() as java.net.HttpURLConnection
+        c.connectTimeout = 500
+        c.readTimeout = 500
+        c.requestMethod = "GET"
+        if (c.responseCode == 200) {
+            val body = c.inputStream.bufferedReader().use { it.readText() }
+            val v = org.json.JSONObject(body).optString("version", null)
+            if (v.isNullOrBlank()) null else v
+        } else null
+    } catch (_: Throwable) {
+        null
     }
 
     private fun startRuntime() {
@@ -130,7 +166,8 @@ class MainActivity : AppCompatActivity() {
         scroll.visibility = View.GONE
         retryBtn.visibility = View.GONE
         webView.visibility = View.VISIBLE
-        webView.loadUrl("file:///android_asset/host.html")
+        // 加载**内核同源托管**的宿主帧（非容器 assets）：宿主页与面板同源 → 面板写操作不被内核 403。
+        webView.loadUrl("http://127.0.0.1:$KERNEL_CONTROL_PORT/__host")
     }
 
     private fun isPortUp(): Boolean = try {
@@ -148,7 +185,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
     }
 
-    /** 内核 ↔ 原生桥：内核 UI 经 window.DshNative.onRequest 把更新请求交给原生。 */
+    /** 内核 ↔ 原生桥：宿主帧经 window.DshNative.onRequest 把更新请求交给原生。 */
     private class DshBridge(private val activity: MainActivity) {
         @JavascriptInterface
         fun onRequest(json: String) {

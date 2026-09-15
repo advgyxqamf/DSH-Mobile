@@ -18,7 +18,8 @@
 | **M1 引擎核心** | `container-engine/src/`：zip / keys / sign / verify / kernel-bundle / ota-engine / runtime-json / boot | 35 passed |
 | **M2 HostBridge 协议库** | `bridge/{protocol,methods,uds-transport,server}.js`：JSON-RPC 2.0 + UDS + 握手协商 + 错误码 + 审计 | 23 passed（bridge-protocol 14 / bridge-e2e 9） |
 | **M2.5 内核↔容器桥互通** | 内核侧客户端（`dsh-android-kernel/src/platform/host-bridge/`）与容器参考桥**真实 UDS 互通**；`app.openUrl` 补齐（browser 承接方）；组级能力语义两侧收敛 | 14 passed（bridge-interop，跨仓） |
-| **M3 Kotlin 安卓应用** | `MainActivity/NodeRuntimeService/HostBridgeService/KernelManager/BootReceiver/DeviceAdminReceiver/DshAccessibilityService` + Manifest 注册 + `host.html` 内核更新桥 | 代码评审（**沙箱无 Android SDK，未编译**） |
+| **M2.6 内核更新桥闭环** | 宿主帧由**内核同源托管** `/__host`（消除跨源 403）；容器 `MainActivity` 改加载该 URL + 回灌严格按内核契约（含 `v/ok/restartUncertain`）；控制面端口 3080→36360 修正 | 22 passed（kernel-update-bridge 契约） |
+| **M3 Kotlin 安卓应用** | `MainActivity/NodeRuntimeService/HostBridgeService/KernelManager/BootReceiver/DeviceAdminReceiver/DshAccessibilityService` + Manifest 注册 + 加载内核同源宿主帧 `/__host` + `dsh:kernel-update` 桥 | 代码评审（**沙箱无 Android SDK，未编译**） |
 | **M4 脚本与 CI** | `scripts/build-kernel-bundle.sh` + `container-engine/bin/build-bundle.js` + `kernel-ota.yml` + `build-apk.yml` 公钥锚点校验 | 实测构建+验签闭环通过 |
 | **M5 端到端 + 文档** | `e2e-mock-kernel-test.js`（真实 spawn 内核+健康检查）+ README/CONTAINER-STATUS 重写 | 8 passed |
 
@@ -26,7 +27,7 @@
 - **签名 OTA 端到端**：`build-bundle.js` 用 ed25519 私钥签名 → 产出 `kernel-<v>.zip` + `kernel-manifest.json` → `OtaEngine.verifyPackage` 在焊死公钥下 `ok:true`；错误公钥 → `signature-invalid`；篡改字节 → `sha256-mismatch`；Node 引擎不符 → `node-engine-unsatisfied`。
 - **内核真实拉起**：`e2e-mock-kernel-test.js` 由 `bootKernel` 真实 `spawn` 一个扮演 `dsh-supervisor` 的 node 进程，`/status` 健康检查通过，验证“容器→内核”接线成立。
 - **内核↔容器桥真实互通**：`bridge-interop-test.js` 用**内核侧真实客户端**连**容器侧参考桥**（抽象命名空间 UDS），走完 连接→握手协商→8 组方法调用→能力门禁(-32001)→未知方法(-32601)→审计 全链路。
-- **完整测试**：`npm test` 全绿 **80 passed, 0 failed**（8 套件）。
+- **完整测试**：`npm test` 全绿 **102 passed, 0 failed**（9 套件）。
 
 ---
 
@@ -55,7 +56,7 @@
 
 ```bash
 # 容器引擎单测（无需 Android SDK）
-cd container-engine && npm test        # 80 passed, 0 failed（8 套件）
+cd container-engine && npm test        # 102 passed, 0 failed（9 套件）
 
 # 单独跑内核↔容器桥互通（跨仓，需 dsh-android-kernel 在同级 /workspace）
 node test/bridge-interop-test.js       # 14 passed, 0 failed

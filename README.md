@@ -30,7 +30,6 @@ android-node-container/
 │  │  ├─ node-bin/arm64-v8a/node          # NDK 编出的 node（构建时注入，首启离线可用）
 │  │  ├─ node-versions.json               # Node 运行时版本清单（驱动 Node OTA）
 │  │  ├─ ota-public.pem                   # ★焊接的 OTA 验签公钥（设备端唯一信任源）
-│  │  └─ host.html                        # 内核 UI 宿主帧（iframe + dsh:kernel-update 桥）
 │  ├─ java/com/example/nodecontainer/
 │  │  ├─ NodeContainerApp                 # 通知渠道
 │  │  ├─ NodeRuntimeService(:node)        # 前台服务：写 runtime.json → 拉起内核 → 健康→退避重启
@@ -40,12 +39,12 @@ android-node-container/
 │  │  ├─ BootReceiver                     # ★开机自启容器
 │  │  ├─ DeviceAdminReceiver              # ★Device Owner（静默装卸/锁屏/密码/Kiosk）
 │  │  ├─ DshAccessibilityService          # ★无障碍（bridge:ui_automation 能力）
-│  │  └─ MainActivity                     # 诊断面板 + 内核 UI 宿主帧 + dsh:kernel-update 桥
+│  │  └─ MainActivity                     # 诊断面板 + 加载内核同源宿主帧 /__host + dsh:kernel-update 桥
 │  └─ res/xml/{device_admin, accessibility_service_config, network_security_config}.xml
 ├─ container-engine/                      # ★可测 OTA 引擎（Node，零依赖）
 │  ├─ src/  zip / keys / sign / verify / kernel-bundle / ota-engine / runtime-json
 │  │        / boot / bridge/{protocol,methods,uds-transport,server}.js
-│  ├─ test/ 7 个测试套件（66 passed）
+│  ├─ test/ 9 个测试套件（102 passed）
 │  └─ bin/build-bundle.js                 # 内核包签名构建 CLI
 ├─ scripts/  keygen / build-node-android / build-apk-local / make-release / build-kernel-bundle
 ├─ keys/ota-private.pem                   # 开发期 ed25519 私钥（gitignored；CI 用 secret）
@@ -116,7 +115,8 @@ export ANDROID_HOME=/path/to/sdk ANDROID_NDK=/path/to/ndk   # NDK r27+
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-打开 App → 常驻通知 → 先显示“启动诊断”面板（逐阶段带时间戳），内核就绪后切到内核 UI 宿主帧（`host.html` iframe）。
+打开 App → 常驻通知 → 先显示“启动诊断”面板（逐阶段带时间戳），内核就绪后 WebView 加载
+**内核同源托管的宿主帧** `http://127.0.0.1:36360/__host`（页内 iframe 嵌内核面板）。
 
 ### 5.4 构建并签名内核 OTA 包
 
@@ -132,7 +132,17 @@ CI 等价流程见 `.github/workflows/kernel-ota.yml`（用 `OTA_PRIVATE_KEY_PEM
 
 ### 5.5 内核更新桥（dsh:kernel-update）
 
-内核 UI 在 `host.html` 的 iframe 内运行，向父帧 `postMessage({type:'dsh:kernel-update-request'})`；`MainActivity` 经 `JavascriptInterface` 收到后触发重启 `:node` 以重读 `CURRENT` / 承接 OTA，再 `postMessage({type:'dsh:kernel-update-result', ...})` 回灌结果。
+内核 WebView 加载**内核同源托管的宿主帧** `GET /__host`（`ui/public/host.html`），其内 iframe 嵌面板（`src="/"`）。
+
+- **为什么同源**：内核 `originAllowed` 闸② 要求驱动页面 Origin = `<本机/局域网>:<apiPort>`；
+  容器 `assets/` 的 `file://` 宿主页 Origin 为 null → 面板写操作**一律 403**。故宿主帧搬到内核侧同源托管。
+- **链路**：面板 iframe `postMessage({v:1,type:'dsh:kernel-update-request',requestId})`
+  → 宿主帧 `window.DshNative.onRequest(json)`（`MainActivity` 经 `JavascriptInterface` 收到）
+  → 重启 `:node` 重读 `CURRENT` / 承接 OTA
+  → 回灌 `{v:1,type:'dsh:kernel-update-result',requestId,ok,stage,version,restartUncertain,error}`
+  → 宿主帧 `dshDeliverResult(json)` → 面板 iframe。
+- ⚠ 回灌**必须含 `v` 与 `ok`**（内核 `kernelUpdateBridge.ts` 依此过滤，缺则丢弃 → 面板超时）。
+  契约由 `container-engine/test/kernel-update-bridge-test.js` 锁定。
 
 ---
 
@@ -143,10 +153,11 @@ CI 等价流程见 `.github/workflows/kernel-ota.yml`（用 `OTA_PRIVATE_KEY_PEM
 ```bash
 cd container-engine && npm test
 # sign-verify 6 / kernel-bundle 9 / ota-engine 12 / runtime-json 8 /
-# bridge-protocol 14 / bridge-e2e 9 / e2e-mock-kernel 8  ⇒ 66 passed, 0 failed
+# bridge-protocol 14 / bridge-e2e 9 / bridge-interop 14 / kernel-update-bridge 22 / e2e-mock-kernel 8
+# ⇒ 102 passed, 0 failed（9 套件）
 ```
 
-覆盖：ed25519 签名/验签、内核包打包、OTA 验签+解包+原子指针切换+坏包拦截、runtime.json 契约、HostBridge 协议编解码/握手/方法能力/审计、**内核↔容器桥真实 UDS 互通**、以及**真实 spawn 内核 + 健康检查**的端到端。
+覆盖：ed25519 签名/验签、内核包打包、OTA 验签+解包+原子指针切换+坏包拦截、runtime.json 契约、HostBridge 协议编解码/握手/方法能力/审计、**内核↔容器桥真实 UDS 互通**、**更新桥协议契约**，以及**真实 spawn 内核 + 健康检查**的端到端。
 
 ---
 

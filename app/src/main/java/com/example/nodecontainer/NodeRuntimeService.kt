@@ -269,7 +269,9 @@ class NodeRuntimeService : Service() {
     companion object {
         const val TAG = "NodeRuntimeService"
         const val NOTIF_ID = 1001
-        const val KERNEL_CONTROL_PORT = 3080
+        // 内核**控制面**（supervisor API）端口：与内核 src/platform/config.js 的 apiPort 默认值(36360)一致。
+        // ⚠ 不是 3080 —— 3080 是内核 healthUrl（被管控的 DSH 应用端口），不是 supervisor 控制面。
+        const val KERNEL_CONTROL_PORT = 36360
         const val BACKOFF_BASE_MS = 1000L
         const val BACKOFF_MAX_MS = 30000L
     }
