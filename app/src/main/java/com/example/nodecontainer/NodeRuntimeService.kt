@@ -207,6 +207,35 @@ class NodeRuntimeService : Service() {
             //
             // 注意：ProcessBuilder 是直接 exec，不经过 shell，所以环境变量的
             // 值就是路径原文，不涉及任何 shell 展开或引号处理。
+            //
+            // ---- 两条外部依据（同一结论，互相印证）-----------------------------
+            //
+            // 1) Termux 官方 wiki《Termux execution environment》把 Android linker
+            //    搜索依赖的目录写得很明确，按顺序只有三个：
+            //       ① $LD_LIBRARY_PATH 里的目录
+            //       ② 二进制 DT_RUNPATH 动态段里列出的目录
+            //       ③ 系统默认路径 /system/lib64、/system/lib
+            //    并特别指出：
+            //       "The DT_RPATH dynamic section attribute of the binary and the
+            //        ld cache file (/etc/ld.so.cache) ... is not used."
+            //    也就是说 DT_RPATH 在 Android 上【被忽略】，只有 DT_RUNPATH 有效。
+            //    —— nativeLibraryDir 不在这三者中的任何一个，所以必须靠 ① 补上。
+            //
+            // 2) 一篇专门讲「在 APK 里分发 CLI 程序」的文章
+            //    (viliussutkus89.com/posts/distributing-android-cli-programs-in-apks)
+            //    场景与本项目完全一致，连报错形状都一样：
+            //        CANNOT LINK EXECUTABLE ".../libMyProgram.so":
+            //        library "libmyLibrary.so" not found
+            //    作者的结论原话：
+            //        "nativeLibraryDir is not among the directories which are
+            //         searched for, when loading libraries."
+            //        "Could be solved by linking executables with rpath=$ORIGIN flag,
+            //         but strangely it does not work on all devices."
+            //        "Use LD_LIBRARY_PATH environment variable, it just works."
+            //    注意中间那句：加 $ORIGIN rpath 只在部分设备上有效 —— 所以不要
+            //    图省事去改链接参数，LD_LIBRARY_PATH 才是跨设备可靠的解法。
+            //
+            // 结论：这里设的 LD_LIBRARY_PATH 是【必需】而非可选优化，删了真机必挂。
             // -----------------------------------------------------------------
             val libSearchPath = applicationInfo.nativeLibraryDir
 
