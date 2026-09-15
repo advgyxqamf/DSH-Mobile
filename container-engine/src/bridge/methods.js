@@ -26,6 +26,7 @@ const DEVICE_CAPS = [
 // method → { group, caps:[deviceCap...], audit?:bool }
 const METHODS = {
   'app.launch':            { group: 'app_control', caps: ['base'] },
+  'app.openUrl':           { group: 'app_control', caps: ['base'] },
   'app.stop':              { group: 'app_control', caps: ['base'] },
   'app.listInstalled':     { group: 'app_control', caps: ['base'] },
   'app.install':           { group: 'app_control', caps: ['device_owner'], audit: true },
@@ -80,8 +81,32 @@ function missingCaps(method, availableCaps) {
   return caps.filter((c) => !availableCaps.includes(c));
 }
 
-/** bridge:* 组令牌 → 该组方法所需设备能力（用于握手后内核感知）。 */
+// 每组的**代表能力**：握手时判定「该组是否可用」。
+//
+// ⚠ 语义（与 Kotlin HostBridgeService.GROUP_REQUIRED 逐条对齐，2026-09 收敛）：
+//   组可用 = 该组的**代表性基础能力**具备，而非「组内每个方法的能力都具备」。
+//   例：bridge:app_control 的代表能力是 base —— 否则「启动已装应用」会被 Device Owner 门槛误挡，
+//   而 app.install/uninstall 这类特权方法本就由**方法级 caps**单独门禁（调用时再报 -32001）。
+//   两层门禁：组级（握手协商，粗粒度可用性）+ 方法级（每次调用，精确拦截）。
+const GROUP_REQUIRED = {
+  'app_control': 'base',
+  'notification': 'base',
+  'system': 'base',
+  'device_policy': 'device_owner',
+  'ui_automation': 'accessibility',
+  'shell': 'shizuku',
+  'storage': 'manage_external_storage',
+  'build': 'build_chain',
+};
+
+/** bridge:* 组令牌 → 该组的代表能力（用于握手协商「组是否可用」）。 */
 function groupCaps(group) {
+  const rep = GROUP_REQUIRED[group];
+  return rep ? [rep] : [];
+}
+
+/** 该组全部方法依赖的设备能力并集（供文档/诊断呈现；不用于握手判定）。 */
+function groupAllCaps(group) {
   const out = new Set();
   for (const [m, def] of Object.entries(METHODS)) {
     if (def.group === group) def.caps.forEach((c) => out.add(c));
@@ -90,6 +115,6 @@ function groupCaps(group) {
 }
 
 module.exports = {
-  GROUPS, BRIDGE_TOKENS, DEVICE_CAPS, METHODS,
-  methodCaps, isAudited, missingCaps, groupCaps,
+  GROUPS, BRIDGE_TOKENS, DEVICE_CAPS, METHODS, GROUP_REQUIRED,
+  methodCaps, isAudited, missingCaps, groupCaps, groupAllCaps,
 };

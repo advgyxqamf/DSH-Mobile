@@ -93,6 +93,7 @@ class BridgeServer {
       case 'build.status': return { id: params.id || 'last', status: 'idle' };
       case 'build.apk': return { id: 'b' + Date.now(), status: 'queued' };
       case 'app.launch': return { launched: params.pkg };
+      case 'app.openUrl': return { opened: true, url: params.url };
       case 'app.stop': return { stopped: params.pkg };
       case 'policy.lockNow': return { locked: true };
       case 'policy.setPassword': return { set: true };

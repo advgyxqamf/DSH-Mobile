@@ -72,13 +72,15 @@ android-node-container/
 
 ## 4. HostBridge（能力桥，L3）
 
-- **传输**：Unix 域套接字（抽象命名空间 `dsh_hostbridge`）；内核（Node）经 `net.connect(Buffer.from('\0dsh_hostbridge'))` 主动连接。**严禁 TCP 暴露控制面**（BASE_SPEC §8）。
+- **传输**：Unix 域套接字（抽象命名空间 `dsh_hostbridge`）；内核（Node）经 `net.connect('\0dsh_hostbridge')` 主动连接（**前导 NUL 字节**，Node 22 原生支持）。**严禁 TCP 暴露控制面**（BASE_SPEC §8）。
 - **协议**：JSON-RPC 2.0，换行分隔 JSON 帧；握手协商 `capabilities` / `groups`。
 - **8 组方法**：`app_control / ui_automation / shell / device_policy / storage / build / notification / system`。
-- **鉴权**：方法声明所需能力；设备未预置 → 返回 `ERR_CAPABILITY_MISSING (-32001)`；未知方法 → `METHOD_NOT_FOUND (-32601)`。内核应优雅降级。
-- **审计**：所有特权操作落 `files/bridge-audit.log`（持久，不随内核包切换丢失）。
+- **鉴权**：**两层门禁** —— 组级（握手按每组**代表能力**协商 `bridge:*`）+ 方法级（每次调用按 `caps` 精确拦截）。未授权 → `ERR_CAPABILITY_MISSING (-32001)`；未知方法 → `METHOD_NOT_FOUND (-32601)`。内核应优雅降级。
+- **审计**：所有特权操作（装卸应用/锁屏/shell/读屏/通知读取，见 BRIDGE_PROTOCOL §5）落 `files/bridge-audit.log`（持久，不随内核包切换丢失）。
+- **内核侧客户端**：内核仓 `src/platform/host-bridge/`（本次已互通）；`notify.post`/`app.openUrl` 分别承接内核的通知与「打开浏览器」。
 
 > 协议细节、方法表、错误码见 [`docs/BRIDGE_PROTOCOL.md`](docs/BRIDGE_PROTOCOL.md)；实现与 [`container-engine/src/bridge/*`](container-engine/src/bridge) 对齐。
+> 跨仓互通由 `container-engine/test/bridge-interop-test.js` 实测（内核真实客户端 ←→ 容器参考桥，真实 UDS）。
 
 ---
 
@@ -144,7 +146,7 @@ cd container-engine && npm test
 # bridge-protocol 14 / bridge-e2e 9 / e2e-mock-kernel 8  ⇒ 66 passed, 0 failed
 ```
 
-覆盖：ed25519 签名/验签、内核包打包、OTA 验签+解包+原子指针切换+坏包拦截、runtime.json 契约、HostBridge 协议编解码/握手/方法能力/审计、以及**真实 spawn 内核 + 健康检查**的端到端。
+覆盖：ed25519 签名/验签、内核包打包、OTA 验签+解包+原子指针切换+坏包拦截、runtime.json 契约、HostBridge 协议编解码/握手/方法能力/审计、**内核↔容器桥真实 UDS 互通**、以及**真实 spawn 内核 + 健康检查**的端到端。
 
 ---
 

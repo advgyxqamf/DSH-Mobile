@@ -17,6 +17,7 @@
 |---|---|---|
 | **M1 引擎核心** | `container-engine/src/`：zip / keys / sign / verify / kernel-bundle / ota-engine / runtime-json / boot | 35 passed |
 | **M2 HostBridge 协议库** | `bridge/{protocol,methods,uds-transport,server}.js`：JSON-RPC 2.0 + UDS + 握手协商 + 错误码 + 审计 | 23 passed（bridge-protocol 14 / bridge-e2e 9） |
+| **M2.5 内核↔容器桥互通** | 内核侧客户端（`dsh-android-kernel/src/platform/host-bridge/`）与容器参考桥**真实 UDS 互通**；`app.openUrl` 补齐（browser 承接方）；组级能力语义两侧收敛 | 14 passed（bridge-interop，跨仓） |
 | **M3 Kotlin 安卓应用** | `MainActivity/NodeRuntimeService/HostBridgeService/KernelManager/BootReceiver/DeviceAdminReceiver/DshAccessibilityService` + Manifest 注册 + `host.html` 内核更新桥 | 代码评审（**沙箱无 Android SDK，未编译**） |
 | **M4 脚本与 CI** | `scripts/build-kernel-bundle.sh` + `container-engine/bin/build-bundle.js` + `kernel-ota.yml` + `build-apk.yml` 公钥锚点校验 | 实测构建+验签闭环通过 |
 | **M5 端到端 + 文档** | `e2e-mock-kernel-test.js`（真实 spawn 内核+健康检查）+ README/CONTAINER-STATUS 重写 | 8 passed |
@@ -24,7 +25,8 @@
 ### 关键闭环已实测（非仅代码存在）
 - **签名 OTA 端到端**：`build-bundle.js` 用 ed25519 私钥签名 → 产出 `kernel-<v>.zip` + `kernel-manifest.json` → `OtaEngine.verifyPackage` 在焊死公钥下 `ok:true`；错误公钥 → `signature-invalid`；篡改字节 → `sha256-mismatch`；Node 引擎不符 → `node-engine-unsatisfied`。
 - **内核真实拉起**：`e2e-mock-kernel-test.js` 由 `bootKernel` 真实 `spawn` 一个扮演 `dsh-supervisor` 的 node 进程，`/status` 健康检查通过，验证“容器→内核”接线成立。
-- **完整测试**：`npm test` 全绿 **66 passed, 0 failed**。
+- **内核↔容器桥真实互通**：`bridge-interop-test.js` 用**内核侧真实客户端**连**容器侧参考桥**（抽象命名空间 UDS），走完 连接→握手协商→8 组方法调用→能力门禁(-32001)→未知方法(-32601)→审计 全链路。
+- **完整测试**：`npm test` 全绿 **80 passed, 0 failed**（8 套件）。
 
 ---
 
@@ -32,7 +34,8 @@
 
 - NodeRuntimeService：读 `kernel/CURRENT` → 写 `runtime.json`（schema 2）→ 注入环境 → `spawn node bin/dsh-supervisor daemon` → `/status` 健康检查 → 退避重启监督循环。
 - HostBridgeService：UDS 监听（抽象命名空间 `dsh_hostbridge`）、JSON-RPC 2.0、握手协商 `capabilities/groups`、8 组方法分发、能力门禁（`-32001`/`-32601`）、审计日志。
-- 落地能力方法（设备已有对应权限时真实执行）：`sys.info`、`notif.post`、`app.listInstalled`、`app.launch`、`app.stop`、以及 **Device Owner 全组**（`policy.lockNow/setPassword/wipe/setKiosk/addUserRestriction`、`sys.setTime/sys.reboot`、`app.install/uninstall/grantPermission`）。
+- 落地能力方法（设备已有对应权限时真实执行）：`sys.info`、`notif.post`、`app.listInstalled`、`app.launch`、`app.openUrl`（**内核 browser.open 的承接方**，ACTION_VIEW）、`app.stop`、以及 **Device Owner 全组**（`policy.lockNow/setPassword/wipe/setKiosk/addUserRestriction`、`sys.setTime/sys.reboot`、`app.install/uninstall/grantPermission`）。
+- 组级能力语义：`GROUP_REQUIRED`（每组**代表能力**）判定「组是否可用」；特权方法另由**方法级 caps** 单独门禁 —— 与内核侧 `methods.js` 已逐条对齐（2026-09 收敛）。
 - BootReceiver（开机自启）、DeviceAdminReceiver（Device Owner 激活）、DshAccessibilityService（无障碍声明）、MainActivity（诊断面板 + 内核 UI iframe + `dsh:kernel-update-request/result` 桥）。
 
 ---
@@ -52,7 +55,10 @@
 
 ```bash
 # 容器引擎单测（无需 Android SDK）
-cd container-engine && npm test        # 66 passed, 0 failed
+cd container-engine && npm test        # 80 passed, 0 failed（8 套件）
+
+# 单独跑内核↔容器桥互通（跨仓，需 dsh-android-kernel 在同级 /workspace）
+node test/bridge-interop-test.js       # 14 passed, 0 failed
 
 # 构建并签名一个内核 OTA 包（开发期需先 ./scripts/keygen.sh）
 ./scripts/build-kernel-bundle.sh <内核源码目录> 1.4.0 node24-arm64-android35 https://cdn.example.com/ota
@@ -63,3 +69,6 @@ git push → GitHub Actions → build-apk.yml（自动编 Node 24 +  assembleDeb
 # 出内核 OTA（需配置 OTA_PRIVATE_KEY_PEM secret）
 Actions → kernel-ota.yml → 产出签名内核包 / Release
 ```
+
+> **跨仓联调提示**：内核侧（`dsh-android-kernel`）在自己的仓内跑 `npm test`（含 `test/host-bridge-test.js`，20 passed）；
+> 两侧协议须逐字段一致。抽象命名空间 UDS 名默认 `dsh_hostbridge`，容器 `boot.js` 经 `DSH_BRIDGE_SOCKET` 注入内核。

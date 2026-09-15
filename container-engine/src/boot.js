@@ -22,6 +22,7 @@ const { writeRuntimeJson } = require('./runtime-json');
  *  - npmPath: npm 可执行绝对路径
  *  - apiPort: 内核控制面端口（健康检查用）
  *  - uiDir?: 面板产物目录（默认 <kernel>/ui/dist）
+ *  - bridgeSocket?: HostBridge 抽象命名空间 socket 名（默认 dsh_hostbridge）
  *  - extraEnv?: 额外环境变量
  */
 function bootKernel(o) {
@@ -42,6 +43,8 @@ function bootKernel(o) {
     DSH_PLATFORM: 'android',
     DSH_SUPERVISOR_HOME: o.kernelHome,
     DSH_UI_DIR: o.uiDir || path.join(kernelDir, 'ui', 'dist'),
+    // HostBridge 抽象命名空间 socket 名（内核侧 client.js 用 '\0'+name 连接，与 HostBridgeService.SOCKET_NAME 一致）。
+    DSH_BRIDGE_SOCKET: o.bridgeSocket || 'dsh_hostbridge',
     PATH: [o.nodeBinDir, process.env.PATH].filter(Boolean).join(path.delimiter),
     NODE_PATH: path.join(kernelDir, 'node_modules'),
     HOME: o.kernelHome,
