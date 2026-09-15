@@ -1,0 +1,133 @@
+ADMIN_REPORT
+time  : 2026-09-15 19:23:02 UTC
+tag   : admin-logs-35013072723
+kind  : logs
+target: 35013072723
+
+== run 35013072723 的失败日志 ==
+  wf    : Fast APK (no Node rebuild)
+  sha   : ddec3d9
+  status: completed
+  concl : failure
+  url   : https://github.com/advgyxqamf/DSH-Mobile/actions/runs/35013072723
+
+=== 各步骤结果 ===
+  [success] build :: Set up job
+  [success] build :: Checkout
+  [success] build :: Resolve Node runtime version
+  [success] build :: Validate workflow files (fail fast on YAML/syntax errors)
+  [success] build :: Set up JDK 17
+  [success] build :: Show Android SDK env
+  [success] build :: Install SDK packages
+  [success] build :: Fetch prebuilt Node runtime from pinned release
+  [success] build :: Gate — verify runtime is in place before gradle
+  [failure] build :: Build debug APK
+  [skipped] build :: Audit APK contents
+  [skipped] build :: Upload APK artifact
+  [skipped] build :: Publish APK to Release
+  [skipped] build :: Report to ci-ok
+  [success] build :: Post Set up JDK 17
+  [success] build :: Post Checkout
+  [success] build :: Complete job
+
+=== 失败步骤日志（仅 failed 步骤） ===
+build	Build debug APK	﻿2026-09-15T19:21:19.0976275Z ##[group]Run chmod +x gradlew
+build	Build debug APK	2026-09-15T19:21:19.0976569Z ^[[36;1mchmod +x gradlew^[[0m
+build	Build debug APK	2026-09-15T19:21:19.0976857Z ^[[36;1m./gradlew --no-daemon assembleDebug^[[0m
+build	Build debug APK	2026-09-15T19:21:19.0994943Z shell: /usr/bin/bash -e {0}
+build	Build debug APK	2026-09-15T19:21:19.0995212Z env:
+build	Build debug APK	2026-09-15T19:21:19.0995429Z   NODE_VERSION: 24.21.0
+build	Build debug APK	2026-09-15T19:21:19.0995651Z   ABI: arm64-v8a
+build	Build debug APK	2026-09-15T19:21:19.0995972Z   JAVA_HOME: /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.0.20-1/x64
+build	Build debug APK	2026-09-15T19:21:19.0996456Z   JAVA_HOME_17_X64: /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.0.20-1/x64
+build	Build debug APK	2026-09-15T19:21:19.0996867Z   runtime-tag: node-runtime-24.21.0-arm64-v8a
+build	Build debug APK	2026-09-15T19:21:19.0997152Z ##[endgroup]
+build	Build debug APK	2026-09-15T19:21:19.6882405Z 
+build	Build debug APK	2026-09-15T19:21:19.6883078Z Welcome to Gradle 8.9!
+build	Build debug APK	2026-09-15T19:21:19.6883499Z 
+build	Build debug APK	2026-09-15T19:21:19.6890316Z Here are the highlights of this release:
+build	Build debug APK	2026-09-15T19:21:19.6890919Z  - Enhanced Error and Warning Messages
+build	Build debug APK	2026-09-15T19:21:19.6891208Z  - IDE Integration Improvements
+build	Build debug APK	2026-09-15T19:21:19.6891480Z  - Daemon JVM Information
+build	Build debug APK	2026-09-15T19:21:19.6891783Z 
+build	Build debug APK	2026-09-15T19:21:19.6891996Z For more details see https://docs.gradle.org/8.9/release-notes.html
+build	Build debug APK	2026-09-15T19:21:19.6892282Z 
+build	Build debug APK	2026-09-15T19:21:19.8882748Z To honour the JVM settings for this build a single-use Daemon process will be forked. For more on this, please refer to https://docs.gradle.org/8.9/userguide/gradle_daemon.html#sec:disabling_the_daemon in the Gradle documentation.
+build	Build debug APK	2026-09-15T19:21:21.2874301Z Daemon will be stopped at the end of the build 
+build	Build debug APK	2026-09-15T19:21:29.7912037Z > Task :app:preBuild UP-TO-DATE
+build	Build debug APK	2026-09-15T19:21:29.7912661Z > Task :app:preDebugBuild UP-TO-DATE
+build	Build debug APK	2026-09-15T19:21:29.8885792Z > Task :app:mergeDebugNativeDebugMetadata NO-SOURCE
+build	Build debug APK	2026-09-15T19:21:29.8930462Z > Task :app:checkKotlinGradlePluginConfigurationErrors SKIPPED
+build	Build debug APK	2026-09-15T19:21:30.1880389Z > Task :app:dataBindingMergeDependencyArtifactsDebug
+build	Build debug APK	2026-09-15T19:21:30.1891121Z > Task :app:generateDebugResValues
+build	Build debug APK	2026-09-15T19:21:30.1939873Z > Task :app:generateDebugResources
+build	Build debug APK	2026-09-15T19:21:31.4871772Z > Task :app:packageDebugResources
+build	Build debug APK	2026-09-15T19:21:32.0872578Z > Task :app:mergeDebugResources
+build	Build debug APK	2026-09-15T19:21:32.1880748Z > Task :app:parseDebugLocalResources
+build	Build debug APK	2026-09-15T19:21:32.2877164Z > Task :app:mapDebugSourceSetPaths
+build	Build debug APK	2026-09-15T19:21:32.2900593Z > Task :app:checkDebugAarMetadata
+build	Build debug APK	2026-09-15T19:21:32.3910221Z > Task :app:dataBindingGenBaseClassesDebug
+build	Build debug APK	2026-09-15T19:21:32.3911330Z > Task :app:createDebugCompatibleScreenManifests
+build	Build debug APK	2026-09-15T19:21:32.3940287Z > Task :app:extractDeepLinksDebug
+build	Build debug APK	2026-09-15T19:21:32.6877326Z 
+build	Build debug APK	2026-09-15T19:21:32.6891572Z > Task :app:processDebugMainManifest
+build	Build debug APK	2026-09-15T19:21:32.6892624Z /home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/AndroidManifest.xml:47:9-41 Warning:
+build	Build debug APK	2026-09-15T19:21:32.6894653Z 	android:extractNativeLibs should not be specified in this source AndroidManifest.xml file. See https://d.android.com/guide/topics/manifest/application-element#extractNativeLibs for more information.
+build	Build debug APK	2026-09-15T19:21:32.6897607Z The AGP Upgrade Assistant can remove the attribute from the AndroidManifest.xml file and update the build file accordingly. See https://d.android.com/studio/build/agp-upgrade-assistant for more information.
+build	Build debug APK	2026-09-15T19:21:32.7892295Z 
+build	Build debug APK	2026-09-15T19:21:32.7892951Z > Task :app:processDebugManifest
+build	Build debug APK	2026-09-15T19:21:32.8890166Z > Task :app:javaPreCompileDebug
+build	Build debug APK	2026-09-15T19:21:32.8924553Z > Task :app:mergeDebugShaders
+build	Build debug APK	2026-09-15T19:21:32.8944142Z > Task :app:compileDebugShaders NO-SOURCE
+build	Build debug APK	2026-09-15T19:21:32.8970199Z > Task :app:generateDebugAssets UP-TO-DATE
+build	Build debug APK	2026-09-15T19:21:32.8997496Z > Task :app:mergeDebugAssets
+build	Build debug APK	2026-09-15T19:21:32.8998602Z > Task :app:processDebugManifestForPackage
+build	Build debug APK	2026-09-15T19:21:33.0900597Z > Task :app:desugarDebugFileDependencies
+build	Build debug APK	2026-09-15T19:21:33.0930097Z > Task :app:compressDebugAssets
+build	Build debug APK	2026-09-15T19:21:33.1900403Z > Task :app:checkDebugDuplicateClasses
+build	Build debug APK	2026-09-15T19:21:33.5872992Z > Task :app:processDebugResources
+build	Build debug APK	2026-09-15T19:21:33.6883229Z > Task :app:mergeDebugJniLibFolders
+build	Build debug APK	2026-09-15T19:21:34.4915147Z > Task :app:mergeLibDexDebug
+build	Build debug APK	2026-09-15T19:21:34.9872165Z > Task :app:mergeDebugNativeLibs
+build	Build debug APK	2026-09-15T19:21:35.9882378Z > Task :app:validateSigningDebug
+build	Build debug APK	2026-09-15T19:21:36.0900448Z > Task :app:writeDebugAppMetadata
+build	Build debug APK	2026-09-15T19:21:36.0970429Z > Task :app:writeDebugSigningConfigVersions
+build	Build debug APK	2026-09-15T19:21:36.5890123Z > Task :app:stripDebugDebugSymbols
+build	Build debug APK	2026-09-15T19:21:39.9880477Z > Task :app:mergeExtDexDebug
+build	Build debug APK	2026-09-15T19:21:43.8887806Z e: file:///home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/java/com/example/nodecontainer/HostBridgeService.kt:94:28 Variable 'line' must be initialized.
+build	Build debug APK	2026-09-15T19:21:43.8889038Z 
+build	Build debug APK	2026-09-15T19:21:43.8901400Z e: file:///home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/java/com/example/nodecontainer/HostBridgeService.kt:293:46 Too many arguments for 'fun reboot(p0: ComponentName): Unit'.
+build	Build debug APK	2026-09-15T19:21:43.8910105Z e: file:///home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/java/com/example/nodecontainer/HostBridgeService.kt:351:15 Unresolved reference 'installPackage'.
+build	Build debug APK	2026-09-15T19:21:43.8911537Z > Task :app:compileDebugKotlin FAILED
+build	Build debug APK	2026-09-15T19:21:43.8913178Z e: file:///home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/java/com/example/nodecontainer/HostBridgeService.kt:356:15 Unresolved reference 'uninstallPackage'.
+build	Build debug APK	2026-09-15T19:21:43.8915486Z e: file:///home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/java/com/example/nodecontainer/KernelManager.kt:98:16 Return type mismatch: expected 'kotlin.String?', actual 'kotlin.Unit?'.
+build	Build debug APK	2026-09-15T19:21:43.8917980Z e: file:///home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/java/com/example/nodecontainer/KernelManager.kt:104:17 Unresolved reference 'unzip'.
+build	Build debug APK	2026-09-15T19:21:43.8920166Z e: file:///home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/java/com/example/nodecontainer/MainActivity.kt:114:49 Unresolved reference 'KERNEL_CONTROL_PORT'.
+build	Build debug APK	2026-09-15T19:21:43.8922310Z e: file:///home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/java/com/example/nodecontainer/MainActivity.kt:170:44 Unresolved reference 'KERNEL_CONTROL_PORT'.
+build	Build debug APK	2026-09-15T19:21:43.9870947Z 
+build	Build debug APK	2026-09-15T19:21:43.9887834Z FAILURE: Build failed with an exception.
+build	Build debug APK	2026-09-15T19:21:43.9888429Z 30 actionable tasks: 30 executed
+build	Build debug APK	2026-09-15T19:21:43.9888980Z 
+build	Build debug APK	2026-09-15T19:21:43.9889449Z * What went wrong:
+build	Build debug APK	2026-09-15T19:21:43.9890041Z Execution failed for task ':app:compileDebugKotlin'.
+build	Build debug APK	2026-09-15T19:21:43.9891453Z > A failure occurred while executing org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction
+build	Build debug APK	2026-09-15T19:21:43.9892776Z    > Compilation error. See log for more details
+build	Build debug APK	2026-09-15T19:21:43.9893279Z 
+build	Build debug APK	2026-09-15T19:21:43.9893515Z * Try:
+build	Build debug APK	2026-09-15T19:21:43.9894046Z > Run with --stacktrace option to get the stack trace.
+build	Build debug APK	2026-09-15T19:21:43.9894801Z > Run with --info or --debug option to get more log output.
+build	Build debug APK	2026-09-15T19:21:43.9895847Z > Run with --scan to get full insights.
+build	Build debug APK	2026-09-15T19:21:43.9896498Z > Get more help at https://help.gradle.org.
+build	Build debug APK	2026-09-15T19:21:43.9896948Z 
+build	Build debug APK	2026-09-15T19:21:43.9897231Z BUILD FAILED in 24s
+build	Build debug APK	2026-09-15T19:21:44.3805259Z ##[error]Process completed with exit code 1.
+
+=== 最近 8 个 run ===
+  35013281038  ddec3d9  in_progress/  Admin (cancel / status)
+  35013072748  ddec3d9  in_progress/  Build Android Node Container APK
+  35013072723  ddec3d9  completed/failure  Fast APK (no Node rebuild)
+  34949231621  2dd186d  completed/success  Admin (cancel / status)
+  34949009313  2dd186d  completed/success  Fast APK (no Node rebuild)
+  34948684529  cf741e1  completed/success  Admin (cancel / status)
+  34948630868  cf741e1  completed/success  Admin (cancel / status)
+  34948468446  cf741e1  completed/success  Admin (cancel / status)
