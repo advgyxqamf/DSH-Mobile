@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 253
-time : Tue Sep 15 23:15:52 UTC 2026
+beat : 254
+time : Tue Sep 15 23:16:38 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.8GB
+mem  : avail=14.6GB
 cgmax: n/a
-load : 3.01 3.11 3.05
-logsize: 16796941
+load : 1.54 2.71 2.92
+logsize: 16827996
 objs   : host=2146 target=3723
 oomhits: 0
 0
-lastprog:   /usr/local/lib/android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release
+lastprog: ==> 完成。文件: /home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/jniLibs/arm64-v8a/libnode.so     下一步: ./gradlew assembleDebug 即可把该 Node 
