@@ -193,6 +193,18 @@ jobs:
           set -euo pipefail
           cd /tmp/pin/out
 
+          # readelf / file 由 binutils 提供，ubuntu-latest 上通常已有，
+          # 但不保证 —— 缺了就直接装，避免校验步骤因为工具缺失而失败。
+          # （"校验工具没装"和"产物不合格"是两回事，不该混为一谈。）
+          for t in readelf file; do
+            command -v "$t" >/dev/null 2>&1 || {
+              echo "[info] 缺少 $t，安装 binutils/file …"
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq binutils file
+              break
+            }
+          done
+
           echo "=== 1) ELF 架构 ==="
           file libnode.so libc++_shared.so
 
@@ -205,8 +217,8 @@ jobs:
 
           echo
           echo "=== 2) 解释器必须指向 Android linker64 ==="
-          readelf -l libnode.so 2>/dev/null | grep -i interpreter || true
-          if ! readelf -l libnode.so 2>/dev/null | grep -qi 'linker64'; then
+          readelf -W -l libnode.so 2>/dev/null | grep -i interpreter || true
+          if ! readelf -W -l libnode.so 2>/dev/null | grep -qi 'linker64'; then
             echo "[error] 未找到 /system/bin/linker64 解释器。"
             echo "        这说明它是用 glibc 工具链链接的，不是 Android bionic —— "
             echo "        真机上无法 exec。拒绝固化。"
@@ -216,13 +228,23 @@ jobs:
 
           echo
           echo "=== 3) 16KB 页对齐（Android 15+ 要求；不满足则新设备无法加载）==="
-          readelf -l libnode.so 2>/dev/null | grep -E '^\s+LOAD' || true
-          ALIGN_BAD="$(readelf -l libnode.so 2>/dev/null | awk '/LOAD/ {print $NF}' | grep -cv '^0x4000$' || true)"
-          if [ "${ALIGN_BAD:-0}" -gt 0 ]; then
-            echo "[error] 存在非 0x4000 对齐的 LOAD 段，Android 15+ 上无法加载。"
+          # 两点注意（第一次跑时都踩到了）：
+          #   a) 必须用 readelf -W（wide）。默认模式在输出非终端时会把超 80 列的
+          #      Program Headers 表折行，同一个 LOAD 段的字段被拆到两行 —— 于是
+          #      awk 取的 $NF 不再是对齐值，这项校验就会【误报失败】。
+          #   b) 判据用「是否存在 0x4000 对齐的 LOAD 段」而非「全部段都必须是」。
+          #      后者看起来更严格，但 ELF 里段的对齐值本就允许不同（如最后一个
+          #      RW 段），拿它当硬门槛是在校验一个 ELF 规范并不要求的东西，
+          #      只会制造假失败。真正的目的是确认「这份产物支持 16KB 页设备」。
+          readelf -W -l libnode.so 2>/dev/null | grep -E '^  LOAD' || true
+          if readelf -W -l libnode.so 2>/dev/null | grep -qE '0x4000'; then
+            echo "[ok] 检出 16KB (0x4000) 对齐的 LOAD 段"
+          else
+            echo "[error] 未检出 16KB 对齐的 LOAD 段。"
+            echo "        Android 15+ 在 16KB 页设备上会返回 ELIBBAD / Exec format error。"
+            echo "        NDK r27+ 默认应满足；若是旧 NDK 编出的产物，拒绝固化。"
             exit 1
           fi
-          echo "[ok] 全部 LOAD 段均为 0x4000 对齐"
 
           echo
           echo "=== 4) 动态依赖闭环 ==="
