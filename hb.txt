@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 38
-time : Tue Sep 15 20:29:12 UTC 2026
+beat : 39
+time : Tue Sep 15 20:29:59 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.2GB
+mem  : avail=13.0GB
 cgmax: n/a
-load : 3.00 3.01 2.59
-logsize: 5809615
-objs   : host=879 target=2124
+load : 3.00 3.01 2.61
+logsize: 5831042
+objs   : host=901 target=2124
 oomhits: 0
 0
-lastprog:       |                   ^ 2 warnings generated.   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_compiler/deps/v8/src/compiler/turboshaf
+lastprog:       |                   ^ 2 warnings generated.   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_compiler/deps/v8/src/compiler/wasm-addr
