@@ -19,7 +19,7 @@
 | **M2 HostBridge 协议库** | `bridge/{protocol,methods,uds-transport,server}.js`：JSON-RPC 2.0 + UDS + 握手协商 + 错误码 + 审计 | 23 passed（bridge-protocol 14 / bridge-e2e 9） |
 | **M2.5 内核↔容器桥互通** | 内核侧客户端（`dsh-android-kernel/src/platform/host-bridge/`）与容器参考桥**真实 UDS 互通**；`app.openUrl` 补齐（browser 承接方）；组级能力语义两侧收敛 | 14 passed（bridge-interop，跨仓） |
 | **M2.6 内核更新桥闭环** | 宿主帧由**内核同源托管** `/__host`（消除跨源 403）；容器 `MainActivity` 改加载该 URL + 回灌严格按内核契约（含 `v/ok/restartUncertain`）；控制面端口 3080→36360 修正 | 22 passed（kernel-update-bridge 契约） |
-| **M3 Kotlin 安卓应用** | `MainActivity/NodeRuntimeService/HostBridgeService/KernelManager/BootReceiver/DeviceAdminReceiver/DshAccessibilityService` + Manifest 注册 + 加载内核同源宿主帧 `/__host` + `dsh:kernel-update` 桥 | 代码评审（**沙箱无 Android SDK，未编译**） |
+| **M3 Kotlin 安卓应用** | `MainActivity/NodeRuntimeService/HostBridgeService/KernelManager/BootReceiver/DeviceAdminReceiver/DshAccessibilityService/ProvisioningProbe/PackageInstallReceiver` + Manifest 注册 + 加载内核同源宿主帧 `/__host` + `dsh:kernel-update` 桥 | **CI 真编译通过**（fast-apk `b47df7f`，14/14 步，APK 已发布） |
 | **M4 脚本与 CI** | `scripts/build-kernel-bundle.sh` + `container-engine/bin/build-bundle.js` + `kernel-ota.yml` + `build-apk.yml` 公钥锚点校验 | 实测构建+验签闭环通过 |
 | **M5 端到端 + 文档** | `e2e-mock-kernel-test.js`（真实 spawn 内核+健康检查）+ README/CONTAINER-STATUS 重写 | 8 passed |
 
@@ -55,8 +55,27 @@
    - ⏳ `bridge:build` 整组 —— 内置构建链（P3）尚需 APK 资产打包决策（全内置 vs 首启下载 vs 最小子集）。
 2. **OTA 下发编排**：`OtaEngine` 已具备验签/解包/原子指针能力；设备上“轮询 manifest→下载→apply→回滚”的调度器由内核侧 bootstrap（Node）承接，本仓未内置一个独立 Kotlin OTA 调度器（按 BASE_SPEC §5，OTA 引擎逻辑归于内核引导）。
 3. **基线内核 `assets/kernel/baseline.zip`**：`KernelManager.ensureBaseline` 已支持首启离线落地，但本仓未内置基线内核包（由 `kernel-ota.yml` 构建产出后纳入）。
-4. **Kotlin 未编译验证**：沙箱无 Android SDK/NDK，M3 代码经人工评审与 API 正确性核对，未经 Gradle 编译；真实出包见 `build-apk.yml`（需公网 CI）。**P1/P2 与 P3 合并为一次 CI 出包 + 真机验证。**
+4. **Kotlin 已过 CI 编译，待真机验证**：fast-apk（`b47df7f`）14/14 步全绿、APK 审计通过、已发布到 `apk-latest`。
+   编译过程暴露并修复了 6 处**存量 API 误用**（详见下方「编译修复」），说明此前「只评审不编译」确实藏了真 bug。
+   **剩下的是真机验证**：`adb shell dpm set-device-owner …` → 开无障碍 → 看 `provisioning.json` 五项体检是否全绿。
 5. **`policy.setPassword` 属遗留路径**：`DevicePolicyManager.resetPassword` 自 API 30 废弃且多数设备不生效，实现保留但已返回 `note` 提示；建议改用 user restrictions 或应用内锁。
+
+### 编译修复（2026-09，fast-apk 首次真编译）
+
+这条流水线第一次真正编译 Kotlin（此前 M3 只有人工评审），一次性暴露 6 处存量 API 误用。
+**结论：对 Android API 光靠「核对文档 + 人工评审」不够，必须让 CI 编译。**
+
+| 问题 | 真相 | 修法 |
+|---|---|---|
+| `dpm.installPackage(...)` | **DevicePolicyManager 根本没有这个方法** | 改用 `PackageInstaller`（createSession→openWrite→commit）+ 新增 `PackageInstallReceiver` 承接异步结果广播 |
+| `dpm.uninstallPackage(...)` | 同上，也不存在 | 走 `PackageInstaller.uninstall(pkg, intentSender)` |
+| `dpm.reboot(admin, null)` | android.jar 只有单参 `reboot(ComponentName)`（两参版是桌面 Java 的） | 改 `reboot(deviceAdmin)` |
+| `MainActivity` 裸用 `KERNEL_CONTROL_PORT` | companion 常量须限定名 | 补 `NodeRuntimeService.` 前缀 |
+| `KernelManager.ensureBaseline` 的 `return@use` | lambda 返回值类型不匹配（Unit vs String?） | 显式判 null 后 `return@use null` |
+| `KernelManager.unzip` | **方法从未定义**（被调用但没实现） | 补 `java.util.zip` 实现 |
+
+> 影响面值得记一笔：Device Owner 组里的「静默装卸应用」是本项目最核心的特权能力之一，
+> 而这 6 处里有两处就落在它上面 —— 意味着在真机上**必然直接崩溃**。这正是"必须编译"的价值。
 
 ---
 
@@ -64,7 +83,7 @@
 
 ```bash
 # 容器引擎单测（无需 Android SDK）
-cd container-engine && npm test        # 102 passed, 0 failed（9 套件）
+cd container-engine && npm test        # 107 passed, 0 failed（9 套件）
 
 # 单独跑内核↔容器桥互通（跨仓，需 dsh-android-kernel 在同级 /workspace）
 node test/bridge-interop-test.js       # 14 passed, 0 failed
@@ -73,10 +92,16 @@ node test/bridge-interop-test.js       # 14 passed, 0 failed
 ./scripts/build-kernel-bundle.sh <内核源码目录> 1.4.0 node24-arm64-android35 https://cdn.example.com/ota
 # 产物：release/kernel-1.4.0.zip + release/kernel-manifest.json
 
-# 出 APK（需公网 CI）
-git push → GitHub Actions → build-apk.yml（自动编 Node 24 +  assembleDebug）
+# 出 APK（日常路径：不重编 Node，分钟级）
+git push → Actions → fast-apk.yml（拉 pinned 运行时 → assembleDebug → 审计 → 发布）
+# 出 APK（改了 Node 版本/编译脚本才需要，2~3 小时）
+Actions → build-apk.yml
 # 出内核 OTA（需配置 OTA_PRIVATE_KEY_PEM secret）
 Actions → kernel-ota.yml → 产出签名内核包 / Release
+
+# 拉 CI 失败日志（沙箱读不到 actions blob 时用这条路）
+git push origin HEAD:refs/tags/admin-logs-<run_id> && git fetch origin ci-admin
+git show origin/ci-admin:ci-admin.txt
 ```
 
 > **跨仓联调提示**：内核侧（`dsh-android-kernel`）在自己的仓内跑 `npm test`（含 `test/host-bridge-test.js`，20 passed）；
