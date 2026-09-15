@@ -1,0 +1,323 @@
+name: Fast APK (no Node rebuild)
+
+# ============================================================================
+#  日常出包入口。**不编译 Node** —— 这是本项目效率的核心。
+#
+#  背景：Node 交叉编译要跑两份 V8（host x64 + target aarch64），
+#  在 GitHub 免费 runner 上耗时 2~3 小时。而绝大多数开发改动
+#  （Kotlin 代码、assets 里的 JS、布局、gradle 配置）**完全不影响
+#  Node 二进制** —— 为它们重编一次纯属浪费，这也是"改一行代码等三小时"
+#  这个痛点的根源。
+#
+#  本 workflow 的做法：
+#    从固定 Release（node-runtime-<version>-<abi>）下载预编译的
+#    libnode.so + libc++_shared.so → 校验 sha256 → 放进 jniLibs/
+#    → 直接 gradle assembleDebug → 审计 → 发布。
+#    全程分钟级。
+#
+#  什么时候该用 build-node.yml 而不是这条：
+#    · 改了 scripts/build-node-android.sh
+#    · 要换 Node 版本
+#    这两类改动才需要真正重编，编完用 pin-node.yml 把新产物固化，
+#    之后本 workflow 自动用上新版本。
+#
+#  决策表见 docs/ARCHITECTURE.md 第 8 节。
+# ============================================================================
+
+on:
+  push:
+    branches: [main, master]
+    # 只在【真正影响 APK 内容】的路径变更时触发。
+    # 这里用 paths 白名单（而非 build-node.yml 的 paths-ignore 黑名单）：
+    # 白名单的默认语义是"不匹配就不跑"，对于日常出包这条高频路径，
+    # 宁可漏跑（可手动触发）也不要因为新增了某个目录就莫名其妙跑起来。
+    paths:
+      - 'app/**'
+      - 'gradle/**'
+      - 'build.gradle.kts'
+      - 'settings.gradle.kts'
+      - 'gradle.properties'
+      - 'gradlew'
+      - 'gradlew.bat'
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: '用作运行时的 Node 版本（须已有对应的 pinned release）'
+        required: false
+        default: '24.21.0'
+      abi:
+        description: '目标 ABI'
+        required: false
+        default: 'arm64-v8a'
+  # tag 触发：推 fast-<任意> 即可手动跑一次，不必改代码。
+  # 维护环境（沙箱）无法操作网页，workflow_dispatch 点不了；
+  # 而用"改个文件触发"的办法会让 paths 过滤与触发意图纠缠在一起，
+  # 容易误触发别的构建。tag 是最干净的显式触发手段。
+  push:
+    tags:
+      - 'fast-*'
+
+# 同一个 ref 上只允许一个在跑。日常出包很快，取消旧的没有损失。
+concurrency:
+  group: fast-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write     # 建 Release / 传资产
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 不编 Node，gradle 也就几分钟。给 40 分钟余量（含依赖下载）。
+    timeout-minutes: 40
+
+    env:
+      NODE_VERSION: ${{ inputs.node_version || '24.21.0' }}
+      ABI: ${{ inputs.abi || 'arm64-v8a' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve Node runtime version
+        id: nodever
+        run: |
+          set -euo pipefail
+          # 优先用显式传入的 input（workflow_dispatch 时）；tag 触发或 push 触发
+          # 时 inputs 为空，则从 assets 清单里读 —— 这样"清单说用什么版本"
+          # 与"实际下载哪份运行时"永远一致，不会出现两处硬编码各自漂移。
+          V="${{ inputs.node_version }}"
+          if [ -z "$V" ]; then
+            V="$(python3 -c "import json; print(json.load(open('app/src/main/assets/node-versions.json'))['default'])")"
+            echo "从 assets/node-versions.json 读到版本: $V"
+          else
+            echo "使用显式指定的版本: $V"
+          fi
+          A="${{ inputs.abi }}"
+          if [ -z "$A" ]; then
+            A="$(python3 -c "import json; print(json.load(open('app/src/main/assets/node-versions.json'))['abi'])")"
+            echo "从 assets/node-versions.json 读到 ABI: $A"
+          else
+            echo "使用显式指定的 ABI: $A"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "abi=$A"     >> "$GITHUB_OUTPUT"
+          echo "NODE_VERSION=$V" >> "$GITHUB_ENV"
+          echo "ABI=$A"          >> "$GITHUB_ENV"
+
+      - name: Validate workflow files (fail fast on YAML/syntax errors)
+        run: |
+          python3 - <<'PY'
+          import glob, sys, yaml
+          bad = 0
+          for f in sorted(glob.glob('.github/workflows/*.yml')):
+              try:
+                  yaml.safe_load(open(f))
+                  print(f"[ok] {f}")
+              except Exception as e:
+                  print(f"[FAIL] {f}: {e}")
+                  bad += 1
+          sys.exit(1 if bad else 0)
+          PY
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          echo "== 安装 platform-tools / platform 35 / build-tools 35.0.0 =="
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" 2>&1 | tail -5
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME/platforms" || true
+
+      # ----------------------------------------------------------------------
+      # 关键步骤：把预编译的 Node 运行时取回来，替代"现场编译 2~3 小时"。
+      # ----------------------------------------------------------------------
+      - name: Fetch prebuilt Node runtime from pinned release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="node-runtime-${NODE_VERSION}-${ABI}"
+          echo "== 从 Release 获取预编译运行时: $TAG =="
+
+          rm -rf /tmp/rt && mkdir -p /tmp/rt
+
+          # 若该 tag 不存在，给出可操作的指引而不是一个含糊的 404。
+          if ! gh release view "$TAG" --repo '${{ github.repository }}' >/dev/null 2>&1; then
+            echo "[error] 找不到 Release: $TAG"
+            echo
+            echo "说明预编译运行时尚未固化。请先执行一次："
+            echo "  Actions → 'Pin Node runtime' → Run workflow"
+            echo "  或推送 tag: pin-node-latest"
+            echo
+            echo "（固化会从最近一次成功的 build-node 运行里提取并校验两个 .so）"
+            exit 1
+          fi
+
+          gh release download "$TAG" \
+            --repo '${{ github.repository }}' \
+            --dir /tmp/rt \
+            --pattern 'libnode.so' --pattern 'libc++_shared.so' --pattern 'manifest.json'
+
+          echo "== 下载内容 =="
+          ls -la /tmp/rt/
+
+          # ---- 校验 sha256 ----
+          # 必须校验。运行时是"外部输入的二进制"，不校验就等于把
+          # "APK 里装了什么"交给运气；出问题时会极难定位。
+          echo
+          echo "== 校验 sha256 =="
+          python3 - <<'PY'
+          import json, hashlib, sys, pathlib
+          m = json.load(open('/tmp/rt/manifest.json'))
+          print(f"  manifest: version={m['version']} abi={m['abi']} from run {m.get('source_run')}")
+          ok = True
+          for name, meta in m['files'].items():
+              p = pathlib.Path('/tmp/rt') / name
+              if not p.exists():
+                  print(f"  [MISSING] {name}"); ok = False; continue
+              h = hashlib.sha256(p.read_bytes()).hexdigest()
+              good = h == meta['sha256']
+              print(f"  [{'ok' if good else 'MISMATCH'}] {name}  {p.stat().st_size} 字节")
+              if not good:
+                  print(f"      期望 {meta['sha256']}")
+                  print(f"      实际 {h}")
+                  ok = False
+          sys.exit(0 if ok else 1)
+          PY
+
+          # ---- 放进 jniLibs ----
+          # 文件名必须是 lib*.so：否则 AGP 不会把它当 native lib 处理，
+          # 也就不会在安装时解压到可执行的 nativeLibraryDir（W^X 约束）。
+          mkdir -p "app/src/main/jniLibs/${ABI}"
+          cp -f /tmp/rt/libnode.so       "app/src/main/jniLibs/${ABI}/libnode.so"
+          cp -f /tmp/rt/libc++_shared.so "app/src/main/jniLibs/${ABI}/libc++_shared.so"
+          chmod +x "app/src/main/jniLibs/${ABI}/libnode.so"
+          chmod +x "app/src/main/jniLibs/${ABI}/libc++_shared.so"
+
+          echo
+          echo "== jniLibs 就位 =="
+          ls -la "app/src/main/jniLibs/${ABI}/"
+
+          # 记录用了哪份运行时 —— 出问题时能一眼看出 APK 里装的是哪次固化的产物。
+          echo "runtime-tag=$TAG" >> "$GITHUB_ENV"
+
+      - name: Gate — verify runtime is in place before gradle
+        run: |
+          set -euo pipefail
+          D="app/src/main/jniLibs/${ABI}"
+          for f in libnode.so libc++_shared.so; do
+            if [ ! -f "$D/$f" ]; then
+              echo "[error] $D/$f 缺失 —— 打包会产出真机跑不起来的 APK，中止。"
+              exit 1
+            fi
+            SIZE=$(stat -c%s "$D/$f")
+            if [ "$SIZE" -lt 1000000 ]; then
+              echo "[error] $D/$f 只有 $SIZE 字节，明显不是有效产物，中止。"
+              exit 1
+            fi
+            echo "[ok] $f  $SIZE 字节"
+          done
+
+      - name: Build debug APK
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Audit APK contents
+        run: |
+          set -euo pipefail
+          APK="$(find app/build/outputs/apk/debug -name '*.apk' -type f | head -1)"
+          echo "APK: $APK  ($(stat -c%s "$APK") 字节)"
+
+          echo "--- lib/ 下的条目 ---"
+          unzip -l "$APK" | grep 'lib/' || { echo "[error] 没有 lib/ 条目"; exit 1; }
+
+          # 这两个文件缺任何一个，装到真机上都会挂：
+          #   缺 libnode.so       → exec 找不到东西
+          #   缺 libc++_shared.so → cannot locate symbol
+          # 与其让它在真机上失败，不如在这里失败 —— 反馈快得多。
+          for f in lib/arm64-v8a/libnode.so lib/arm64-v8a/libc++_shared.so; do
+            if unzip -l "$APK" | grep -q "$f"; then
+              echo "[ok] $f"
+            else
+              echo "[error] APK 里缺少 $f"
+              exit 1
+            fi
+          done
+          echo "[ok] APK 审计通过"
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-node-container-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Publish APK to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          APK="$(find app/build/outputs/apk/debug -name '*.apk' -type f | head -1)"
+          TAG="apk-latest"
+
+          # 固定 tag、每轮覆盖：下载网址稳定，不必每轮去查新地址。
+          if gh release view "$TAG" --repo '${{ github.repository }}' >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，覆盖资产。"
+          else
+            gh release create "$TAG" \
+              --repo '${{ github.repository }}' \
+              --title "DSH Mobile APK (latest)" \
+              --notes "Android 原生 Node 容器 APK（由 fast-apk 构建，运行时来自 ${{ env.runtime-tag }}）。"
+          fi
+
+          gh release upload "$TAG" "$APK#app-debug.apk" \
+            --repo '${{ github.repository }}' --clobber
+
+          echo
+          echo "=== 已发布 ==="
+          gh release view "$TAG" --repo '${{ github.repository }}' --json assets \
+            --jq '.assets[] | "  \(.name)  \(.size) 字节  digest=\(.digest // "n/a")"'
+          echo
+          echo "下载地址:"
+          echo "https://github.com/${{ github.repository }}/releases/download/${TAG}/app-debug.apk"
+
+      - name: Report to ci-ok
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory '*'
+          rm -rf /tmp/okr && mkdir -p /tmp/okr && cd /tmp/okr
+          git clone --quiet \
+            "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" . || {
+              echo "[warn] clone 失败，跳过上报"; exit 0; }
+
+          APK_SHA="$(sha256sum "$GITHUB_WORKSPACE"/app/build/outputs/apk/debug/*.apk | awk '{print $1}')"
+          {
+            echo "BUILD_OK"
+            echo "time    : $(date -u)"
+            echo "mode    : fast-apk (no Node rebuild)"
+            echo "runtime : ${{ env.runtime-tag }}"
+            echo "sha     : ${GITHUB_SHA:0:7}"
+            echo "apk     : app-debug.apk"
+            echo "apk_sha : $APK_SHA"
+            echo "url     : https://github.com/${{ github.repository }}/releases/download/apk-latest/app-debug.apk"
+          } > ci-ok.txt
+
+          git config user.email "ci@workbuddy.local"
+          git config user.name "CI Diagnostic Bot"
+          git add ci-ok.txt
+          git commit -q -m "ci: fast-apk ok (${GITHUB_SHA:0:7})" || true
+          git push origin HEAD:ci-ok --force && echo "[ok] ci-ok 已更新"
