@@ -77,6 +77,32 @@ android {
             //   /data/app/.../lib/arm64-v8a/libnode.so，我们才能 ProcessBuilder 启动它。
             //   代价是 APK 体积变大（不压缩），这对本地运行时是必要且可接受的。
             useLegacyPackaging = true
+
+            // -----------------------------------------------------------------
+            // keepDebugSymbols = 旧 API 的 doNotStrip。
+            //
+            // 命名容易误解：它不只是「保留调试信息」，实际语义就是
+            // 「这些 .so 不要交给 strip 处理」。AGP 官方文档里 doNotStrip 的
+            // 替代写法明确指向它："Use jniLibs.keepDebugSymbols.add() instead."
+            //
+            // 为什么这两个文件必须豁免 strip：
+            //   AGP 默认会把 jniLibs 里的 .so 交给 NDK 的 llvm-strip 处理以减小体积。
+            //   但这两个文件【不是普通的共享库】：
+            //     · libnode.so      —— 其实是一个可执行文件，只是被改名为 lib*.so，
+            //                          借 jniLibs 这条通道落到可执行目录（见上文 W^X 说明）。
+            //                          strip 会破坏它被 exec 所需的信息。
+            //     · libc++_shared.so —— node 的运行期动态依赖，符号由它提供。
+            //                          真机报的 cannot locate symbol
+            //                          "_ZTVNSt6__ndk119basic_ostringstream..." 正指向它；
+            //                          strip 掉符号表只会让动态链接更无解。
+            //
+            //   这两个文件由 CI 用与 node 相同的 NDK 亲自挑选/产出，不需要 AGP 再加工。
+            //   显式豁免，避免「体积看着小了、真机反而加载失败」这类极难排查的副作用。
+            // -----------------------------------------------------------------
+            keepDebugSymbols += setOf(
+                "**/libnode.so",
+                "**/libc++_shared.so"
+            )
         }
     }
     // 注意：node 二进制现位于 jniLibs/arm64-v8a/libnode.so。

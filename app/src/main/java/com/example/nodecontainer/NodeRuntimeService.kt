@@ -104,6 +104,40 @@ class NodeRuntimeService : Service() {
             val script = NodeProvisioner.ensureServerScript(this)
             RuntimeDiagnostics.append(this, "script", true, "server.js 探针就位", script.absolutePath)
 
+            // 4.4) 列出 nativeLibraryDir 的实际内容。
+            //
+            //      为什么要专门列这个：真机报的是
+            //          cannot locate symbol "_ZTVNSt6__ndk119basic_ostringstream..."
+            //      这是【动态链接期】找不到提供该符号的 libc++_shared.so 导致的。
+            //      而 libnode.so 既不依赖系统里的任何 C++ 库、自己也不导出这些符号，
+            //      它唯一来源就是同目录的 libc++_shared.so。
+            //
+            //      所以「这个目录里到底有没有 libc++_shared.so」是所有猜测的分水岭：
+            //        · 有 → 那就是 linker 搜索路径问题（需要 RUNPATH 或改加载方式）
+            //        · 没有 → 是打包问题（APK 里就没带上它）
+            //      一张截图即可定论，不必再来回猜。
+            try {
+                val libDir = File(applicationInfo.nativeLibraryDir)
+                val files = libDir.listFiles()?.sortedBy { it.name } ?: emptyList()
+                val listing = if (files.isEmpty()) {
+                    "(目录为空或无法读取)"
+                } else {
+                    files.joinToString("\n") { f ->
+                        "  ${f.name}  ${f.length()} 字节"
+                    }
+                }
+                val hasCxx = files.any { it.name == "libc++_shared.so" }
+                RuntimeDiagnostics.append(
+                    this, "libdir", hasCxx,
+                    if (hasCxx) "libc++_shared.so 就在 lib 目录里"
+                    else "⚠ lib 目录里【没有】libc++_shared.so —— 这就是 cannot locate symbol 的直接原因",
+                    "nativeLibraryDir=${libDir.absolutePath}\n" +
+                        "文件数=${files.size}\n$listing"
+                )
+            } catch (e: Exception) {
+                RuntimeDiagnostics.append(this, "libdir", false, "列举 nativeLibraryDir 失败", err(e))
+            }
+
             // 4.5) 先跑一次 `node -v`：这是对「能否 exec」的确定性验证。
             //      比 canExecute() 可靠得多 —— 它真去执行了。成功说明 W^X 这关过了，
             //      顺便把二进制的真实版本号显示出来（与清单里的 version 可能不同，

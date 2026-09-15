@@ -30,6 +30,13 @@ on:
         description: 'Release tag（默认 apk-latest，会被覆盖更新）'
         required: false
         default: 'apk-latest'
+  # 支持 tag 触发：推送形如 publish-<run_id> 的 tag 即可直接发布指定 run 的 artifact。
+  # 之所以需要这条：workflow_dispatch 只能在网页上手动点，而维护环境无法操作网页
+  # （沙箱屏蔽了 api.github.com，gh CLI 也用不了）。用 tag 触发就能把"发布"这个
+  # 动作变成一条 git push，全程无需人工点击 —— 也便于把结果回报到 ci-ok 分支。
+  push:
+    tags:
+      - 'publish-*'
 
 jobs:
   publish:
@@ -48,6 +55,22 @@ jobs:
           set -euo pipefail
           TAG="${{ inputs.tag }}"
           RUN_ID="${{ inputs.run_id }}"
+
+          # tag 触发时（refs/tags/publish-<run_id>），从 tag 名解析 run_id。
+          # 例：publish-34852369904 → RUN_ID=34852369904
+          if [ -z "$RUN_ID" ] && [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            REF_TAG="${GITHUB_REF_NAME:-}"
+            echo "== 由 tag 触发: $REF_TAG =="
+            CAND="${REF_TAG#publish-}"
+            if printf '%s' "$CAND" | grep -qE '^[0-9]+$'; then
+              RUN_ID="$CAND"
+              echo "从 tag 解析出 run_id=$RUN_ID"
+            else
+              echo "[warn] tag 名不是 publish-<run_id> 形式（got: $CAND），改为自动查找。"
+            fi
+          fi
+
+          if [ -z "$TAG" ]; then TAG="apk-latest"; fi
 
           if [ -z "$RUN_ID" ]; then
             echo "== 未指定 run_id，自动查找最近一次成功运行 =="
