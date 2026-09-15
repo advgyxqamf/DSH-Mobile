@@ -1,0 +1,5 @@
+BUILD_OK
+time : Tue Sep 15 23:18:06 UTC 2026
+node : 24.21.0
+apk  : app/build/outputs/apk/debug/app-debug.apk
+url  : https://github.com/advgyxqamf/DSH-Mobile/releases/download/apk-latest/app-debug.apk
