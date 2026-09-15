@@ -1,0 +1,56 @@
+CI_LAST_REPORT
+time   : Tue Sep 15 23:18:08 UTC 2026
+run    : 35016859539
+sha    : 5bb8957aa55779304d442203d5d7ba8c7d930511
+stage  : 8/9 gradle-apk
+job    : success
+
+=== step outcomes ===
+wfvalidate  : success
+hbstart     : success
+ping        : success
+checkout    : success
+setup-java  : success
+sdk-env     : success
+sdk-install : success
+host-deps   : success
+node-tag    : success
+sync-json   : success
+node-cache  : success
+node-restore: success
+node-reused : no
+node-build  : success
+gradle-build: success
+
+=== node-build.log size / tail ===
+16827996 /tmp/node-build.log
+  /usr/local/lib/android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.target/node_mksnapshot/tools/snapshot/node_mksnapshot.o ../tools/snapshot/node_mksnapshot.cc '-D_GLIBCXX_USE_CXX11_ABI=1' '-D_FILE_OFFSET_BITS=64' '-DNODE_OPENSSL_CONF_NAME=nodejs_conf' '-DICU_NO_USER_DATA_OVERRIDE' '-D__STDC_FORMAT_MA
+  /usr/local/lib/android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ -rdynamic -Wl,--whole-archive /tmp/tmp.FUXM8odFff/node/out/Release/obj.target/deps/zlib/libzlib.a -Wl,--no-whole-archive -Wl,--whole-archive /tmp/tmp.FUXM8odFff/node/out/Release/obj.target/deps/uv/libuv.a -Wl,--no-whole-archive -fPIC  -o /tmp/tmp.FUXM8odFff/node/out/Release/embe
+  /usr/local/lib/android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.target/node/src/node_main.o ../src/node_main.cc '-D_GLIBCXX_USE_CXX11_ABI=1' '-D_FILE_OFFSET_BITS=64' '-DNODE_OPENSSL_CONF_NAME=nodejs_conf' '-DICU_NO_USER_DATA_OVERRIDE' '-D__STDC_FORMAT_MACROS' '-DOPENSSL_NO_PINSHARED' '-DOPENSSL_THR
+  /usr/local/lib/android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ -rdynamic -Wl,--whole-archive /tmp/tmp.FUXM8odFff/node/out/Release/obj.target/libnode_base.a /tmp/tmp.FUXM8odFff/node/out/Release/obj.target/tools/v8_gypfiles/libv8_base_without_compiler.a -Wl,--no-whole-archive -Wl,--whole-archive /tmp/tmp.FUXM8odFff/node/out/Release/obj.target
+  /usr/local/lib/android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ -rdynamic -Wl,--whole-archive /tmp/tmp.FUXM8odFff/node/out/Release/obj.target/deps/zlib/libzlib.a -Wl,--no-whole-archive -Wl,--whole-archive /tmp/tmp.FUXM8odFff/node/out/Release/obj.target/deps/uv/libuv.a -Wl,--no-whole-archive -fPIC  -o /tmp/tmp.FUXM8odFff/node/out/Release/node
+  /usr/local/lib/android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ -rdynamic -Wl,--whole-archive /tmp/tmp.FUXM8odFff/node/out/Release/obj.target/deps/zlib/libzlib.a -Wl,--no-whole-archive -Wl,--whole-archive /tmp/tmp.FUXM8odFff/node/out/Release/obj.target/deps/uv/libuv.a -Wl,--no-whole-archive -fPIC  -o /tmp/tmp.FUXM8odFff/node/out/Release/ccte
+rm c4fee1483c38ac50e2c517fe8514388e4c63316aa7d0fa4e8b1d2513a6fb3e36.intermediate 5255c5ee33cbb0db490ac82d5f945611b3bd110d64c38614070a1a1b4260b71e.intermediate 10d7df7a9eef16f6e2624a86a490eb9a11bfbc739ffd0b84377011c733cf8e2c.intermediate e8e729287f3ab97ede613b37fc0e77932888ea3a25c2f21dc5cbf99b3597f7e5.intermediate c1ff1a3067574515fc7a9080f5b9ddb21ff1fcc3d1692b33fc5147a7efe0673c.intermediate 4a97b0e
+if [ ! -r node ] || [ ! -L node ]; then \
+  ln -fs out/Release/node node; fi
+==> 拷贝产物到 /home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/jniLibs/arm64-v8a/libnode.so
+==> 打包 libc++_shared.so（node 运行时的动态依赖，系统不提供）
+    源: /usr/local/lib/android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so
+    目标: /home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/jniLibs/arm64-v8a/libc++_shared.so (9290184 字节)
+==> 依赖闭环自检
+    [ok] libm.so （bionic/系统提供）
+    [ok] libdl.so （bionic/系统提供）
+    [ok] liblog.so （bionic/系统提供）
+    [ok] libc++_shared.so （已随包提供）
+    [ok] libc.so （bionic/系统提供）
+==> 产物自检
+    file: ELF 64-bit LSB pie executable, ARM aarch64, version 1 (SYSV), dynamically linked, interpreter /system/bin/linker64, with debug_info, not stripped
+          [Requesting program interpreter: /system/bin/linker64]
+      LOAD           0x000000 0x0000000000000000 0x0000000000000000 0x5894710 0x5894710 R E 0x4000
+      LOAD           0x5894710 0x0000000005898710 0x0000000005898710 0x1312f8 0x1318f0 RW  0x4000
+      LOAD           0x59c8000 0x00000000059d0000 0x00000000059d0000 0x028d78 0x0595d0 RW  0x4000
+    [ok] 解释器为 Android linker64（bionic 动态链接，可正常 exec）
+    [ok] 检出 16KB (0x4000) 对齐的 LOAD 段（满足 Android 15+ 要求）
+==> 完成。文件: /home/runner/work/DSH-Mobile/DSH-Mobile/app/src/main/jniLibs/arm64-v8a/libnode.so
+    下一步: ./gradlew assembleDebug 即可把该 Node 打进 APK（首启离线可跑）。
+    若要做 OTA 升级包: ./scripts/make-release.sh 24.21.0
