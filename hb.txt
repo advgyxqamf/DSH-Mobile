@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 22
-time : Tue Sep 15 20:16:47 UTC 2026
+beat : 23
+time : Tue Sep 15 20:17:34 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.6GB
+mem  : avail=13.5GB
 cgmax: n/a
-load : 3.00 2.89 1.97
-logsize: 5258460
-objs   : host=764 target=2124
+load : 3.00 2.91 2.03
+logsize: 5293127
+objs   : host=787 target=2124
 oomhits: 0
 0
-lastprog: 2 warnings generated.   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_compiler/deps/v8/src/compiler/js-call-reducer.o ../deps/v8/src/comp
+lastprog:   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_compiler/deps/v8/src/compiler/js-inlining-heuristic.o ../deps/v8/src/compiler/js-inlining
