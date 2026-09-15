@@ -352,11 +352,39 @@ class NodeRuntimeService : Service() {
             val code = runCatching { p.waitFor() }.getOrDefault(-1)
             if (!portUp) {
                 RuntimeDiagnostics.append(this, "process", false, "node 进程已退出", "exitCode=$code")
-                val err = RuntimeDiagnostics.readNodeStderr(this)
+
+                // ------------------------------------------------------------------
+                // 这里有个竞态，曾经导致诊断里 node-stderr 一片空白（很误导人）。
+                //
+                // forward() 是在【另一个独立线程】里 stream.bufferedReader() 逐行读的，
+                // 而 watchExit 这个线程在 waitFor() 一返回就立刻去读那个 log 文件。
+                // 两个线程之间没有任何同步 —— 于是当 node 死得很快时（本例就是这样：
+                // server.listen 抛 RangeError 后进程瞬间退出），读取线程很可能还
+                // 没被调度到，文件自然是空的。表现出来就是：
+                //     [FAIL] node-stderr: (node 无 stderr 输出)
+                // 而实际上 node 明明打印了 RangeError。
+                //
+                // 修法：不是盲目 sleep，而是【轮询等待文件出现内容】，最多等 1.5 秒。
+                // 正常情况下第一轮就命中，几乎不增加开销。
+                //
+                // 注意这里必须用 while 而不是 repeat{}：repeat 是内联 lambda，
+                // 里面的 return@repeat 语义只相当于 continue，【跳不出整个循环】，
+                // 会被误解成「读到了就收工」，实际仍会老实跑满 15 轮。
+                // ------------------------------------------------------------------
+                var err = RuntimeDiagnostics.readNodeStderr(this)
+                var waited = 0
+                while (err.isBlank() && waited < 1500) {
+                    Thread.sleep(100)
+                    waited += 100
+                    err = RuntimeDiagnostics.readNodeStderr(this)
+                }
+
                 RuntimeDiagnostics.append(
-                    this, "node-stderr", false, "node 标准错误(完整)",
+                    this, "node-stderr", err.isNotBlank(), "node 标准错误(完整)",
                     if (err.isNotBlank()) err
-                    else "(node 无 stderr 输出；用 adb logcat -s NodeRuntime:* 查看 stdout)"
+                    else "(node 确实没有 stderr 输出。请用 adb logcat -s NodeRuntime:* 看 stdout，" +
+                        "本 App 也把 stdout 逐行打进了 logcat)\n" +
+                        "已等待 ${waited}ms 让转发线程收敛。"
                 )
             }
         }.start()
