@@ -166,8 +166,10 @@ class HostBridgeService : Service() {
         // accessibility 以**服务实例已连接**为准，而非仅看 Settings 字符串：
         // 字符串可能在服务被系统回收后仍残留，会导致 ui.* 方法通过门禁却在执行时 NullPointer。
         if (DshAccessibilityService.isReady()) caps.add("accessibility")
-        // 仍未内置：Shizuku（P4）/ 构建链（P3）/ MediaProjection（P5）。
-        // 这三项置位后，bridge:shell / bridge:build / ui.screenshot 会自动解锁，无需改动此处以外的代码。
+        // mediaprojection：授权是每次会话的，以「截屏服务已连且 projection 非空」为准。
+        if (ScreenCaptureService.isReady()) caps.add("mediaprojection")
+        // 仍未内置：Shizuku（P4，需第三方 SDK）。
+        // 置位后 bridge:shell 会自动解锁，无需改动此处以外的代码。
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager())
             caps.add("manage_external_storage")
         if (notificationListenerEnabled()) caps.add("notification_access")
@@ -495,8 +497,44 @@ class HostBridgeService : Service() {
                 maxDepth = p.optInt("maxDepth", 40)
             )
         },
-        "ui.screenshot" to MethodDef(listOf("mediaprojection"), true) { _ ->
-            throw BridgeError(CODE_CAPABILITY_MISSING, "需 MediaProjection（P5 未落地）")
+        "ui.screenshot" to MethodDef(listOf("mediaprojection"), true) { p ->
+            // P5：真实实现。授权是**每次会话**的（用户须点系统弹窗），故首次调用前
+            // 必须先经 MainActivity 授权；授权结果缓存在 files/screen-capture-grant.json。
+            val svc = ScreenCaptureService.instance
+                ?: throw BridgeError(
+                    CODE_CAPABILITY_MISSING,
+                    "截屏服务未启动。需先在 App 内完成一次截屏授权（系统弹窗），此后可后台复用"
+                )
+            val metrics = resources.displayMetrics
+            val w = p.optInt("width", metrics.widthPixels)
+            val h = p.optInt("height", metrics.heightPixels)
+            val bmp = svc.capture(w, h, metrics.densityDpi)
+                ?: throw BridgeError(CODE_INTERNAL, "截屏失败（8s 内未取到帧；可能屏幕处于锁屏/息屏）")
+
+            val dir = File(filesDir, "screenshots").apply { mkdirs() }
+            val file = File(dir, "shot-${System.currentTimeMillis()}.png")
+            file.outputStream().use { bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it) }
+            val outW = bmp.width
+            val outH = bmp.height
+            bmp.recycle()
+
+            if (p.optBoolean("inline", false)) {
+                // 内联 base64：方便小图/低分辨率直取，但大图会显著撑大 JSON-RPC 帧。
+                val bytes = file.readBytes()
+                JSONObject().apply {
+                    put("encoding", "base64")
+                    put("content", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
+                    put("width", outW); put("height", outH); put("bytes", bytes.size)
+                    put("path", file.absolutePath)
+                }
+            } else {
+                JSONObject().apply {
+                    put("path", file.absolutePath)
+                    put("width", outW)
+                    put("height", outH)
+                    put("bytes", file.length())
+                }
+            }
         },
         "ui.waitFor" to MethodDef(listOf("accessibility"), false) { p ->
             val a11y = requireA11y()
@@ -508,16 +546,215 @@ class HostBridgeService : Service() {
                 intervalMs = p.optLong("intervalMs", 250L)
             )
         },
-        // 3.3 shell / 3.5 storage / 3.6 build：仍为能力门禁占位（P3/P4/P5 待落地）。
+        // 3.3 shell / 3.6 build：仍为能力门禁占位（P3/P4 待落地）。
         // 能力缺失时返回 -32001（与 spec 降级语义一致）。
-        "shell.exec" to MethodDef(listOf("shizuku"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 Shizuku/无线调试") },
-        "fs.read" to MethodDef(listOf("manage_external_storage"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 MANAGE_EXTERNAL_STORAGE") },
-        "fs.write" to MethodDef(listOf("manage_external_storage"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 MANAGE_EXTERNAL_STORAGE") },
-        "fs.list" to MethodDef(listOf("manage_external_storage"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 MANAGE_EXTERNAL_STORAGE") },
-        "fs.mkdir" to MethodDef(listOf("manage_external_storage"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 MANAGE_EXTERNAL_STORAGE") },
+        "shell.exec" to MethodDef(listOf("shizuku"), true) { p ->
+            // 「兜底」实现：无 Shizuku 时，本应用 uid 仍能跑一部分命令（getprop / pm list /
+            // am 查询等只读或本应用权限内的操作）。明确不冒充 shell uid(2000)。
+            // 设计取舍见类注释「shell.exec 的兜底语义」。
+            val cmd = p.optString("cmd", "")
+            if (cmd.isBlank()) throw BridgeError(CODE_INVALID_PARAM, "cmd 为空")
+            val uid = android.os.Process.myUid()
+            if (uid == 2000 || uid == 0) {
+                throw BridgeError(CODE_CAPABILITY_MISSING, "意外的 uid=$uid（不该出现在应用进程中）")
+            }
+            val arr = p.optJSONArray("args")?.let { a -> (0 until a.length()).map { a.optString(it) } }
+                ?: emptyList()
+            val timeoutMs = p.optLong("timeoutMs", 10_000L).coerceIn(1L, 60_000L)
+            try {
+                val proc = ProcessBuilder(listOf(cmd) + arr)
+                    .redirectErrorStream(true)
+                    .start()
+                val out = StringBuilder()
+                val reader = proc.inputStream.bufferedReader()
+                // 读线程与 waitFor 并行，避免管道写满导致子进程阻塞（经典死锁）。
+                val pump = Thread {
+                    reader.forEachLine { line ->
+                        if (out.length < MAX_SHELL_OUTPUT) out.append(line).append('\n')
+                    }
+                }
+                pump.start()
+                val finished = proc.waitFor(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                if (!finished) {
+                    proc.destroyForcibly()
+                    throw BridgeError(CODE_TIMEOUT, "命令超时 ${timeoutMs}ms: $cmd")
+                }
+                pump.join(1000)
+                val text = out.toString()
+                JSONObject().apply {
+                    put("ok", proc.exitValue() == 0)
+                    put("exitCode", proc.exitValue())
+                    put("stdout", if (text.length > MAX_SHELL_OUTPUT) text.take(MAX_SHELL_OUTPUT) + "\n…(截断)" else text)
+                    put("uid", uid)
+                    put("privileged", false)
+                    put("note", "以应用 uid($uid) 执行，非 shell uid(2000)。需特权请接入 Shizuku（P4）。")
+                }
+            } catch (e: java.io.IOException) {
+                throw BridgeError(
+                    CODE_INVALID_PARAM,
+                    "无法执行 $cmd：${e.message}。注意：PATH 受限，且多数系统命令需 shell uid（Shizuku）。"
+                )
+            }
+        },
+        // ---- 3.5 storage：fs.* 真实实现（P5，2026-09）----
+        // 访问范围：全放开（有 MANAGE_EXTERNAL_STORAGE 即通行），不做白名单限制。
+        // 但保留**审计留痕**与**危险路径提示**（不拦截）——见 auditPathHint()。
+        "fs.read" to MethodDef(listOf("manage_external_storage"), false) { p ->
+            val f = requireReadableFile(p.optString("path", ""))
+            val maxBytes = p.optLong("maxBytes", DEFAULT_FS_MAX_BYTES).coerceIn(1L, MAX_FS_BYTES)
+            if (f.length() > maxBytes) {
+                throw BridgeError(
+                    CODE_INVALID_PARAM,
+                    "文件 ${f.length()} 字节超过上限 $maxBytes；用 maxBytes 显式放大（硬顶 ${MAX_FS_BYTES}）"
+                )
+            }
+            val bytes = f.readBytes()
+            val encoding = p.optString("encoding", "auto")
+            if (encoding == "base64") {
+                JSONObject().apply {
+                    put("path", f.absolutePath)
+                    put("bytes", bytes.size)
+                    put("encoding", "base64")
+                    put("content", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
+                }
+            } else {
+                // auto：能按 UTF-8 无损还原就当文本，否则退 base64（避免二进制被静默损坏）。
+                val text = String(bytes, Charsets.UTF_8)
+                val lossless = text.toByteArray(Charsets.UTF_8).contentEquals(bytes)
+                JSONObject().apply {
+                    put("path", f.absolutePath)
+                    put("bytes", bytes.size)
+                    if (lossless) {
+                        put("encoding", "utf8")
+                        put("content", text)
+                    } else {
+                        put("encoding", "base64")
+                        put("content", android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
+                        put("note", "内容非合法 UTF-8，已自动以 base64 返回（避免损坏二进制）")
+                    }
+                }
+            }
+        },
+        "fs.write" to MethodDef(listOf("manage_external_storage"), true) { p ->
+            val f = requireWritableFile(p.optString("path", ""))
+            val encoding = p.optString("encoding", "utf8")
+            val content = p.optString("content", "")
+            val bytes = if (encoding == "base64") {
+                android.util.Base64.decode(content, android.util.Base64.DEFAULT)
+            } else {
+                content.toByteArray(Charsets.UTF_8)
+            }
+            val append = p.optBoolean("append", false)
+            f.parentFile?.mkdirs()
+            if (append) f.appendBytes(bytes) else f.writeBytes(bytes)
+            JSONObject().apply {
+                put("path", f.absolutePath)
+                put("bytes", bytes.size)
+                put("appended", append)
+                auditPathHint(f.absolutePath)?.let { put("hint", it) }
+            }
+        },
+        "fs.list" to MethodDef(listOf("manage_external_storage"), false) { p ->
+            val path = p.optString("path", "")
+            val f = when {
+                path.isBlank() -> File(Environment.getExternalStorageDirectory().absolutePath)
+                else -> File(path)
+            }
+            if (!f.exists()) throw BridgeError(CODE_INVALID_PARAM, "路径不存在: ${f.absolutePath}")
+            val recursive = p.optBoolean("recursive", false)
+            val maxEntries = p.optInt("maxEntries", 1000).coerceIn(1, 10000)
+            val arr = JSONArray()
+            var truncated = false
+            if (f.isDirectory) {
+                if (recursive) f.walkTopDown().forEach { c ->
+                    if (arr.length() >= maxEntries) { truncated = true; return@forEach }
+                    if (c.absolutePath != f.absolutePath) arr.put(fileToJson(c))
+                } else {
+                    val kids = f.listFiles() ?: emptyArray()
+                    for (c in kids) {
+                        if (arr.length() >= maxEntries) { truncated = true; break }
+                        arr.put(fileToJson(c))
+                    }
+                }
+            }
+            JSONObject().apply {
+                put("path", f.absolutePath)
+                put("isDirectory", f.isDirectory)
+                put("entries", arr)
+                put("count", arr.length())
+                put("truncated", truncated)
+            }
+        },
+        "fs.mkdir" to MethodDef(listOf("manage_external_storage"), true) { p ->
+            val f = requireWritableFile(p.optString("path", ""))
+            val ok = if (f.exists()) f.isDirectory else f.mkdirs()
+            if (!ok) throw BridgeError(CODE_INTERNAL, "创建目录失败: ${f.absolutePath}")
+            JSONObject().apply {
+                put("path", f.absolutePath)
+                put("existed", f.exists())
+            }
+        },
         "build.apk" to MethodDef(listOf("build_chain"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "构建链未内置") },
         "build.status" to MethodDef(listOf("build_chain"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "构建链未内置") }
     )
+
+    // ---- fs.* 辅助 ----
+
+    private fun fileToJson(f: File): JSONObject = JSONObject().apply {
+        put("name", f.name)
+        put("path", f.absolutePath)
+        put("directory", f.isDirectory)
+        put("size", if (f.isDirectory) 0L else f.length())
+        put("modified", f.lastModified())
+        put("readable", f.canRead())
+        put("writable", f.canWrite())
+    }
+
+    private fun requireReadableFile(path: String): File {
+        if (path.isBlank()) throw BridgeError(CODE_INVALID_PARAM, "path 为空")
+        val f = File(path)
+        if (!f.exists()) throw BridgeError(CODE_INVALID_PARAM, "文件不存在: $path")
+        if (f.isDirectory) throw BridgeError(CODE_INVALID_PARAM, "是目录而非文件: $path")
+        if (!f.canRead()) throw BridgeError(CODE_INVALID_PARAM, "无读权限: $path")
+        return f
+    }
+
+    private fun requireWritableFile(path: String): File {
+        if (path.isBlank()) throw BridgeError(CODE_INVALID_PARAM, "path 为空")
+        val f = File(path)
+        if (f.exists() && f.isDirectory) throw BridgeError(CODE_INVALID_PARAM, "是目录而非文件: $path")
+        val parent = f.parentFile
+        if (parent != null && !parent.exists()) {
+            // 允许自动建父目录（fs.write/fs.mkdir 的常见用法），但父目录必须可创建。
+            if (!parent.mkdirs() && !parent.exists()) {
+                throw BridgeError(CODE_INVALID_PARAM, "无法创建父目录: ${parent.absolutePath}")
+            }
+        }
+        if (parent != null && !parent.canWrite()) {
+            throw BridgeError(CODE_INVALID_PARAM, "父目录不可写: ${parent.absolutePath}")
+        }
+        return f
+    }
+
+    /**
+     * 危险路径提示（**不拦截**，仅回传给调用方 + 审计）。
+     *
+     * 用户明确选择了「全放开」策略，故不设白名单。但这些路径写入的后果不可逆
+     * （设备变砖 / 内核崩溃 / 系统不可启动），调用方至少应当在日志里看见风险。
+     */
+    private fun auditPathHint(path: String): String? {
+        val p = path.trim()
+        return when {
+            p.startsWith("/dev/") || p == "/dev" ->
+                "⚠ 写入 /dev 下的块设备/字符设备可能立即损坏设备数据"
+            p.startsWith("/proc/") || p.startsWith("/sys/") ->
+                "⚠ /proc 与 /sys 是内核接口，写入可能使系统立即不稳定或崩溃"
+            p.startsWith("/system") || p.startsWith("/vendor") || p.startsWith("/boot") ->
+                "⚠ 系统分区受 verified boot 保护，写入通常失败；强行修改可能导致设备无法启动"
+            p == "/" -> "⚠ 根目录写入：请确认目标路径"
+            else -> null
+        }
+    }
 
     private fun getUserRestriction(key: String): String? = when (key) {
         "no_install_apps" -> android.os.UserManager.DISALLOW_INSTALL_APPS
@@ -544,6 +781,13 @@ class HostBridgeService : Service() {
 
         /** PackageInstaller 回传广播里携带的目标（apk 路径或包名），见 PackageInstallReceiver。 */
         const val EXTRA_PKG = "dsh_target"
+
+        /** shell.exec 单次输出上限（防止超大输出撑爆 JSON-RPC 帧）。 */
+        const val MAX_SHELL_OUTPUT = 256 * 1024
+
+        /** fs.read 默认读取上限（64MB 硬顶）—— 与 JSON-RPC 帧模型匹配。 */
+        const val DEFAULT_FS_MAX_BYTES = 8L * 1024 * 1024
+        const val MAX_FS_BYTES = 64L * 1024 * 1024
 
         // 能力分组 -> 代表能力（用于握手时的 groups 交集）
         val GROUP_REQUIRED = mapOf(

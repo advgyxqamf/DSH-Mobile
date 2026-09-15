@@ -34,6 +34,9 @@ object ProvisioningProbe {
     const val MEDIAPROJECTION = "mediaprojection"
     const val SPECIAL_PERMS = "special-perms"
 
+    /** 与 [ScreenCaptureService.GRANT_FILE] 保持一致（探针提示文案里引用）。 */
+    private const val GRANT_FILE = ScreenCaptureService.GRANT_FILE
+
     /**
      * 跑全量体检并把结果写入诊断日志。
      * @return 通过项数 / 总项数
@@ -126,32 +129,71 @@ object ProvisioningProbe {
         }
     }
 
+    /**
+     * Shizuku 三态探测：**未安装 / 已安装未授权 / 已授权可用**。
+     *
+     * 为什么必须细分：这三种状态对内核的**处置方式完全不同**——
+     *   · 未安装   → 引导用户去装（或改用无线调试路径）；
+     *   · 未授权   → 只需在 Shizuku App 里点一次授权，成本极低，值得重试；
+     *   · 已授权   → shell 能力理论上可用（但容器侧尚未接入 SDK，见下）。
+     * 只报「不可用」会让内核既不知道要不要重试，也不知道该提示用户做什么。
+     *
+     * ⚠ 当前容器**未内置 Shizuku SDK**（P4 决策：先做 shell 兜底 + 探测增强，不引入
+     *   第三方 AAR 以免污染冻结容器的信任边界）。因此即使 Shizuku 完全就绪，
+     *   `shell.exec` 仍以**应用 uid** 执行（privileged=false），不会冒充 shell uid(2000)。
+     *   真正的特权 shell 需要 Shizuku SDK 的 `Shell.newProcess(...)` 通道。
+     */
     private fun checkShizuku(ctx: Context): ProbeResult {
-        // Shizuku 以「是否安装 + 是否已授权」判定；未接 SDK，故只做存在性探测。
-        val installed = try {
-            ctx.packageManager.getPackageInfo("moe.shizuku.privileged.api", 0)
-            true
-        } catch (_: Throwable) { false }
+        // ① 是否安装（包存在性）
+        val installedVersion = try {
+            @Suppress("DEPRECATION")
+            val pi = ctx.packageManager.getPackageInfo("moe.shizuku.privileged.api", 0)
+            pi.versionName ?: "unknown"
+        } catch (_: Throwable) { null }
 
+        // ② 守护进程是否在跑（binder 服务名固定为 "shizuku"）
         val binderAlive = try {
-            // Shizuku 的 binder 服务名固定为 "shizuku"；getService 非空即视为守护进程在跑。
             Class.forName("android.os.ServiceManager")
                 .getMethod("getService", String::class.java)
                 .invoke(null, "shizuku") != null
         } catch (_: Throwable) { false }
 
-        val ok = installed && binderAlive
+        // ③ 是否已授权本应用。
+        //    Shizuku 的授权记录存在 Settings.Secure 的 "shizuku_authorized_packages" 之类字段上，
+        //    不同版本键名不一致；稳妥做法是「binder 在跑 + 本包已安装」即视为可尝试授权，
+        //    这里额外读一次常见键做增强判断，读不到不影响主判定。
+        val authedPkgs = try {
+            Settings.Secure.getString(ctx.contentResolver, "shizuku_authorized_packages") ?: ""
+        } catch (_: Throwable) { "" }
+        val selfAuthorized = authedPkgs.contains(ctx.packageName)
+
+        val ok = binderAlive
         val status = when {
-            ok -> "已安装且守护进程在跑"
-            installed -> "已安装但未启动/未授权"
+            binderAlive && selfAuthorized -> "已授权且守护进程在跑"
+            binderAlive -> "守护进程在跑（本应用可能尚未授权）"
+            installedVersion != null -> "已安装 v$installedVersion 但守护进程未启动"
             else -> "未安装"
         }
-        return ProbeResult(
-            SHIZUKU, "Shizuku / 无线调试", ok, status,
-            if (ok) "bridge:shell 可解锁（需容器侧接入 Shizuku SDK，P4）"
-            else "无线调试方案：开发者选项 → 无线调试 → 配对；或安装 Shizuku 并授权。\n" +
-                "⚠ 容器尚未内置 Shizuku SDK（P4），当前即使就绪 shell.exec 仍返回 -32001"
-        )
+
+        val hint = when {
+            !ok && installedVersion == null ->
+                "两条路二选一：\n" +
+                    "  A) 安装 Shizuku（moe.shizuku.privileged.api）并启动，然后在其中授权本应用；\n" +
+                    "  B) 用无线调试：开发者选项 → 无线调试 → 配对（Android 11+，adb 一次即可）。\n" +
+                    "⚠ 容器尚未内置 Shizuku SDK（P4 决策），当前 shell.exec 以**应用 uid** 执行兜底，" +
+                    "能跑 getprop / pm list 等只读命令，但不具备 shell uid(2000) 特权。"
+            !ok ->
+                "Shizuku 已安装但守护进程没起来。打开 Shizuku App 点一次「启动」（Android 11+ 需先经无线调试配对）。\n" +
+                    "启动后 bridge 握手会多出 shizuku 能力标记。"
+            !selfAuthorized ->
+                "守护进程在跑，但本应用可能还没在 Shizuku 里授权。打开 Shizuku → 已授权应用 → 添加本应用。\n" +
+                    "⚠ 容器尚未内置 Shizuku SDK（P4 决策），shell.exec 仍走应用 uid 兜底。"
+            else ->
+                "Shizuku 完全就绪。⚠ 但容器尚未内置 Shizuku SDK（P4 决策），" +
+                    "shell.exec 目前仍以应用 uid 执行（privileged=false）。接入 SDK 后可解锁 shell uid(2000)。"
+        }
+
+        return ProbeResult(SHIZUKU, "Shizuku / 无线调试", ok, status, hint)
     }
 
     private fun checkMediaProjection(ctx: Context): ProbeResult {
@@ -167,15 +209,30 @@ object ProvisioningProbe {
             pi.requestedPermissions?.contains("android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION") == true
         } catch (_: Throwable) { false }
 
+        // P5 已落地：ScreenCaptureService 真实存在，判定维度从「声明」升级为「授权是否已生效」。
+        val granted = ScreenCaptureService.isReady()
+        val hasCachedGrant = ScreenCaptureService.loadGrant(ctx) != null
+
+        val status = when {
+            !apiOk -> "平台不支持（需 API 21+）"
+            granted -> "已授权，截屏可用"
+            hasCachedGrant -> "有缓存授权，服务未启动（点「授权屏幕捕获」或重启 App）"
+            fgsDeclared -> "未授权（点诊断面板的「授权屏幕捕获」按钮）"
+            else -> "⚠ 未声明 FOREGROUND_SERVICE_MEDIA_PROJECTION"
+        }
+
         return ProbeResult(
             MEDIAPROJECTION, "MediaProjection（截屏）",
-            ok = false,
-            status = if (apiOk) "未实现（P5）" else "平台不支持",
-            hint = "ui.screenshot 恒返回 -32001。落地需：\n" +
+            ok = apiOk && fgsDeclared,
+            status = status,
+            hint = if (granted) {
+                "ui.screenshot 可用。默认返回 PNG 落盘路径，传 inline=true 可内联 base64。"
+            } else {
                 "① Manifest 声明 FOREGROUND_SERVICE_MEDIA_PROJECTION" +
-                (if (fgsDeclared) "（已声明）" else "（⚠ 当前未声明）") + "\n" +
-                "② 用户侧一次性弹窗授权（createScreenCaptureIntent），授权不可预置；\n" +
-                "③ 前台服务类型切为 mediaProjection。"
+                    (if (fgsDeclared) "（已声明 ✓）" else "（⚠ 当前未声明）") + "\n" +
+                    "② 用户在 App 内点一次「授权屏幕捕获」完成系统弹窗授权（**不可预置**，这是与 Device Owner 的本质区别）；\n" +
+                    "③ 授权缓存于 files/$GRANT_FILE，进程重启后自动复用。"
+            }
         )
     }
 
@@ -189,7 +246,7 @@ object ProvisioningProbe {
         } else false
         if (extStorage) okCount++
         items += "MANAGE_EXTERNAL_STORAGE=${if (extStorage) "已授权" else "未授权"}" +
-            (if (extStorage) "" else "（Manifest 未声明，需先声明再跳设置页授权）")
+            (if (extStorage) "" else "（已声明，需跳设置页或由 Device Owner 静默授予）")
 
         // 2) 通知访问
         val notifAccess = try {
@@ -220,7 +277,8 @@ object ProvisioningProbe {
             Settings.canDrawOverlays(ctx)
         } catch (_: Throwable) { false }
         if (overlay) okCount++
-        items += "SYSTEM_ALERT_WINDOW=${if (overlay) "已授权" else "未授权"}（Manifest 未声明）"
+        items += "SYSTEM_ALERT_WINDOW=${if (overlay) "已授权" else "未授权"}" +
+            "（Device Owner 可静默授予，无需用户点确认）"
 
         return ProbeResult(
             SPECIAL_PERMS, "标准特殊权限", okCount == 5, "$okCount/5 已就绪",

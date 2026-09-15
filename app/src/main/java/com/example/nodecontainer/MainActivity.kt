@@ -26,6 +26,9 @@ import androidx.core.content.ContextCompat
  *  - 面板经 postMessage 发 dsh:kernel-update-request → 宿主帧转交本 Activity（DshNative.onRequest）
  *    → 重启 :node 进程（重读 CURRENT / 触发 OTA）→ 回灌 dsh:kernel-update-result（**严格按内核契约**）。
  *  - 提供“重试”按钮：清空诊断、重启 NodeRuntimeService 重新走全流程。
+ *  - 提供“授权屏幕捕获”按钮：MediaProjection 授权**无法预置**（不同于 Device Owner），
+ *    必须由用户点系统弹窗。授权结果缓存到 files/screen-capture-grant.json，之后可后台复用，
+ *    这是内核 ui.screenshot 能工作的前置条件。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -33,6 +36,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var scroll: ScrollView
     private lateinit var webView: WebView
     private lateinit var retryBtn: Button
+    private lateinit var captureBtn: Button
     private val handler = Handler(Looper.getMainLooper())
     private var uiMode = false // false=诊断面板, true=WebView(内核 /__host 宿主帧 + 面板 iframe)
 
@@ -43,6 +47,33 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.RequestPermission()
     ) { /* 即使被拒也尽力启动服务 */ }
 
+    /**
+     * 截屏授权（ui.screenshot 的前置）。
+     *
+     * ⚠ MediaProjection 与 Device Owner 的本质区别：它**不能预置**，必须由用户在系统弹窗
+     * 上点一次「开始录制」。所以这里必须有个 Activity 承接 startActivityForResult。
+     * 拿到 resultCode + data 后：
+     *   ① saveGrant() 落盘缓存（进程重启后可复用，避免每次截图都弹窗）；
+     *   ② 拉起 ScreenCaptureService 建 projection。
+     */
+    private val requestCapture = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        if (result.resultCode == RESULT_OK && data != null) {
+            ScreenCaptureService.saveGrant(this, result.resultCode, data)
+            startCaptureService(result.resultCode, data)
+            RuntimeDiagnostics.append(
+                this, "screenshot", true, "截屏授权已获取", "已缓存，可后台复用；ui.screenshot 现在可用"
+            )
+        } else {
+            RuntimeDiagnostics.append(
+                this, "screenshot", false, "截屏授权被取消",
+                "ui.screenshot 将继续返回 -32001；可随时点「授权屏幕捕获」重来"
+            )
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -51,6 +82,7 @@ class MainActivity : AppCompatActivity() {
         scroll = findViewById(R.id.scroll)
         webView = findViewById(R.id.webview)
         retryBtn = findViewById(R.id.retryBtn)
+        captureBtn = findViewById(R.id.captureBtn)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
@@ -60,10 +92,53 @@ class MainActivity : AppCompatActivity() {
         }
 
         retryBtn.setOnClickListener { restartRuntime() }
+        captureBtn.setOnClickListener { requestScreenCapture() }
 
         setupWebView()
+        // 复用上次授权：进程/设备重启后若 grant 仍在，直接拉起服务，无需用户再点一次。
+        reuseExistingCaptureGrant()
         startRuntime()
         startPolling()
+    }
+
+    /** 尝试用上次缓存的 MediaProjection 授权直接建 projection（失败则静默，等用户手动授权）。 */
+    private fun reuseExistingCaptureGrant() {
+        if (ScreenCaptureService.isReady()) return
+        val grant = ScreenCaptureService.loadGrant(this) ?: return
+        startCaptureService(grant.first, grant.second)
+    }
+
+    /** 拉起截屏前台服务（Android 14+ 必须以前台服务承载 MediaProjection）。 */
+    private fun startCaptureService(resultCode: Int, data: Intent) {
+        try {
+            val svc = Intent(this, ScreenCaptureService::class.java)
+                .setAction(ScreenCaptureService.ACTION_START)
+                .putExtra(ScreenCaptureService.EXTRA_RESULT_CODE, resultCode)
+                .putExtra(ScreenCaptureService.EXTRA_RESULT_DATA, data)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(svc)
+            } else {
+                startService(svc)
+            }
+        } catch (e: Throwable) {
+            RuntimeDiagnostics.append(this, "screenshot", false, "启动截屏服务失败",
+                "${e::class.java.simpleName}: ${e.message}")
+        }
+    }
+
+    /** 向系统申请截屏授权（弹窗由系统渲染，用户须手动确认）。 */
+    private fun requestScreenCapture() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.LOLLIPOP) {
+            RuntimeDiagnostics.append(this, "screenshot", false, "平台不支持 MediaProjection", "需 API 21+")
+            return
+        }
+        try {
+            val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as android.media.projection.MediaProjectionManager
+            requestCapture.launch(mpm.createScreenCaptureIntent())
+        } catch (e: Throwable) {
+            RuntimeDiagnostics.append(this, "screenshot", false, "发起截屏授权失败",
+                "${e::class.java.simpleName}: ${e.message}")
+        }
     }
 
     private fun setupWebView() {

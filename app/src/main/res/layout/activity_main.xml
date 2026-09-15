@@ -34,12 +34,26 @@
                 android:textColor="#c9d1d9"
                 android:textSize="12sp" />
 
-            <Button
-                android:id="@+id/retryBtn"
-                android:layout_width="wrap_content"
+            <LinearLayout
+                android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="12dp"
-                android:text="@string/retry" />
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/retryBtn"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="@string/retry" />
+
+                <!-- 截屏授权：MediaProjection 无法预置，必须用户点一次系统弹窗 -->
+                <Button
+                    android:id="@+id/captureBtn"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:text="@string/screenshot_grant_hint" />
+            </LinearLayout>
         </LinearLayout>
     </ScrollView>
 

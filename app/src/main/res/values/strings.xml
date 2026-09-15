@@ -6,4 +6,7 @@
     <string name="notification_text">Node.js 正在以原生方式运行</string>
     <string name="retry">重试</string>
     <string name="accessibility_desc">DSH 容器需要无障碍服务以启用 UI 自动化能力（tap/swipe/输入/读屏）。开启后，内核经 HostBridge 的 bridge:ui_automation 方法组可执行无人值守操作。</string>
+    <string name="screenshot_notif_title">屏幕捕获已启用</string>
+    <string name="screenshot_notif_text">DSH 容器正在使用屏幕捕获（MediaProjection）</string>
+    <string name="screenshot_grant_hint">授权屏幕捕获（供内核截屏用）</string>
 </resources>

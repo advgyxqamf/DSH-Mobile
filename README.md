@@ -42,7 +42,9 @@ android-node-container/
 │  │  ├─ BootReceiver                     # ★开机自启容器
 │  │  ├─ DeviceAdminReceiver              # ★Device Owner（静默装卸/锁屏/密码/Kiosk）
 │  │  ├─ DshAccessibilityService          # ★无障碍：手势/节点树/文本注入（bridge:ui_automation）
-│  │  └─ MainActivity                     # 诊断面板 + 加载内核同源宿主帧 /__host + dsh:kernel-update 桥
+│  │  ├─ ScreenCaptureService             # ★截屏：MediaProjection 前台服务（bridge:ui.screenshot）
+│  │  ├─ PackageInstallReceiver           # ★PackageInstaller 会话结果回传（app.install/uninstall）
+│  │  └─ MainActivity                     # 诊断面板 + 屏幕捕获授权 + 内核同源宿主帧 /__host
 │  └─ res/xml/{device_admin, accessibility_service_config, network_security_config}.xml
 ├─ container-engine/                      # ★可测 OTA 引擎（Node，零依赖）
 │  ├─ src/  zip / keys / sign / verify / kernel-bundle / ota-engine / runtime-json
@@ -126,12 +128,15 @@ IOException: Cannot run program ".../files/node/24.21.0/node": error=13, Permiss
 | 方法组 | 状态 | 说明 |
 |---|---|---|
 | `app_control` / `notification` / `system` | ✅ | 真实实现 |
-| `device_policy` | ✅ | 13 个 `dpm.*` 方法真实调用（需 Device Owner） |
-| `ui_automation` | ✅ | **P2 落地**：无障碍服务真实手势/节点树/文本注入 |
-| `storage` | ⏳ | Manifest 已声明权限，`fs.*` 方法体待实现 |
-| `shell` | ⏳ | 需 Shizuku SDK（P4） |
+| `device_policy` | ✅ | 13 个 `dpm.*` 方法真实调用（需 Device Owner）；**P1 修正 6 处存量 API 误用** |
+| `ui_automation` | ✅ | **P2 落地**：手势/节点树/文本注入；**P5 补 `ui.screenshot`**（MediaProjection） |
+| `storage` | ✅ | **P5 落地**：`fs.read/write/list/mkdir` 真实实现（全放开 + 危险路径提示不拦截） |
+| `shell` | ⚠️ | **P4 兜底**：以应用 uid 执行（`privileged:false`）；特权 shell 需 Shizuku SDK（未内置） |
 | `build` | ⏳ | 需内置构建链（P3，待方案决策） |
 
+> **`ui.screenshot` 的前置**：MediaProjection 授权**不可预置**（与 Device Owner 本质区别）——
+> 需在 App 诊断面板点一次「授权屏幕捕获」，之后缓存于 `files/screen-capture-grant.json` 长期复用。
+>
 > 协议细节、方法表、错误码见 [`docs/BRIDGE_PROTOCOL.md`](docs/BRIDGE_PROTOCOL.md)；实现与 [`container-engine/src/bridge/*`](container-engine/src/bridge) 对齐。
 > 跨仓互通由 `container-engine/test/bridge-interop-test.js` 实测（内核真实客户端 ←→ 容器参考桥，真实 UDS）。
 > 权限预置与自检见 [`docs/PROVISIONING.md`](docs/PROVISIONING.md)；`Device Owner` 激活：`adb shell dpm set-device-owner com.example.nodecontainer/.DeviceAdminReceiver`。

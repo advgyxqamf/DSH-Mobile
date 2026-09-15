@@ -16,6 +16,13 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <!--
+      悬浮窗（bridge:ui_automation 的辅助能力，也是无障碍不可用时的降级路径）。
+      同样属 AppOps 特殊权限：声明后还需 Settings.canDrawOverlays() 授权的跳转。
+      Device Owner 可经 setPermissionGrantState 静默授予，无需用户点确认。
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!--
       外部存储全量访问（bridge:storage 的代表能力）。
       ⚠ 这是 AppOps 特殊权限（非运行时权限）：Manifest 声明后，还需跳到
         Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION 由用户/Device Owner 授权，
@@ -74,6 +81,12 @@
         <service
             android:name=".HostBridgeService"
             android:exported="false" />
+
+        <!-- 截屏（ui.screenshot）：Android 14+ 硬性要求 mediaProjection 类型前台服务 -->
+        <service
+            android:name=".ScreenCaptureService"
+            android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
 
         <!-- 开机自启接收器 -->
         <receiver

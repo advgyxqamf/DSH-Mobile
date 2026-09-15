@@ -89,10 +89,19 @@ class BridgeServer {
       case 'ui.swipe': return { ok: true };
       case 'ui.inputText': return { ok: true };
       case 'ui.waitFor': return { found: false, elapsedMs: params.timeoutMs || 0 };
-      case 'ui.screenshot': return { ok: false, note: 'MediaProjection 未落地（P5）' };
-      case 'fs.list': return { entries: [] };
-      case 'fs.read': return { content: '' };
-      case 'fs.mkdir': return { created: params.path };
+      case 'ui.screenshot': return {
+        // P5：默认返回 PNG 文件路径（避免几 MB base64 撑爆 JSON-RPC 帧）；inline=true 才内联。
+        ...(params && params.inline
+          ? { encoding: 'base64', content: '' }
+          : { path: '/data/.../screenshots/shot-<ts>.png', width: 1080, height: 2400, bytes: 0 }),
+      };
+      // storage：P5 真实实现（2026-09）。与 Kotlin 返回结构对齐。
+      case 'fs.list': return { path: params.path || '/sdcard', isDirectory: true, entries: [], count: 0, truncated: false };
+      case 'fs.read': return {
+        path: params.path || '', bytes: 0, encoding: params.encoding === 'base64' ? 'base64' : 'utf8', content: '',
+      };
+      case 'fs.write': return { path: params.path || '', bytes: 0, appended: !!params.append };
+      case 'fs.mkdir': return { path: params.path || '', existed: false };
       case 'build.status': return { id: params.id || 'last', status: 'idle' };
       case 'build.apk': return { id: 'b' + Date.now(), status: 'queued' };
       case 'app.launch': return { launched: params.pkg };
@@ -110,8 +119,11 @@ class BridgeServer {
       case 'sys.reboot': return { ok: true };
       case 'sys.setTimeZone': return { ok: true, timeZone: params.timeZone };
       case 'shell.exec': return new Promise((resolve, reject) => {
+        // P4 兜底语义：以**应用 uid** 执行（非 shell uid 2000）。
+        // 真实部署需 Shizuku 才有特权；mock 保留可执行性验证。
         execFile(params.cmd || 'echo', params.args || ['ok'], { timeout: 5000 }, (err, stdout) => {
-          if (err) reject(err); else resolve({ exitCode: 0, stdout: String(stdout) });
+          if (err) reject(err);
+          else resolve({ ok: true, exitCode: 0, stdout: String(stdout), uid: -1, privileged: false });
         });
       });
       default: return { echo: method };
