@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 32
-time : Tue Sep 15 20:24:33 UTC 2026
+beat : 33
+time : Tue Sep 15 20:25:19 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.4GB
+mem  : avail=13.2GB
 cgmax: n/a
-load : 3.09 3.05 2.43
-logsize: 5617700
-objs   : host=852 target=2124
+load : 3.04 3.04 2.46
+logsize: 5639296
+objs   : host=865 target=2124
 oomhits: 0
 0
-lastprog:   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_compiler/deps/v8/src/compiler/turboshaft/loop-peeling-phase.o ../deps/v8/src/compiler/tur
+lastprog: [progress 20:25:18] host=865 target=2124 2 warnings generated.   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_compiler/deps/v8/src/compi
