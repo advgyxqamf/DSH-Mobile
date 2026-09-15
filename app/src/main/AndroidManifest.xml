@@ -4,6 +4,7 @@
 
     <!-- WebView 加载本地 HTTP 服务、Node 打开网络/本地端口 -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!-- 前台服务保活（防止 Doze 杀掉 Node 进程） -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -11,6 +12,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <!-- Android 13+ 通知授权 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- 开机/重启后自启容器（拉起 NodeRuntimeService） -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- HostBridge：静默安装应用（Device Owner） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- HostBridge：列举全部已装应用 -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+    <!-- 16KB 页对齐要求（Node 24 / 原生模块） -->
+    <uses-feature android:name="android.hardware.ram.normal" android:required="false" />
 
     <application
         android:name=".NodeContainerApp"
@@ -27,6 +38,47 @@
             android:exported="false"
             android:process=":node"
             android:foregroundServiceType="dataSync" />
+
+        <!-- HostBridge（UDS 能力桥）：随 APK 冻结；exported=false，仅本应用 :node 进程连接 -->
+        <service
+            android:name=".HostBridgeService"
+            android:exported="false" />
+
+        <!-- 开机自启接收器 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Device Owner 接收器（静默装卸/锁屏/密码/Kiosk/用户限制） -->
+        <receiver
+            android:name=".DeviceAdminReceiver"
+            android:exported="true"
+            android:permission="android.permission.BIND_DEVICE_ADMIN">
+            <meta-data
+                android:name="android.app.device_admin"
+                android:resource="@xml/device_admin" />
+            <intent-filter>
+                <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 无障碍服务（bridge:ui_automation 能力） -->
+        <service
+            android:name=".DshAccessibilityService"
+            android:exported="true"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
 
         <activity
             android:name=".MainActivity"

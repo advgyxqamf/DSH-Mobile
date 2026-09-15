@@ -5,4 +5,5 @@
     <string name="notification_title">Node.js 运行时</string>
     <string name="notification_text">Node.js 正在以原生方式运行</string>
     <string name="retry">重试</string>
+    <string name="accessibility_desc">DSH 容器需要无障碍服务以启用 UI 自动化能力（tap/swipe/输入/读屏）。开启后，内核经 HostBridge 的 bridge:ui_automation 方法组可执行无人值守操作。</string>
 </resources>

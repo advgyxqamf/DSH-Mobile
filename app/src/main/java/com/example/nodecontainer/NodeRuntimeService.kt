@@ -12,27 +12,35 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * Node 运行时前台服务（独立进程 :node）。
+ * 内核运行时前台服务（独立进程 :node）。容器（L0）把“可热更新的内核（L1）”真正拉起来的最后一环。
  *
- * 与之前版本的区别：每一步都用 RuntimeDiagnostics 写入带时间戳的诊断行，
- * 并在失败时把 node 进程自身的 stderr 完整落盘。这样 App 打开后，屏幕上的
- * “启动诊断”面板就能逐阶段反映真实状态——node 二进制是否就位、进程是否拉起、
- * 端口是否就绪、若失败则失败在哪一环、node 自己报了什么错。
+ * 流程（对齐 container-engine/src/boot.js 与 docs/BASE_SPEC.md §9）：
+ *   1. 启动 HostBridge（UDS 能力桥，本进程外独立监听）。
+ *   2. 读 files/kernel/CURRENT 指针 → 若缺则落地基线内核（assets/kernel/baseline.zip）。
+ *   3. 取冻结的 Node 运行时（NodeVersionManager，files/node/CURRENT）。
+ *   4. 写 runtime.json（schema 2，容器写内核读）到 files/supervisor/runtime.json。
+ *   5. 注入安卓环境（DSH_ANDROID=1 / DSH_SUPERVISOR_HOME / PATH / HOME / TMPDIR …）。
+ *   6. spawn `node bin/dsh-supervisor daemon`（内核入口）。
+ *   7. HTTP /status 健康检查；失败/进程退出 → 退避重启（START_STICKY 保活）。
  *
- * 关键点：node 是直接 exec 的应用私有二进制（bionic 链接），因此这是“原生安卓环境”，
- *        与 Termux 无关、不需要 root。
+ * 关键点：node 是直接 exec 的应用私有二进制（bionic 链接），与 Termux 无关、不需要 root。
+ *        一次包升级 = 重启 :node 进程（用户侧“热”的，无 APK 重编）。
  */
 class NodeRuntimeService : Service() {
 
     private var nodeProcess: Process? = null
     private val scope = CoroutineScope(Dispatchers.IO)
-    private var portUp = false
+    private var healthUp = false
+    private var keepRunning = true
+    private var restartCount = 0
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -43,150 +51,171 @@ class NodeRuntimeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         RuntimeDiagnostics.clear(this)
-        scope.launch { startNode() }
-        // START_STICKY：进程被杀后系统会尝试重启服务，尽量保活 Node
+        keepRunning = true
+        // 先拉起 HostBridge（UDS 能力桥），再启动内核
+        startHostBridge()
+        scope.launch { supervisorLoop() }
         return START_STICKY
     }
 
-    private fun startNode() {
-        try {
-            RuntimeDiagnostics.append(
-                this, "init", null, "NodeRuntimeService 启动 (进程 :node)",
-                "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), " +
-                    "ABI=${NodeProvisioner.currentAbi()}, " +
-                    "filesDir=${filesDir.absolutePath}"
-            )
+    private fun startHostBridge() {
+        val svc = Intent(this, HostBridgeService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(svc) else startService(svc)
+    }
 
-            // 1) 版本清单
-            val vm = NodeVersionManager(this)
-            val manifest = vm.loadManifest()
-            RuntimeDiagnostics.append(
-                this, "manifest", true, "版本清单加载成功",
-                "default=${manifest.default}, abi=${manifest.abi}, " +
-                    "可用版本=${manifest.versions.joinToString { it.version }}"
-            )
-
-            // 2) 当前生效版本
-            val version = vm.currentVersion()
-            RuntimeDiagnostics.append(this, "version", true, "当前生效版本=$version", "指针=${version}")
-
-            // 3) 确保 node 二进制就位
-            val nodeBin = NodeProvisioner.nodeExecutable(this, version)
-            if (!nodeBin.canExecute()) {
-                val bundled = manifest.versions.firstOrNull { it.version == version }?.bundled == true
-                if (bundled) {
-                    RuntimeDiagnostics.append(
-                        this, "provision", null,
-                        "解压内置 node 二进制 (assets/node-bin/${manifest.abi}/node)"
-                    )
-                    try {
-                        NodeProvisioner.ensureBundledNode(this, version)
-                        RuntimeDiagnostics.append(this, "provision", true, "内置 node 已解压并可执行", nodeBin.absolutePath)
-                    } catch (e: Exception) {
-                        RuntimeDiagnostics.append(this, "provision", false, "内置 node 解压失败", err(e))
-                        return
-                    }
-                } else {
-                    RuntimeDiagnostics.append(
-                        this, "provision", false, "node 二进制缺失且该版本非内置",
-                        "期望路径: ${nodeBin.absolutePath}\n" +
-                            "该版本(bundled=false)需先经 OTA 安装，或把 default 改回 bundled=true 的版本。\n" +
-                            "若是自己构建：请先运行 ./scripts/build-node-android.sh $version 生成并放入 assets/node-bin/${manifest.abi}/node"
-                    )
-                    return
+    /** 监督循环：持续拉起内核，进程退出/健康失败则退避重启，避免无限紧循环。 */
+    private suspend fun supervisorLoop() {
+        while (keepRunning) {
+            val backoff = minOf(BACKOFF_BASE_MS shl restartCount.coerceAtMost(5), BACKOFF_MAX_MS)
+            val ok = bootKernelOnce()
+            if (ok) {
+                restartCount = 0
+                // 内核在跑；等待其退出或被外部停止
+                while (keepRunning && nodeProcess?.isAlive == true && healthUp) {
+                    delay(1000)
                 }
             } else {
-                RuntimeDiagnostics.append(this, "provision", true, "node 二进制已就绪", nodeBin.absolutePath)
+                restartCount += 1
             }
-
-            if (!nodeBin.canExecute()) {
-                RuntimeDiagnostics.append(this, "provision", false, "node 仍不可执行（权限或架构不符）", nodeBin.absolutePath)
-                return
-            }
-
-            // 4) server.js 探针
-            val script = NodeProvisioner.ensureServerScript(this)
-            RuntimeDiagnostics.append(this, "script", true, "server.js 探针就位", script.absolutePath)
-
-            // 5) 启动 node
-            val pb = ProcessBuilder(
-                nodeBin.absolutePath, script.absolutePath, "--port", PORT.toString()
-            ).directory(filesDir)
-            pb.environment().apply {
-                // Node 在安卓沙箱里需要 HOME / TMPDIR，否则部分模块(npm、crypto 临时文件)报错
-                put("HOME", filesDir.absolutePath)
-                put("TMPDIR", cacheDir.absolutePath)
-                put("NODE_PATH", File(filesDir, "node_modules").absolutePath)
-            }
-            nodeProcess = pb.start()
-            val pidStr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) nodeProcess!!.pid().toString() else "n/a"
-            RuntimeDiagnostics.append(this, "exec", true, "node 进程已启动", "pid=$pidStr, 监听 127.0.0.1:$PORT")
-
-            // 6) 转发 stdout/stderr 到诊断
-            forward(nodeProcess!!.inputStream, "stdout")
-            forward(nodeProcess!!.errorStream, "stderr")
-
-            // 7) 监听进程退出（独立于端口轮询，避免遗漏崩溃）
-            watchExit()
-
-            // 8) 轮询端口
-            pollPort()
-        } catch (e: Throwable) {
-            RuntimeDiagnostics.append(this, "fatal", false, "启动流程异常", err(e))
-            Log.e(TAG, "启动 Node 失败", e)
+            if (!keepRunning) break
+            RuntimeDiagnostics.append(this, "supervisor", null, "退避 ${backoff}ms 后重启", "attempt=$restartCount")
+            delay(backoff)
         }
     }
 
-    /** 把 node 子进程的 stdout/stderr 转发：stdout 记诊断、stderr 额外落 node-stderr.log。 */
+    /** 单次拉起内核；成功返回 true（进程已起 + 健康），失败返回 false。 */
+    private fun bootKernelOnce(): Boolean {
+        try {
+            RuntimeDiagnostics.append(
+                this, "init", null, "NodeRuntimeService 启动内核 (进程 :node)",
+                "Android ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), filesDir=${filesDir.absolutePath}"
+            )
+
+            // 1) 内核版本指针
+            val km = KernelManager(this)
+            val version = km.ensureBaseline() ?: km.currentVersion()
+            if (version.isNullOrBlank() || !km.entryPath(version).exists()) {
+                RuntimeDiagnostics.append(
+                    this, "kernel", false, "无可用内核",
+                    "files/kernel/CURRENT 缺失且无 assets/kernel/baseline.zip，" +
+                        "请确认 OTA 已下发或通过 CI 内置基线内核。"
+                )
+                return false
+            }
+            RuntimeDiagnostics.append(this, "kernel", true, "内核版本=$version", "入口=${km.entryPath(version).absolutePath}")
+
+            // 2) 冻结的 Node 运行时
+            val vm = NodeVersionManager(this)
+            val manifest = vm.loadManifest()
+            val nodeVersion = vm.currentVersion()
+            val nodeBin = NodeProvisioner.nodeExecutable(this, nodeVersion)
+            if (!nodeBin.canExecute()) {
+                val bundled = manifest.versions.firstOrNull { it.version == nodeVersion }?.bundled == true
+                if (bundled) {
+                    NodeProvisioner.ensureBundledNode(this, nodeVersion)
+                } else {
+                    RuntimeDiagnostics.append(this, "provision", false, "Node 二进制缺失且非内置", nodeBin.absolutePath)
+                    return false
+                }
+            }
+            if (!nodeBin.canExecute()) {
+                RuntimeDiagnostics.append(this, "provision", false, "node 仍不可执行", nodeBin.absolutePath)
+                return false
+            }
+            RuntimeDiagnostics.append(this, "provision", true, "Node 运行时就位", nodeBin.absolutePath)
+
+            val kernelDir = km.kernelDir(version)
+            val entry = km.entryPath(version)
+            val uiDir = File(kernelDir, "manager/dist").absolutePath
+
+            // 3) 写 runtime.json（schema 2，容器写内核读）
+            writeRuntimeJson(
+                home = filesDir.absolutePath,
+                nodePath = nodeBin.absolutePath,
+                nodeBinDir = nodeBin.parentFile!!.absolutePath,
+                npmPath = nodeBin.absolutePath,
+                minNode = "v24.12.0"
+            )
+            RuntimeDiagnostics.append(this, "runtime", true, "runtime.json 已写入（schema 2）", "home=${filesDir.absolutePath}")
+
+            // 4) 注入安卓环境并拉起内核
+            val pb = ProcessBuilder(nodeBin.absolutePath, entry.absolutePath, "daemon")
+                .directory(kernelDir)
+            pb.environment().apply {
+                put("DSH_ANDROID", "1")
+                put("DSH_PLATFORM", "android")
+                put("DSH_SUPERVISOR_HOME", filesDir.absolutePath)
+                put("DSH_UI_DIR", uiDir)
+                put("HOME", filesDir.absolutePath)
+                put("TMPDIR", cacheDir.absolutePath)
+                put("NODE_PATH", File(kernelDir, "node_modules").absolutePath)
+                put("PATH", (nodeBin.parentFile!!.absolutePath) + File.pathSeparator + (getenv("PATH") ?: ""))
+            }
+            nodeProcess = pb.start()
+            healthUp = false
+            val pidStr = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) nodeProcess!!.pid().toString() else "n/a"
+            RuntimeDiagnostics.append(this, "exec", true, "内核进程已启动", "pid=$pidStr, 监听 127.0.0.1:$KERNEL_CONTROL_PORT")
+
+            forward(nodeProcess!!.inputStream, "stdout")
+            forward(nodeProcess!!.errorStream, "stderr")
+            watchExit()
+            return pollHealth()
+        } catch (e: Throwable) {
+            RuntimeDiagnostics.append(this, "fatal", false, "启动内核异常", err(e))
+            Log.e(TAG, "启动内核失败", e)
+            return false
+        }
+    }
+
+    /** 把内核子进程的 stdout/stderr 转发：stderr 额外落 node-stderr.log。 */
     private fun forward(stream: java.io.InputStream, tag: String) {
         Thread {
             stream.bufferedReader().use { r ->
                 r.forEachLine { line ->
-                    Log.i("NodeRuntime:$tag", line)
+                    Log.i("Kernel:$tag", line)
                     if (tag == "stderr") RuntimeDiagnostics.recordNodeStderr(this, line + "\n")
-                    else RuntimeDiagnostics.append(this, "node-$tag", null, line)
+                    else RuntimeDiagnostics.append(this, "kernel-$tag", null, line)
                 }
             }
         }.start()
     }
 
-    /** 等待 node 进程结束；若端口尚未就绪则说明失败并把 node 的 stderr 完整回写诊断。 */
     private fun watchExit() {
         val p = nodeProcess ?: return
         Thread {
             val code = runCatching { p.waitFor() }.getOrDefault(-1)
-            if (!portUp) {
-                RuntimeDiagnostics.append(this, "process", false, "node 进程已退出", "exitCode=$code")
+            if (!healthUp) {
+                RuntimeDiagnostics.append(this, "process", false, "内核进程退出", "exitCode=$code")
                 val err = RuntimeDiagnostics.readNodeStderr(this)
                 RuntimeDiagnostics.append(
-                    this, "node-stderr", false, "node 标准错误(完整)",
-                    if (err.isNotBlank()) err
-                    else "(node 无 stderr 输出；用 adb logcat -s NodeRuntime:* 查看 stdout)"
+                    this, "node-stderr", false, "内核标准错误(完整)",
+                    if (err.isNotBlank()) err else "(无 stderr；adb logcat -s Kernel:*)"
                 )
             }
         }.start()
     }
 
-    private fun pollPort() {
+    /** 轮询内核 /status 健康检查，直到 200 或超时；成功置 healthUp。 */
+    private fun pollHealth(): Boolean {
         repeat(100) {
-            if (isPortUp()) {
-                portUp = true
-                RuntimeDiagnostics.append(this, "port", true, "127.0.0.1:$PORT 已就绪", "Node 原生运行成功 ✓")
-                return
+            if (isStatusUp()) {
+                healthUp = true
+                RuntimeDiagnostics.append(this, "health", true, "内核健康检查通过 (127.0.0.1:$KERNEL_CONTROL_PORT/status)", "内核原生运行成功 ✓")
+                return true
             }
             Thread.sleep(300)
         }
-        if (!portUp) {
+        if (!healthUp) {
             RuntimeDiagnostics.append(
-                this, "port", false, "端口在 30s 内未就绪",
-                "可能原因：node 崩溃 / 端口被占用 / 二进制不兼容当前 ROM(如非 16KB 页对齐)。\n" +
-                    "查看上方 [FAIL] process 与 node-stderr，或 adb logcat -s NodeRuntime:*"
+                this, "health", false, "健康检查 30s 内未通过",
+                "可能原因：内核崩溃 / 端口不符 / 二进制不兼容。查看上方 [FAIL] process 与 node-stderr。"
             )
         }
+        return healthUp
     }
 
-    private fun isPortUp(): Boolean = try {
-        val c = URL("http://127.0.0.1:$PORT/api/version").openConnection() as HttpURLConnection
+    private fun isStatusUp(): Boolean = try {
+        val c = URL("http://127.0.0.1:$KERNEL_CONTROL_PORT/status").openConnection() as HttpURLConnection
         c.connectTimeout = 300
         c.readTimeout = 300
         c.requestMethod = "GET"
@@ -195,11 +224,28 @@ class NodeRuntimeService : Service() {
         false
     }
 
+    private fun getenv(k: String): String? = System.getenv(k)
+
+    private fun writeRuntimeJson(home: String, nodePath: String, nodeBinDir: String, npmPath: String, minNode: String) {
+        val dir = File(filesDir, "supervisor")
+        dir.mkdirs()
+        val obj = JSONObject().apply {
+            put("schema", 2)
+            put("nodePath", nodePath)
+            put("nodeBinDir", nodeBinDir)
+            put("npmPath", npmPath)
+            put("minNode", minNode)
+            put("writtenBy", "android-node-container")
+        }
+        File(dir, "runtime.json").writeText(obj.toString(2))
+    }
+
     private fun err(e: Throwable): String =
         "${e::class.java.simpleName}: ${e.message}\n" +
             e.stackTraceToString().lines().take(10).joinToString("\n")
 
     override fun onDestroy() {
+        keepRunning = false
         nodeProcess?.destroy()
         nodeProcess = null
         super.onDestroy()
@@ -223,6 +269,8 @@ class NodeRuntimeService : Service() {
     companion object {
         const val TAG = "NodeRuntimeService"
         const val NOTIF_ID = 1001
-        const val PORT = 3080
+        const val KERNEL_CONTROL_PORT = 3080
+        const val BACKOFF_BASE_MS = 1000L
+        const val BACKOFF_MAX_MS = 30000L
     }
 }

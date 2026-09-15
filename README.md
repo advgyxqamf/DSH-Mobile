@@ -1,149 +1,156 @@
-# Android Node Container
+# Android Node Container（DSH 容器底座 / L0）
 
-> 在**非 root、免 Termux** 的安卓原生环境（bionic libc）里跑通 Node.js 的容器骨架。
-> 架构上把 Node 当作**可独立升级的运行时资源**，未来升级 Node 无需重新发布 APK。
+> 把手机变成「工作台」的**地基**：一个冻结的安卓 APK，内含原生 Node 运行时 + HostBridge 能力桥 + 签名 OTA 引擎 + 生命周期/诊断。
+> 真正的产品（控制面板内核 L1、Agent L2）由这套底座**热更新**承载——APK 只在 Node/构建链/桥能力变更时才重编。
 
----
-
-## 1. 这个骨架解决什么
-
-- **原生安卓跑 Node**：用 NDK 交叉编译出的 `node` 可执行文件（bionic 链接），由 App 前台服务直接 `exec`，与 Termux/root 无关。
-- **最新 LTS + 现代 TLS**：默认 **Node 24 “Krypton” (Active LTS，支持到 2028-04-30)**，自带 **OpenSSL 3.5 / TLS 1.3、安全等级 2**。
-- **可升级**：Node 二进制放在应用沙箱 `files/node/<version>/`，版本指针在 `files/node/CURRENT`。升级 = OTA 下载新版本 + sha256 校验 + 切换指针。
-- **最小探针**：`assets/node/server.js` 在 `127.0.0.1:3080` 暴露 `/api/version`（验证 LTS/架构/OpenSSL），证明 Node 真跑起来了。后续把 DSH 等负载换成这个入口即可。
+分层架构详见 [`docs/BASE_SPEC.md`](docs/BASE_SPEC.md) 与 [`docs/BRIDGE_PROTOCOL.md`](docs/BRIDGE_PROTOCOL.md)。
 
 ---
 
-## 2. 架构
+## 1. 三层架构（BASE_SPEC §2）
+
+| 层 | 名称 | 更新方式 | 冻结？ | 职责 |
+|---|---|---|---|---|
+| **L0** | 容器（本仓库 APK） | 仅 Node/构建链/桥能力变更才重编 | ✅ | Node 运行时 + npm 客户端 + 内置构建链 + **HostBridge（UDS 能力桥）** + **OTA 引擎** + 生命周期 + 诊断 |
+| **L1** | 内核 = 控制面板 / Manager | 容器**签名 OTA** 热更新 | ❌ | 控制面板代码 + `kernel.json`；运行在 Node 运行时内；运行时经 npm 安装/管理 Agent |
+| **L2** | Agent 产品 | 内核运行时 **npm（公共源）** | ❌ | Codex / Claude Code / DeepSeek Harness 等标准公共产品，由内核拉取 |
+
+**两条热更新通道**（双信任根，互不替代）：
+- 容器 → 内核：**签名 OTA**（容器私钥签内核包，公钥焊进 APK 验签）。
+- 内核 → Agent：运行时 **npm 标准完整性**（sha512 integrity）。
+
+---
+
+## 2. 仓库结构
 
 ```
-APK (com.example.nodecontainer)
-├─ assets/node-bin/arm64-v8a/node      ← NDK 编出的 node（构建时注入，首启离线可用）
-├─ assets/node/server.js               ← 容器探针（后续换成你的负载，如 DSH Web UI）
-├─ assets/node-versions.json           ← 版本清单（驱动 OTA 升级）
-└─ Kotlin 层
-   ├─ NodeContainerApp       通知渠道
-   ├─ NodeRuntimeService(:node 独立进程，前台服务)
-   │     └─ ProcessBuilder → exec node server.js --port 3080
-   ├─ NodeProvisioner        把 assets/node-bin 解压到 files/node/<v>/，chmod +x
-   ├─ NodeVersionManager     读清单 / 当前版本指针 / OTA 下载+sha256 校验+原子切换
-   └─ MainActivity           WebView 加载 http://127.0.0.1:3080
+android-node-container/
+├─ app/src/main/
+│  ├─ assets/
+│  │  ├─ node-bin/arm64-v8a/node          # NDK 编出的 node（构建时注入，首启离线可用）
+│  │  ├─ node-versions.json               # Node 运行时版本清单（驱动 Node OTA）
+│  │  ├─ ota-public.pem                   # ★焊接的 OTA 验签公钥（设备端唯一信任源）
+│  │  └─ host.html                        # 内核 UI 宿主帧（iframe + dsh:kernel-update 桥）
+│  ├─ java/com/example/nodecontainer/
+│  │  ├─ NodeContainerApp                 # 通知渠道
+│  │  ├─ NodeRuntimeService(:node)        # 前台服务：写 runtime.json → 拉起内核 → 健康→退避重启
+│  │  ├─ HostBridgeService                # ★UDS 能力桥（JSON-RPC 2.0，8 组方法 + 审计）
+│  │  ├─ KernelManager                    # kernel/ CURRENT 指针 + 基线内核落地
+│  │  ├─ NodeProvisioner / NodeVersionManager  # Node 运行时解压 / 版本管理
+│  │  ├─ BootReceiver                     # ★开机自启容器
+│  │  ├─ DeviceAdminReceiver              # ★Device Owner（静默装卸/锁屏/密码/Kiosk）
+│  │  ├─ DshAccessibilityService          # ★无障碍（bridge:ui_automation 能力）
+│  │  └─ MainActivity                     # 诊断面板 + 内核 UI 宿主帧 + dsh:kernel-update 桥
+│  └─ res/xml/{device_admin, accessibility_service_config, network_security_config}.xml
+├─ container-engine/                      # ★可测 OTA 引擎（Node，零依赖）
+│  ├─ src/  zip / keys / sign / verify / kernel-bundle / ota-engine / runtime-json
+│  │        / boot / bridge/{protocol,methods,uds-transport,server}.js
+│  ├─ test/ 7 个测试套件（66 passed）
+│  └─ bin/build-bundle.js                 # 内核包签名构建 CLI
+├─ scripts/  keygen / build-node-android / build-apk-local / make-release / build-kernel-bundle
+├─ keys/ota-private.pem                   # 开发期 ed25519 私钥（gitignored；CI 用 secret）
+└─ .github/workflows/  build-apk.yml / kernel-ota.yml
 ```
-
-进程模型：`MainActivity`（UI 进程）→ 启动 `NodeRuntimeService`（独立 `:node` 进程，前台服务保活）→ 它 `exec` 出一个 `node` 子进程监听回环端口 → WebView 渲染本地 UI。
 
 ---
 
-## 3. 快速开始
+## 3. 内核启动流程（BASE_SPEC §9）
 
-### 3.1 编译 Node 二进制（最难啃的一步，一次性）
+`NodeRuntimeService`（独立 `:node` 进程，`START_STICKY` 前台保活）在 App 启动或 `BootReceiver` 收到开机广播时：
 
-> 没有现成的新版预编译安卓 Node：`node-on-mobile/node-on-android` 最后提交 2019、`nodejs-mobile` 停在 Node 12，都已不可用。必须从官方源码 + NDK 自编。
+1. 启动 **HostBridgeService**（UDS 监听，内核侧主动 connect）。
+2. 读 `files/kernel/CURRENT` 指针；若无内核则落地 `assets/kernel/baseline.zip`（首启离线可用）。
+3. 取冻结的 Node 运行时（`files/node/CURRENT`）。
+4. 写 **runtime.json（schema 2，容器写内核读）** 到 `files/supervisor/runtime.json`。
+5. 注入安卓环境：`DSH_ANDROID=1` / `DSH_PLATFORM=android` / `DSH_SUPERVISOR_HOME` / `DSH_UI_DIR` / `PATH` / `HOME` / `TMPDIR`。
+6. `spawn node bin/dsh-supervisor daemon`（内核入口）。
+7. HTTP `/status` 健康检查；失败/进程退出 → **退避重启**（1s→…→30s 上限）。
+
+> 一次内核升级 = 重启 `:node` 进程（用户侧“热”的，无 APK 重编）。
+
+---
+
+## 4. HostBridge（能力桥，L3）
+
+- **传输**：Unix 域套接字（抽象命名空间 `dsh_hostbridge`）；内核（Node）经 `net.connect(Buffer.from('\0dsh_hostbridge'))` 主动连接。**严禁 TCP 暴露控制面**（BASE_SPEC §8）。
+- **协议**：JSON-RPC 2.0，换行分隔 JSON 帧；握手协商 `capabilities` / `groups`。
+- **8 组方法**：`app_control / ui_automation / shell / device_policy / storage / build / notification / system`。
+- **鉴权**：方法声明所需能力；设备未预置 → 返回 `ERR_CAPABILITY_MISSING (-32001)`；未知方法 → `METHOD_NOT_FOUND (-32601)`。内核应优雅降级。
+- **审计**：所有特权操作落 `files/bridge-audit.log`（持久，不随内核包切换丢失）。
+
+> 协议细节、方法表、错误码见 [`docs/BRIDGE_PROTOCOL.md`](docs/BRIDGE_PROTOCOL.md)；实现与 [`container-engine/src/bridge/*`](container-engine/src/bridge) 对齐。
+
+---
+
+## 5. 快速开始
+
+### 5.1 编译 Node 二进制（一次性）
 
 前置（主机侧）：`git python3 ninja cmake make zip` + **Android NDK r27+**。
 
 ```bash
-# 默认编 Node 24 LTS
 ANDROID_NDK=/path/to/ndk ./scripts/build-node-android.sh 24.21.0
 # 产物 -> app/src/main/assets/node-bin/arm64-v8a/node
 ```
 
-脚本内部：克隆 Node 官方源码 → `./android-configure $NDK arm64 24` → `make`。
-NDK r27+ 链接器默认 16KB 页对齐，满足 Android 15+ (API 35) 的 `dlopen` 要求。
-
-> 想要别的 LTS：把版本号换掉即可（如 `22.23.1`，Maintenance LTS，满足 DSH 的 `^22.19.0`）。
-> 想要别的 ABI：扩展 `build-node-android.sh` 的 `ARCH` 与 `app/build.gradle.kts` 的 `abiFilters`。
-
-### 3.2 出包（两条路径）
-
-> ⚠️ 关于“谁来编”：本仓库的 Node 二进制与 APK 都需要在**有公网、能访问 dl.google.com** 的
-> 环境里编译（要下载 Android SDK/NDK）。作者所在的沙箱环境外网被白名单限制，无法下载
-> 这些工具，因此**出包交给你这边**。下面两条路径任选其一，都能产出可安装的 `app-debug.apk`。
-
-**路径 A（推荐，零本地环境）：GitHub Actions 一键出包**
-
-本仓库已带 `.github/workflows/build-apk.yml`。把它推到**你有写权限**的 GitHub 仓库
-（或让我用你的 PAT 直接推）→ Actions → 手动 `Run workflow`（或 push 到 main/master 自动触发）
-→ 完成后在 **Artifacts** 下载 `android-node-container-apk`，里面是 `app-debug.apk`。
-
-CI 运行器有完整公网，会自动：装 JDK17 + SDK/NDK(r27) →
-**自动解析 nodejs/node 上最新的 24.x tag 并写回 `node-versions.json`** →
-`build-node-android.sh` 交叉编译 Node → `./gradlew assembleDebug` → 上传 APK。
-
-**路径 B（本地，需已装 SDK/NDK）：**
+### 5.2 生成 OTA 密钥对（开发期）
 
 ```bash
-export ANDROID_HOME=/path/to/sdk ANDROID_NDK=/path/to/ndk   # NDK 需 r27+
+./scripts/keygen.sh
+# 生成 keys/ota-private.pem（gitignored）+ 把公钥焊进 app/src/main/assets/ota-public.pem
+```
+
+> 私钥仅用于**签名内核包**；公钥焊死在 APK。私钥轮换 = 发新版 APK。
+
+### 5.3 出包（APK）
+
+**路径 A（推荐，零本地环境）：GitHub Actions 一键出包** — `.github/workflows/build-apk.yml` 自动解析最新 Node 24.x tag、NDK 交叉编译、`./gradlew assembleDebug` 上传 APK。推到你有写权限的仓库 → Actions → Run workflow。
+
+**路径 B（本地，需 SDK/NDK）：**
+
+```bash
+export ANDROID_HOME=/path/to/sdk ANDROID_NDK=/path/to/ndk   # NDK r27+
 ./scripts/build-apk-local.sh
-# 产出 app/build/outputs/apk/debug/app-debug.apk
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
-> 注：`gradle-wrapper.jar` 与 `gradlew` 已随仓库提交（指向官方 Gradle 8.9 发行版），
-> CI 直接用 `./gradlew assembleDebug`，无需你手动生成。
+打开 App → 常驻通知 → 先显示“启动诊断”面板（逐阶段带时间戳），内核就绪后切到内核 UI 宿主帧（`host.html` iframe）。
 
-### 3.3 运行 & 验证（你在手机上会看到什么）
+### 5.4 构建并签名内核 OTA 包
 
-打开 App → 通知栏出现“Node.js 运行时”常驻通知 → 屏幕先显示**“启动诊断”面板**：
-
-- 逐阶段、带时间戳地打印：`init → manifest → version → provision → script → exec → port`。
-- **成功**：端口就绪后自动切换到 Node 探针 Web UI。
-- **失败**：对应阶段标 `[FAIL]`，并附真实错误。最常见两类：
-  - `provision [FAIL]`：`assets/node-bin/arm64-v8a/node` 缺失 → 说明没跑 `build-node-android.sh`（CI/本地脚本已处理）。
-  - `node-stderr [FAIL]`：node 进程自己报的错（如二进制非 16KB 页对齐、ROM 不兼容）→ 看完整 stderr 即可定位。
-
-点探针页 `/api/version` 应返回类似：
-
-```json
-{
-  "container": "android-node-container",
-  "node": "v24.21.0",
-  "lts": "Krypton",
-  "platform": "android",
-  "arch": "arm64",
-  "openssl": "3.5.8"
-}
+```bash
+# 先确保私钥就位（见 5.2）
+./scripts/build-kernel-bundle.sh <内核源码目录> 1.4.0 node24-arm64-android35 https://cdn.example.com/ota
+# 产物（release/，gitignored）：
+#   kernel-1.4.0.zip        OTA 下发的内核包（已 ed25519 签名）
+#   kernel-manifest.json    版本/url/sha256/签名
 ```
 
-`adb logcat -s NodeRuntime:*` 可看 Node 进程日志。
+CI 等价流程见 `.github/workflows/kernel-ota.yml`（用 `OTA_PRIVATE_KEY_PEM` secret 签名，绝不进 APK）。
+
+### 5.5 内核更新桥（dsh:kernel-update）
+
+内核 UI 在 `host.html` 的 iframe 内运行，向父帧 `postMessage({type:'dsh:kernel-update-request'})`；`MainActivity` 经 `JavascriptInterface` 收到后触发重启 `:node` 以重读 `CURRENT` / 承接 OTA，再 `postMessage({type:'dsh:kernel-update-result', ...})` 回灌结果。
 
 ---
 
-## 4. 升级 Node（不发新版 APK）
+## 6. container-engine（可测 OTA 引擎）
 
-1. 用新版本号重跑 `build-node-android.sh` 生成 node。
-2. `./scripts/make-release.sh 24.x.x` → 产出 `release/node-24.x.x-android-arm64-v8a.zip` 并打印 sha256。
-3. 把 zip 上传到你的 OTA 服务器（GitHub Release / 对象存储均可）。
-4. 在 `assets/node-versions.json` 的 `versions` 追加一条（把脚本打印的 sha256 填进去，`url` 换成真实地址）。
-5. App 内 `NodeVersionManager.install(...)` 下载 → sha256 校验 → 解压到 `files/node/<新版本>/` → `setCurrentVersion(...)` 原子切换 → 重启 `NodeRuntimeService`。
+纯 Node、零外部依赖，可在本机 `node` 直接跑测试（无需 Android SDK）：
 
-**坏包永不生效**：sha256 不匹配直接抛异常，不切指针。
+```bash
+cd container-engine && npm test
+# sign-verify 6 / kernel-bundle 9 / ota-engine 12 / runtime-json 8 /
+# bridge-protocol 14 / bridge-e2e 9 / e2e-mock-kernel 8  ⇒ 66 passed, 0 failed
+```
 
----
-
-## 5. 关键坑（已为你在工程里规避/标注）
-
-| 坑 | 处理 |
-|---|---|
-| **16KB 页对齐** | NDK r27+ 编译；老 NDK 需 `LDFLAGS=-Wl,-z,max-page-size=16384`，否则安卓 15+ `dlopen` 失败 |
-| **bionic 链接** | 走官方 `android-configure`，node 链接系统 libc，不依赖 Termux |
-| **前台保活** | `NodeRuntimeService` 前台服务 + `START_STICKY` + 常驻通知 |
-| **exec 限制** | node 放在应用私有 `files/` 目录直接 `exec`（Termux 同款做法），无需系统分区 |
-| **明文 HTTP** | `network_security_config.xml` 仅对 `127.0.0.1/localhost` 放行，不全局 cleartext |
-| **HOME/TMPDIR** | 启动 node 前注入 `HOME`、`TMPDIR`，否则 npm/crypto 临时文件报错 |
-
----
-
-## 6. 下一步（接你之前的路线）
-
-- **塞 DeepSeek Harness**：把 `server.js` 换成 `dsh web` 的入口（`npm pack @deepseek-ai/dsh` 也塞进 `files/node_modules`），端口/监听地址不变。注意 DSH 的 `native/system` host-addon 仍需为安卓交叉编译。
-- **加 Python / Java**：Python 用 Chaquopy、Java 用 FCL-Team/Android-OpenJDK-Build，以同样“沙箱运行时资源”思路并入，由 `NodeVersionManager` 同款模式管理版本。
-- **让容器内的 Agent 控手机**：叠加无障碍服务或 Shizuku（见对话前文），把 droidrun / mobile-use 当容器内 Agent 的执行器。
+覆盖：ed25519 签名/验签、内核包打包、OTA 验签+解包+原子指针切换+坏包拦截、runtime.json 契约、HostBridge 协议编解码/握手/方法能力/审计、以及**真实 spawn 内核 + 健康检查**的端到端。
 
 ---
 
 ## 7. 已核实事实
 
-- **最新 LTS = Node 24 Krypton**（24.21.0，2026-09-08；Active LTS 到 2028-04-30）；Node 22 Jod 为 Maintenance LTS。满足 DSH `^22.19.0 || >=24`。
-- **Node 24 自带 OpenSSL 3.5**，默认安全等级 2（拒绝 <2048bit RSA / <224bit ECC）。
-- **`node-on-mobile/node-on-android` 真实但已死**（最后提交 2019-01，libnode.so 是 Node 8/10 时代），架构模式（libnode + JNI + WebView）可参考，二进制不可用。
+- **最新 LTS = Node 24 Krypton**（24.21.0；Active LTS 到 2028-04-30）；Node 24 自带 OpenSSL 3.5，默认安全等级 2。
+- **16KB 页对齐**：NDK r27+ 编译满足安卓 15+ (API 35) `dlopen` 要求。
+- **双信任根**：容器 ed25519 私钥签内核、公钥焊进 APK；npm 标准 integrity 验 Agent。
+- **传输私有**：Agent↔HostBridge 走 UDS，不走 TCP（BASE_SPEC §8）。

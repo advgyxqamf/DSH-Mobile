@@ -15,3 +15,8 @@ release/
 # 沙箱产物
 *.log
 .DS_Store
+
+# 开发期签名私钥（绝不入库；公钥焊进 APK assets/ota-public.pem）
+keys/ota-private.pem
+keys/*.pem
+!keys/README.md

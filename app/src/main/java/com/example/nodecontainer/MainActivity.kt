@@ -7,6 +7,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.View
+import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
@@ -15,13 +16,13 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
-import java.net.HttpURLConnection
-import java.net.URL
 
 /**
- * 入口 Activity，也是“可观测”面板：
- *  - 默认显示“启动诊断”文本（逐阶段、带时间戳的状态与报错，来自 RuntimeDiagnostics 文件）。
- *  - 一旦探测到 127.0.0.1:3080 就绪，自动切换到 WebView 加载 Node 探针 UI。
+ * 入口 Activity，也是“可观测”面板 + 内核 UI 宿主帧：
+ *  - 内核未就绪时显示“启动诊断”文本（逐阶段、带时间戳的状态，来自 RuntimeDiagnostics）。
+ *  - 探测到 127.0.0.1:3080 就绪后，切换到 WebView 加载 host.html（内嵌内核 UI 的 iframe）。
+ *  - 宿主帧经 JavascriptInterface 桥接内核的 dsh:kernel-update-request，
+ *    处理完（此处为重启 :node 进程以重读 CURRENT / 触发 OTA）后回灌 dsh:kernel-update-result。
  *  - 提供“重试”按钮：清空诊断、重启 NodeRuntimeService 重新走全流程。
  */
 class MainActivity : AppCompatActivity() {
@@ -31,11 +32,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var webView: WebView
     private lateinit var retryBtn: Button
     private val handler = Handler(Looper.getMainLooper())
-    private var uiMode = false // false=诊断面板, true=WebView
+    private var uiMode = false // false=诊断面板, true=WebView(host.html + 内核 iframe)
 
     private val requestNotif = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* 即使被拒也尽力启动服务，仅通知可能不显示 */ }
+    ) { /* 即使被拒也尽力启动服务 */ }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -55,8 +56,36 @@ class MainActivity : AppCompatActivity() {
 
         retryBtn.setOnClickListener { restartRuntime() }
 
+        setupWebView()
         startRuntime()
         startPolling()
+    }
+
+    private fun setupWebView() {
+        webView.webViewClient = WebViewClient()
+        webView.settings.javaScriptEnabled = true
+        webView.settings.domStorageEnabled = true
+        webView.addJavascriptInterface(DshBridge(this), "DshNative")
+    }
+
+    /** 原生侧接收内核发来的 dsh:kernel-update-request，处理并回灌结果。 */
+    fun handleKernelUpdateRequest(json: String) {
+        try {
+            val req = org.json.JSONObject(json)
+            val requestId = req.optString("requestId", "")
+            // 处理：重启 :node 进程（重读 CURRENT / OTA 钩子由 Node 侧承接），拉起最新内核。
+            restartRuntime()
+            val result = org.json.JSONObject().apply {
+                put("type", "dsh:kernel-update-result")
+                put("requestId", requestId)
+                put("status", "restarting")
+                put("message", "已重启运行时以加载内核更新")
+            }
+            webView.post {
+                webView.evaluateJavascript("dshDeliverResult($result)", null)
+            }
+        } catch (_: Throwable) {
+        }
     }
 
     private fun startRuntime() {
@@ -101,14 +130,11 @@ class MainActivity : AppCompatActivity() {
         scroll.visibility = View.GONE
         retryBtn.visibility = View.GONE
         webView.visibility = View.VISIBLE
-        webView.webViewClient = WebViewClient()
-        webView.settings.javaScriptEnabled = true
-        webView.settings.domStorageEnabled = true
-        webView.loadUrl("http://127.0.0.1:${NodeRuntimeService.PORT}/")
+        webView.loadUrl("file:///android_asset/host.html")
     }
 
     private fun isPortUp(): Boolean = try {
-        val c = URL("http://127.0.0.1:${NodeRuntimeService.PORT}/api/version").openConnection() as HttpURLConnection
+        val c = java.net.URL("http://127.0.0.1:${NodeRuntimeService.KERNEL_CONTROL_PORT}/status").openConnection() as java.net.HttpURLConnection
         c.connectTimeout = 300
         c.readTimeout = 300
         c.requestMethod = "GET"
@@ -120,5 +146,13 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         handler.removeCallbacksAndMessages(null)
         super.onDestroy()
+    }
+
+    /** 内核 ↔ 原生桥：内核 UI 经 window.DshNative.onRequest 把更新请求交给原生。 */
+    private class DshBridge(private val activity: MainActivity) {
+        @JavascriptInterface
+        fun onRequest(json: String) {
+            activity.runOnUiThread { activity.handleKernelUpdateRequest(json) }
+        }
     }
 }

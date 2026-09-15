@@ -1,0 +1,116 @@
+name: Build & Sign Kernel OTA Bundle
+
+# 构建并签名「可热更新的内核（L1）」OTA 包：对齐 docs/BASE_SPEC.md §5 通道一（构建期签名）。
+#
+# 双信任根：本工作流用 CI secret OTA_PRIVATE_KEY_PEM（ed25519 私钥）签名内核包；
+# 设备端用焊死在 APK 的 app/src/main/assets/ota-public.pem 验签 —— 私钥绝不进 APK。
+#
+# 用法（手动 Run workflow）：
+#   - kernel_repo : 内核源码仓（默认 <owner>/dsh-android-kernel）
+#   - kernel_ref  : 内核仓 ref（分支/tag/sha）
+#   - version     : 内核版本号（写进 kernel.json / 包名）
+#   - abi         : 默认 node24-arm64-android35
+#   - url_base    : OTA 下载基址（如 https://cdn.example.com/ota）；留空则不写 url
+#   - publish     : 是否把产物发到 Release
+#
+# 产物：release/kernel-<version>.zip + release/kernel-manifest.json（作为 artifact / Release 下载）。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: '内核源码仓 (owner/repo)'
+        required: false
+        default: ''
+      kernel_ref:
+        description: '内核仓 ref（分支/tag/sha）'
+        required: false
+        default: 'main'
+      version:
+        description: '内核版本号'
+        required: true
+        default: '1.0.0'
+      abi:
+        description: 'abi 标签'
+        required: false
+        default: 'node24-arm64-android35'
+      url_base:
+        description: 'OTA 下载基址（结尾不带 /）'
+        required: false
+        default: ''
+      publish:
+        description: '发布到 Release'
+        type: boolean
+        required: false
+        default: false
+  push:
+    tags:
+      - 'kernel-ota-*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      KERNEL_REPO: ${{ github.event.inputs.kernel_repo || format('{0}/dsh-android-kernel', github.repository_owner) }}
+      KERNEL_REF: ${{ github.event.inputs.kernel_ref || 'main' }}
+      KERNEL_VER: ${{ github.event.inputs.version || '1.0.0' }}
+      KERNEL_ABI: ${{ github.event.inputs.abi || 'node24-arm64-android35' }}
+      OTA_URL_BASE: ${{ github.event.inputs.url_base || '' }}
+    steps:
+      - name: Checkout container repo
+        uses: actions/checkout@v4
+
+      - name: Restore signing private key from secret
+        env:
+          OTA_PRIVATE_KEY_PEM: ${{ secrets.OTA_PRIVATE_KEY_PEM }}
+        run: |
+          if [ -z "$OTA_PRIVATE_KEY_PEM" ]; then
+            echo "::error::secrets.OTA_PRIVATE_KEY_PEM 未配置（ed25519 私钥，用于签名内核包）"
+            exit 1
+          fi
+          mkdir -p keys
+          printf '%s' "$OTA_PRIVATE_KEY_PEM" > keys/ota-private.pem
+          chmod 600 keys/ota-private.pem
+          echo "private key restored -> keys/ota-private.pem"
+
+      - name: Verify welded public key anchor present
+        run: |
+          ANCHOR=app/src/main/assets/ota-public.pem
+          [ -f "$ANCHOR" ] || { echo "::error::缺少 $ANCHOR（设备端验签公钥锚点）"; exit 1; }
+          echo "anchor present: $(wc -c < "$ANCHOR") bytes"
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.KERNEL_REPO }}
+          ref: ${{ env.KERNEL_REF }}
+          path: kernel-src
+
+      - name: Build & sign kernel bundle
+        run: |
+          chmod +x scripts/build-kernel-bundle.sh
+          ./scripts/build-kernel-bundle.sh "$PWD/kernel-src" "$KERNEL_VER" "$KERNEL_ABI" "$OTA_URL_BASE"
+
+      - name: Upload bundle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-ota-${{ env.KERNEL_VER }}
+          path: |
+            release/kernel-${{ env.KERNEL_VER }}.zip
+            release/kernel-manifest.json
+          if-no-files-found: error
+
+      - name: Publish to Release
+        if: ${{ github.event.inputs.publish == 'true' || startsWith(github.ref, 'refs/tags/kernel-ota-') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "kernel-${{ env.KERNEL_VER }}" \
+            release/kernel-${{ env.KERNEL_VER }}.zip \
+            release/kernel-manifest.json \
+            --title "Kernel OTA ${{ env.KERNEL_VER }}" \
+            --notes "Signed kernel OTA bundle (abi=${{ env.KERNEL_ABI }}). Verify with welded APK public key."
