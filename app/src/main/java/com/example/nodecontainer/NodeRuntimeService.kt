@@ -52,6 +52,13 @@ class NodeRuntimeService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         RuntimeDiagnostics.clear(this)
         keepRunning = true
+        // 先把预置体检结果写进诊断（PROVISIONING §4），再拉起 HostBridge 与内核 ——
+        // 这样即使内核起不来，屏幕上也能看到「设备到底具备哪些控制面能力」。
+        try {
+            ProvisioningProbe.run(this)
+        } catch (e: Throwable) {
+            RuntimeDiagnostics.append(this, "probe", false, "预置体检异常", "${e::class.java.simpleName}: ${e.message}")
+        }
         // 先拉起 HostBridge（UDS 能力桥），再启动内核
         startHostBridge()
         scope.launch { supervisorLoop() }

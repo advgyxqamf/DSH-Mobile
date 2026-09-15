@@ -61,6 +61,7 @@ const METHODS = {
 
   'sys.info':             { group: 'system', caps: ['base'] },
   'sys.setTime':          { group: 'system', caps: ['device_owner'], audit: true },
+  'sys.setTimeZone':      { group: 'system', caps: ['device_owner'], audit: true },
   'sys.reboot':           { group: 'system', caps: ['device_owner'], audit: true },
 };
 

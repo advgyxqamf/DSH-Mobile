@@ -7,7 +7,7 @@
 
 ## 1. 结论
 
-**L0 容器底座已完整落地并自测通过。** 内核（L1）现在能被真正拉起：容器写 `runtime.json`、注入 `DSH_ANDROID` 环境、spawn `node bin/dsh-supervisor daemon`、健康检查、退避重启；通道一（签名 OTA）端到端打通（签名→打包→验签→解包→原子指针切换→坏包拦截）；HostBridge 走 UDS 并实现 8 组方法 + 能力协商 + 审计；开机自启、Device Owner、无障碍三件套就位。
+**L0 容器底座已完整落地并自测通过。** 内核（L1）现在能被真正拉起：容器写 `runtime.json`、注入 `DSH_ANDROID` 环境、spawn `node bin/dsh-supervisor daemon`、健康检查、退避重启；通道一（签名 OTA）端到端打通（签名→打包→验签→解包→原子指针切换→坏包拦截）；HostBridge 走 UDS 并实现 8 组方法 + 能力协商 + 审计；开机自启、Device Owner、无障碍三件套就位。**2026-09 补齐 P1（预置自检探针 + Device Owner API 修正）与 P2（无障碍真实实现，`ui_automation` 整组解锁）。**
 
 ---
 
@@ -37,7 +37,9 @@
 - HostBridgeService：UDS 监听（抽象命名空间 `dsh_hostbridge`）、JSON-RPC 2.0、握手协商 `capabilities/groups`、8 组方法分发、能力门禁（`-32001`/`-32601`）、审计日志。
 - 落地能力方法（设备已有对应权限时真实执行）：`sys.info`、`notif.post`、`app.listInstalled`、`app.launch`、`app.openUrl`（**内核 browser.open 的承接方**，ACTION_VIEW）、`app.stop`、以及 **Device Owner 全组**（`policy.lockNow/setPassword/wipe/setKiosk/addUserRestriction`、`sys.setTime/sys.reboot`、`app.install/uninstall/grantPermission`）。
 - 组级能力语义：`GROUP_REQUIRED`（每组**代表能力**）判定「组是否可用」；特权方法另由**方法级 caps** 单独门禁 —— 与内核侧 `methods.js` 已逐条对齐（2026-09 收敛）。
-- BootReceiver（开机自启）、DeviceAdminReceiver（Device Owner 激活）、DshAccessibilityService（无障碍声明）、MainActivity（诊断面板 + 内核 UI iframe + `dsh:kernel-update-request/result` 桥）。
+- BootReceiver（开机自启）、DeviceAdminReceiver（Device Owner 激活）、MainActivity（诊断面板 + 内核 UI iframe + `dsh:kernel-update-request/result` 桥）。
+- **DshAccessibilityService（P2 真实实现，2026-09）**：`dispatchGesture` 手势（tap/swipe）、`getWindows + rootInActiveWindow` 节点树递归采集（含 IME/悬浮窗）、`ACTION_SET_TEXT` 文本注入（含 `ACTION_PASTE` 降级）、`waitForNode` 条件轮询；以进程内单例 `instance` 与 HostBridgeService 对接。
+- **ProvisioningProbe（P1 预置自检探针，2026-09）**：开机跑 5 项体检（device-owner / accessibility / shizuku / mediaprojection / special-perms），结果写 `files/diagnostics.txt`（人读）+ `files/provisioning.json`（机器读）。
 
 ---
 
@@ -45,10 +47,16 @@
 
 这些是**能力增强**，不是“底座缺失”——地基已通，下面是墙和屋顶：
 
-1. **ui_automation / shell / storage / build 方法组为能力门禁占位**：当前在未预置对应能力时返回 `-32001`（符合 spec 降级语义）。真实手势执行、Shizuku shell、MANAGE_EXTERNAL_STORAGE 文件访问、内置 APK 构建链需在集成分支填充（依赖无障碍/Shizuku/特殊权限的实际开启）。
+1. **ui_automation 已落地，其余三组仍为能力门禁占位**：
+   - ✅ `ui.tap / ui.swipe / ui.inputText / ui.getUiTree / ui.waitFor` —— **P2 真实实现**，无障碍服务连接后即可用。
+   - ⏳ `ui.screenshot` —— 需 MediaProjection（P5），恒返回 `-32001`。
+   - ⏳ `bridge:shell` 整组 —— 需 Shizuku（P4）；容器**未内置 Shizuku SDK**，即使设备已装 Shizuku，`shell.exec` 仍返回 `-32001`。
+   - ⏳ `bridge:storage` 整组 —— Manifest 已声明 `MANAGE_EXTERNAL_STORAGE`（2026-09 补齐），但 `fs.*` 方法体**仍是占位**；授权后需实现文件读写。
+   - ⏳ `bridge:build` 整组 —— 内置构建链（P3）尚需 APK 资产打包决策（全内置 vs 首启下载 vs 最小子集）。
 2. **OTA 下发编排**：`OtaEngine` 已具备验签/解包/原子指针能力；设备上“轮询 manifest→下载→apply→回滚”的调度器由内核侧 bootstrap（Node）承接，本仓未内置一个独立 Kotlin OTA 调度器（按 BASE_SPEC §5，OTA 引擎逻辑归于内核引导）。
 3. **基线内核 `assets/kernel/baseline.zip`**：`KernelManager.ensureBaseline` 已支持首启离线落地，但本仓未内置基线内核包（由 `kernel-ota.yml` 构建产出后纳入）。
-4. **Kotlin 未编译验证**：沙箱无 Android SDK/NDK，M3 代码经人工评审与 API 正确性核对，未经 Gradle 编译；真实出包见 `build-apk.yml`（需公网 CI）。
+4. **Kotlin 未编译验证**：沙箱无 Android SDK/NDK，M3 代码经人工评审与 API 正确性核对，未经 Gradle 编译；真实出包见 `build-apk.yml`（需公网 CI）。**P1/P2 与 P3 合并为一次 CI 出包 + 真机验证。**
+5. **`policy.setPassword` 属遗留路径**：`DevicePolicyManager.resetPassword` 自 API 30 废弃且多数设备不生效，实现保留但已返回 `note` 提示；建议改用 user restrictions 或应用内锁。
 
 ---
 

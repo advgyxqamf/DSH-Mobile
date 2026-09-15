@@ -10,8 +10,20 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <!-- Android 14+ (API 34) 要求显式声明前台服务类型；dataSync 贴切“本地运行时”语义 -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- P5 MediaProjection 截屏所需的前台服务类型（提前声明，避免届时要重编 APK 权限面） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- Android 13+ 通知授权 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      外部存储全量访问（bridge:storage 的代表能力）。
+      ⚠ 这是 AppOps 特殊权限（非运行时权限）：Manifest 声明后，还需跳到
+        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION 由用户/Device Owner 授权，
+        授权后 Environment.isExternalStorageManager() 才为 true。
+      tools:ignore 抑制 Lint 对「全文件访问」的强提示（本应用定位即为受管设备上的容器）。
+    -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
 
     <!-- 开机/重启后自启容器（拉起 NodeRuntimeService） -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />

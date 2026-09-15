@@ -82,11 +82,14 @@ class BridgeServer {
       case 'notif.post': return { posted: true, title: params.title, text: params.text };
       case 'notif.read': return { notifications: [] };
       case 'sys.info': return { device: 'mock-android', apiLevel: 35, arch: 'arm64' };
-      case 'ui.getUiTree': return { nodes: [] };
-      case 'ui.tap': return { tapped: true, x: params.x, y: params.y };
-      case 'ui.swipe': return { swiped: true };
-      case 'ui.inputText': return { input: true };
-      case 'ui.waitFor': return { found: false };
+      // ui_automation：与 Kotlin 真实实现的返回结构对齐（P2，2026-09）。
+      // Kotlin 侧 ui.* 返回 {ok:bool}（getUiTree 返回 {windows,windowCount,truncated}）
+      case 'ui.getUiTree': return { windows: [], windowCount: 0, truncated: false };
+      case 'ui.tap': return { ok: true };
+      case 'ui.swipe': return { ok: true };
+      case 'ui.inputText': return { ok: true };
+      case 'ui.waitFor': return { found: false, elapsedMs: params.timeoutMs || 0 };
+      case 'ui.screenshot': return { ok: false, note: 'MediaProjection 未落地（P5）' };
       case 'fs.list': return { entries: [] };
       case 'fs.read': return { content: '' };
       case 'fs.mkdir': return { created: params.path };
@@ -96,15 +99,16 @@ class BridgeServer {
       case 'app.openUrl': return { opened: true, url: params.url };
       case 'app.stop': return { stopped: params.pkg };
       case 'policy.lockNow': return { locked: true };
-      case 'policy.setPassword': return { set: true };
-      case 'policy.wipe': return { wiped: true };
-      case 'policy.setKiosk': return { kiosk: params.pkg };
-      case 'policy.addUserRestriction': return { added: params.key };
-      case 'app.install': return { installed: params.apkPath };
-      case 'app.uninstall': return { uninstalled: params.pkg };
-      case 'app.grantPermission': return { granted: params.pkg, perm: params.perm };
-      case 'sys.setTime': return { set: true };
-      case 'sys.reboot': return { reboot: true };
+      case 'policy.setPassword': return { ok: true };
+      case 'policy.wipe': return { ok: true };
+      case 'policy.setKiosk': return { kiosk: params.pkg ? [params.pkg] : [] };
+      case 'policy.addUserRestriction': return { ok: true };
+      case 'app.install': return { installing: params.apkPath };
+      case 'app.uninstall': return { uninstalling: params.pkg };
+      case 'app.grantPermission': return { granted: true };
+      case 'sys.setTime': return { ok: true };
+      case 'sys.reboot': return { ok: true };
+      case 'sys.setTimeZone': return { ok: true, timeZone: params.timeZone };
       case 'shell.exec': return new Promise((resolve, reject) => {
         execFile(params.cmd || 'echo', params.args || ['ok'], { timeout: 5000 }, (err, stdout) => {
           if (err) reject(err); else resolve({ exitCode: 0, stdout: String(stdout) });

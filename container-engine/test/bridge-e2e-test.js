@@ -54,6 +54,25 @@ function call(cli, id, method, params) {
   const un = await call(cli, 5, 'nope.x', {});
   check('未知方法 METHOD_NOT_FOUND(-32601)', un.error && un.error.code === -32601);
 
+  // P2（2026-09）：ui_automation 真实实现的**返回结构契约**（与 Kotlin 侧对齐）
+  const tap = await call(cli, 6, 'ui.tap', { x: 10, y: 20 });
+  check('ui.tap（accessibility）成功且返回 {ok:true}', tap.result && tap.result.ok === true);
+
+  const tree = await call(cli, 7, 'ui.getUiTree', {});
+  check('ui.getUiTree 返回 windows 结构',
+    tree.result && Array.isArray(tree.result.windows) && typeof tree.result.windowCount === 'number');
+
+  const wf = await call(cli, 8, 'ui.waitFor', { selector: { text: 'x' }, timeoutMs: 100 });
+  check('ui.waitFor 返回 found/elapsedMs', wf.result && wf.result.found === false && typeof wf.result.elapsedMs === 'number');
+
+  // ui.screenshot 需 mediaprojection（本用例未预置）→ 方法级门禁拦截
+  const ss = await call(cli, 9, 'ui.screenshot', {});
+  check('ui.screenshot 缺 mediaprojection 被拒(-32001)', ss.error && ss.error.code === -32001);
+
+  // sys.setTimeZone 与 sys.setTime 同属 system 组、同需 device_owner
+  const tz = await call(cli, 10, 'sys.setTimeZone', { timeZone: 'Asia/Shanghai' });
+  check('sys.setTimeZone（device_owner）成功', tz.result && tz.result.ok === true);
+
   const log = fs.existsSync(audit) ? fs.readFileSync(audit, 'utf8') : '';
   check('审计日志含 policy.lockNow（特权）', log.includes('policy.lockNow'));
   check('审计日志含握手记录', log.includes('handshake'));

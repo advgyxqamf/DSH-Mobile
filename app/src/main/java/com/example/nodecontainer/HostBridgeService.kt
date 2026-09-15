@@ -164,19 +164,26 @@ class HostBridgeService : Service() {
         try {
             if (dpm.isDeviceOwnerApp(packageName)) caps.add("device_owner")
         } catch (_: Throwable) {}
-        if (accessibilityEnabled()) caps.add("accessibility")
-        // 本参考实现不内置 Shizuku / 构建链 / MediaProjection；真实集成分支再置位。
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && android.os.Environment.isExternalStorageManager())
+        // accessibility 以**服务实例已连接**为准，而非仅看 Settings 字符串：
+        // 字符串可能在服务被系统回收后仍残留，会导致 ui.* 方法通过门禁却在执行时 NullPointer。
+        if (DshAccessibilityService.isReady()) caps.add("accessibility")
+        // 仍未内置：Shizuku（P4）/ 构建链（P3）/ MediaProjection（P5）。
+        // 这三项置位后，bridge:shell / bridge:build / ui.screenshot 会自动解锁，无需改动此处以外的代码。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager())
             caps.add("manage_external_storage")
         if (notificationListenerEnabled()) caps.add("notification_access")
         return caps
     }
 
-    private fun accessibilityEnabled(): Boolean {
+    /**
+     * 无障碍服务是否已在系统设置中启用（字符串层面）。
+     * ⚠ 只用于**诊断探针**展示配置状态；能力门禁请用 [DshAccessibilityService.isReady]。
+     */
+    private fun accessibilityEnabledInSettings(): Boolean {
         val enabled = try {
             Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES) ?: ""
         } catch (_: Throwable) { "" }
-        return enabled.split(":").any { it.contains("DshAccessibilityService") || it.endsWith("${packageName}/${packageName}.DshAccessibilityService") }
+        return enabled.split(":").any { it.contains("DshAccessibilityService") }
     }
 
     private fun notificationListenerEnabled(): Boolean {
@@ -226,6 +233,15 @@ class HostBridgeService : Service() {
         return dpm
     }
 
+    /**
+     * 取无障碍服务实例；未连接则抛 -32001。
+     * 能力门禁已在 dispatch 前置（caps 含 "accessibility"），此处是**二次确认**，
+     * 覆盖「门禁通过后服务恰好被系统回收」的竞态窗口。
+     */
+    private fun requireA11y(): DshAccessibilityService =
+        DshAccessibilityService.instance
+            ?: throw BridgeError(CODE_CAPABILITY_MISSING, "无障碍服务未连接（请在系统设置中开启 DSH 无障碍服务）")
+
     private val METHODS: Map<String, MethodDef> = mapOf(
         // 3.8 system
         "sys.info" to MethodDef(listOf("base"), false) { _ ->
@@ -238,8 +254,40 @@ class HostBridgeService : Service() {
             }
         },
         "sys.setTime" to MethodDef(listOf("device_owner"), true) { p ->
-            requireDpm().setTime(deviceAdmin, p.optLong("time", System.currentTimeMillis()))
+            // DevicePolicyManager.setTime 为 API 28+，且**仅当系统自动对时关闭时生效**：
+            // Settings.Global.AUTO_TIME == 0 才可写，否则 setTime 静默返回 false（无异常、无效果）。
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                throw BridgeError(CODE_CAPABILITY_MISSING, "setTime 需 Android 9 (API 28)+，当前 API ${Build.VERSION.SDK_INT}")
+            }
+            val autoTime = Settings.Global.getInt(contentResolver, Settings.Global.AUTO_TIME, 1)
+            if (autoTime != 0) {
+                throw BridgeError(
+                    CODE_CAPABILITY_MISSING,
+                    "系统自动对时开启（AUTO_TIME=1），setTime 无效；请先关闭自动对时"
+                )
+            }
+            val m = requireDpm()
+            val ok = m.setTime(deviceAdmin, p.optLong("time", System.currentTimeMillis()))
+            if (!ok) throw BridgeError(CODE_INTERNAL, "setTime 被系统拒绝（返回 false）")
             JSONObject().apply { put("ok", true) }
+        },
+        "sys.setTimeZone" to MethodDef(listOf("device_owner"), true) { p ->
+            // 同样 API 28+，且需 AUTO_TIME_ZONE == 0。
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
+                throw BridgeError(CODE_CAPABILITY_MISSING, "setTimeZone 需 Android 9 (API 28)+")
+            }
+            val autoZone = Settings.Global.getInt(contentResolver, Settings.Global.AUTO_TIME_ZONE, 1)
+            if (autoZone != 0) {
+                throw BridgeError(
+                    CODE_CAPABILITY_MISSING,
+                    "自动设置时区开启（AUTO_TIME_ZONE=1），setTimeZone 无效"
+                )
+            }
+            val tz = p.optString("timeZone", "")
+            if (tz.isEmpty()) throw BridgeError(CODE_INVALID_PARAM, "timeZone 为空（需 Olson ID，如 Asia/Shanghai）")
+            val ok = requireDpm().setTimeZone(deviceAdmin, tz)
+            if (!ok) throw BridgeError(CODE_INTERNAL, "setTimeZone 被系统拒绝（返回 false）")
+            JSONObject().apply { put("ok", true); put("timeZone", tz) }
         },
         "sys.reboot" to MethodDef(listOf("device_owner"), true) { _ ->
             requireDpm().reboot(deviceAdmin, null)
@@ -322,18 +370,51 @@ class HostBridgeService : Service() {
             JSONObject().apply { put("locked", true) }
         },
         "policy.setPassword" to MethodDef(listOf("device_owner"), true) { p ->
+            // ⚠ DevicePolicyManager.resetPassword(String, int) 自 **API 30 起废弃** 且仅对
+            // 「已配置密码强度但尚未设密码」的设备生效；现代设备上基本无效。
+            // 该能力属遗留路径，保留实现但显式提示调用方改用 user restrictions / 应用内锁。
             val m = requireDpm()
             m.setPasswordQuality(deviceAdmin, p.optInt("type", DevicePolicyManager.PASSWORD_QUALITY_NUMERIC))
-            m.resetPassword(p.optString("pwd", ""), 0)
-            JSONObject().apply { put("ok", true) }
+            @Suppress("DEPRECATION")
+            val ok = m.resetPassword(p.optString("pwd", ""), 0)
+            JSONObject().apply {
+                put("ok", ok)
+                if (!ok) put("note", "resetPassword 已废弃(API 30)且多数设备不生效；建议改用 user restriction")
+            }
         },
         "policy.wipe" to MethodDef(listOf("device_owner"), true) { p ->
-            requireDpm().wipeData(p.optInt("flags", 0))
+            // ⚠ wipeData(int) 自 API 29 起废弃，替代品 wipeData(int, CharSequence)。
+            // flags 语义未变；reason 作为审计留痕（Android 10+ 要求非空）。
+            val m = requireDpm()
+            val flags = p.optInt("flags", 0)
+            val reason = p.optString("reason", "DSH remote wipe")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                m.wipeData(flags, reason)
+            } else {
+                @Suppress("DEPRECATION")
+                m.wipeData(flags)
+            }
             JSONObject().apply { put("ok", true) }
         },
         "policy.setKiosk" to MethodDef(listOf("device_owner"), true) { p ->
-            requireDpm().setLockTaskPackages(deviceAdmin, arrayOf(p.optString("pkg", packageName)))
-            JSONObject().apply { put("kiosk", p.optString("pkg", "")) }
+            // Device Owner 专用：把目标包加入 lock task 白名单。
+            // ⚠ API 34 (UPSIDE_DOWN_CAKE) 起 lock task features 与 packages 捆绑为同一策略，
+            //   必须显式调用 setLockTaskFeatures，否则部分机型上报 SecurityException。
+            val m = requireDpm()
+            val pkgs = p.optJSONArray("packages")?.let { arr ->
+                (0 until arr.length()).map { arr.optString(it, "") }.filter { it.isNotBlank() }
+            } ?: listOf(p.optString("pkg", packageName))
+            val target = if (pkgs.isEmpty()) listOf(packageName) else pkgs
+            m.setLockTaskPackages(deviceAdmin, target.toTypedArray())
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                // 若调用方要求进入 kiosk 模式，一并开启 features（含 LOCK_TASK_FEATURE_NONE=0 表示仅白名单）
+                val features = p.optInt("features", DevicePolicyManager.LOCK_TASK_FEATURE_NONE)
+                m.setLockTaskFeatures(deviceAdmin, features)
+            }
+            JSONObject().apply {
+                put("kiosk", JSONArray(target))
+                put("note", "已加入 lock task 白名单；调用方需再 startLockTask() 进入锁定态")
+            }
         },
         "policy.addUserRestriction" to MethodDef(listOf("device_owner"), true) { p ->
             val key = p.optString("key", "")
@@ -341,14 +422,59 @@ class HostBridgeService : Service() {
             if (r != null) requireDpm().addUserRestriction(deviceAdmin, r)
             JSONObject().apply { put("ok", r != null) }
         },
-        // 3.2 ui_automation / 3.3 shell / 3.5 storage / 3.6 build：需辅助功能/Shizuku/存储权限/构建链。
-        // 本参考实现未内置这些子系统，能力缺失时返回 -32001（与 spec 降级语义一致）。
-        "ui.tap" to MethodDef(listOf("accessibility"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 Accessibility/Shizuku") },
-        "ui.swipe" to MethodDef(listOf("accessibility"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 Accessibility/Shizuku") },
-        "ui.inputText" to MethodDef(listOf("accessibility"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 Accessibility/Shizuku") },
-        "ui.getUiTree" to MethodDef(listOf("accessibility"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 Accessibility/Shizuku") },
-        "ui.screenshot" to MethodDef(listOf("mediaprojection"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 MediaProjection") },
-        "ui.waitFor" to MethodDef(listOf("accessibility"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 Accessibility/Shizuku") },
+        // 3.2 ui_automation —— 真实实现（DshAccessibilityService，P2 落地）。
+        // 服务未连接时 requireA11y() 抛 -32001；方法级 caps 已由 dispatch 前置门禁。
+        "ui.tap" to MethodDef(listOf("accessibility"), true) { p ->
+            val a11y = requireA11y()
+            val ok = a11y.performTap(
+                p.optDouble("x", 0.0).toFloat(),
+                p.optDouble("y", 0.0).toFloat(),
+                p.optLong("durationMs", 60L)
+            )
+            JSONObject().apply { put("ok", ok) }
+        },
+        "ui.swipe" to MethodDef(listOf("accessibility"), true) { p ->
+            val a11y = requireA11y()
+            val ok = a11y.performSwipe(
+                p.optDouble("x1", 0.0).toFloat(), p.optDouble("y1", 0.0).toFloat(),
+                p.optDouble("x2", 0.0).toFloat(), p.optDouble("y2", 0.0).toFloat(),
+                p.optLong("durationMs", 300L)
+            )
+            JSONObject().apply { put("ok", ok) }
+        },
+        "ui.inputText" to MethodDef(listOf("accessibility"), true) { p ->
+            val a11y = requireA11y()
+            val text = p.optString("text", "")
+            if (p.has("selector") && p.optJSONObject("selector")?.length() == 0) {
+                throw BridgeError(CODE_INVALID_PARAM, "selector 不能为空对象")
+            }
+            val ok = a11y.inputText(text, p.optJSONObject("selector"))
+            JSONObject().apply { put("ok", ok) }
+        },
+        "ui.getUiTree" to MethodDef(listOf("accessibility"), false) { p ->
+            val a11y = requireA11y()
+            // 读屏属 BRIDGE_PROTOCOL §5 审计项，但 getUiTree 是只读观测；此处保留 audit=true
+            // （与 methods.js 对齐：getUiTree 未标 audit，故此处也不落审计）
+            a11y.dumpUiTree(
+                maxNodes = p.optInt("maxNodes", 3000),
+                maxDepth = p.optInt("maxDepth", 40)
+            )
+        },
+        "ui.screenshot" to MethodDef(listOf("mediaprojection"), true) { _ ->
+            throw BridgeError(CODE_CAPABILITY_MISSING, "需 MediaProjection（P5 未落地）")
+        },
+        "ui.waitFor" to MethodDef(listOf("accessibility"), false) { p ->
+            val a11y = requireA11y()
+            val selector = p.optJSONObject("selector")
+                ?: throw BridgeError(CODE_INVALID_PARAM, "waitFor 需要 selector")
+            a11y.waitForNode(
+                selector,
+                timeoutMs = p.optLong("timeoutMs", 10_000L),
+                intervalMs = p.optLong("intervalMs", 250L)
+            )
+        },
+        // 3.3 shell / 3.5 storage / 3.6 build：仍为能力门禁占位（P3/P4/P5 待落地）。
+        // 能力缺失时返回 -32001（与 spec 降级语义一致）。
         "shell.exec" to MethodDef(listOf("shizuku"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 Shizuku/无线调试") },
         "fs.read" to MethodDef(listOf("manage_external_storage"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 MANAGE_EXTERNAL_STORAGE") },
         "fs.write" to MethodDef(listOf("manage_external_storage"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "需 MANAGE_EXTERNAL_STORAGE") },
