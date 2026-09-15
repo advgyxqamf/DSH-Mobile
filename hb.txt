@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 47
-time : Tue Sep 15 20:36:11 UTC 2026
+beat : 48
+time : Tue Sep 15 20:36:58 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.7GB
+mem  : avail=13.3GB
 cgmax: n/a
-load : 3.00 3.00 2.76
-logsize: 6273674
+load : 3.00 3.00 2.77
+logsize: 6333750
 objs   : host=961 target=2124
 oomhits: 0
 0
-lastprog:   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_base_without_compiler/deps/v8/src/codegen/code-desc.o ../deps/v8/src/codegen/code-desc.cc
+lastprog:   100 |   __attribute__ ((__deprecated__ ("use '" ALT "' instead")))       |                   ^   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.
