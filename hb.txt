@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 74
-time : Tue Sep 15 20:57:08 UTC 2026
+beat : 75
+time : Tue Sep 15 20:57:55 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.3GB
+mem  : avail=12.8GB
 cgmax: n/a
-load : 3.24 3.09 3.02
-logsize: 7680394
-objs   : host=1183 target=2124
+load : 3.10 3.07 3.02
+logsize: 7735787
+objs   : host=1201 target=2124
 oomhits: 0
 0
-lastprog:       |                   ^ 2 warnings generated.   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_base_without_compiler/deps/v8/src/objec
+lastprog:   100 |   __attribute__ ((__deprecated__ ("use '" ALT "' instead")))       |                   ^ 2 warnings generated. 
