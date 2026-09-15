@@ -34,6 +34,8 @@ on:
     paths-ignore:
       - '.github/**'
       - '**.md'
+      - 'docs/**'
+      - 'scripts/validate-workflow.py'
       - 'scripts/inject-*.py'
       - 'scripts/make-release.sh'
       - 'scripts/gh-access.sh'

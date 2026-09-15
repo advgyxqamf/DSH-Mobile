@@ -128,17 +128,45 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+          # 缓存 ~/.gradle（Gradle 发行包 + 依赖 jar + transform 结果）。
+          # 全新 runner 每次都要重下 gradle 发行包，这几乎是零成本的白赚。
+          cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      # 说明：不用第三方 setup-android action。
+      # ubuntu-latest runner 自带 Android SDK（ANDROID_SDK_ROOT 已设置），
+      # 自己装需要的包即可。用 setup-android@v3 实测会失败：
+      #   Warning: Failed to find package 'tools'
+      #   sdkmanager failed with exit code 1
+      # 它默认要装的 'tools' 包在新版 SDK 仓库里已不存在（被 cmdline-tools 取代）。
+      # build-apk.yml 当初也是因为类似原因弃用了该 action，这里遵循同样的做法。
+      - name: Show Android SDK env
+        run: |
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+          ls "$ANDROID_SDK_ROOT" 2>/dev/null || true
 
       - name: Install SDK packages
         run: |
-          echo "== 安装 platform-tools / platform 35 / build-tools 35.0.0 =="
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" 2>&1 | tail -5
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          ls "$ANDROID_HOME/platforms" || true
+          set -o pipefail
+          # 不显式设置 ANDROID_HOME/ANDROID_SDK_ROOT：runner 镜像自带的才是对的。
+          # 曾经写成 ANDROID_HOME: ${{ env.ANDROID_SDK_ROOT }}，而 workflow 级没定义
+          # 该变量 → 展开为空 → 反而把 runner 自带的值覆盖成空。
+          SDKMANAGER="$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          echo "== sdkmanager: $SDKMANAGER"
+          "$SDKMANAGER" --version 2>&1 | tail -1
+
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+
+          # compileSdk 必须 >= 35：androidx.core 1.15.0 / core-ktx 1.15.0 的
+          # AAR metadata 明确要求依赖方 compileSdk >= 35，否则 gradle 在
+          # :app:checkDebugAarMetadata 阶段直接失败。
+          echo "== 安装 platform-tools / platforms;android-35 / build-tools;35.0.0"
+          if ! "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0" 2>&1 | tail -5; then
+            echo "[error] sdkmanager 安装失败"
+            exit 1
+          fi
+          echo "== 已安装的 platforms:"
+          ls "$ANDROID_SDK_ROOT/platforms" 2>/dev/null | sed 's/^/    /'
 
       # ----------------------------------------------------------------------
       # 关键步骤：把预编译的 Node 运行时取回来，替代"现场编译 2~3 小时"。
