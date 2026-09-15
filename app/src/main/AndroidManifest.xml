@@ -85,6 +85,11 @@
             </intent-filter>
         </receiver>
 
+        <!-- PackageInstaller 会话结果回传（exported=false：PendingIntent 定向投递） -->
+        <receiver
+            android:name=".PackageInstallReceiver"
+            android:exported="false" />
+
         <!-- Device Owner 接收器（静默装卸/锁屏/密码/Kiosk/用户限制） -->
         <receiver
             android:name=".DeviceAdminReceiver"

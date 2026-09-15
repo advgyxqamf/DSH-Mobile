@@ -89,9 +89,8 @@ class HostBridgeService : Service() {
         try {
             val reader = BufferedReader(InputStreamReader(sock.inputStream))
             val out = sock.outputStream
-            var line: String?
-            while (running && reader.readLine().also { line = it } != null) {
-                val text = line ?: continue
+            while (running) {
+                val text = reader.readLine() ?: break
                 if (text.isBlank()) continue
                 try {
                     val msg = JSONObject(text)
@@ -290,7 +289,9 @@ class HostBridgeService : Service() {
             JSONObject().apply { put("ok", true); put("timeZone", tz) }
         },
         "sys.reboot" to MethodDef(listOf("device_owner"), true) { _ ->
-            requireDpm().reboot(deviceAdmin, null)
+            // ⚠ Android 的 DevicePolicyManager.reboot 只接受 ComponentName 一个参数
+            //   （桌面 Java 的 reboot(ComponentName, String) 在 android.jar 中不存在）。
+            requireDpm().reboot(deviceAdmin)
             JSONObject().apply { put("ok", true) }
         },
         // 3.7 notification
@@ -345,16 +346,50 @@ class HostBridgeService : Service() {
             JSONObject().apply { put("stopped", pkg) }
         },
         "app.install" to MethodDef(listOf("device_owner"), true) { p ->
-            val m = requireDpm()
+            // ⚠ DevicePolicyManager 没有 installPackage —— 静默安装的 API 是
+            //   PackageInstaller（须为 Device Owner + Manifest 声明 REQUEST_INSTALL_PACKAGES）。
+            //   这里走 PackageInstaller 的 createSession/write/commit 流程。
+            requireDpm() // 仅做 Device Owner 前置校验（静默安装的实际 API 走 PackageInstaller）
             val apk = p.optString("apkPath", "")
-            val uri = android.net.Uri.fromFile(File(apk))
-            m.installPackage(deviceAdmin, uri, 0, null)
-            JSONObject().apply { put("installing", apk) }
+            val f = File(apk)
+            if (!f.exists()) throw BridgeError(CODE_INVALID_PARAM, "APK 不存在: $apk")
+            val installer = packageManager.packageInstaller
+            val params = android.content.pm.PackageInstaller.SessionParams(
+                android.content.pm.PackageInstaller.SessionParams.MODE_FULL_INSTALL
+            )
+            // Device Owner 可申请 INSTALL_REPLACE_EXISTING 等；此处保持最小权限集。
+            val sessionId = installer.createSession(params)
+            installer.openSession(sessionId).use { session ->
+                f.inputStream().use { input ->
+                    session.openWrite("dsh", 0, f.length()).use { input.copyTo(it) }
+                }
+                val intent = Intent(this, PackageInstallReceiver::class.java)
+                    .putExtra(EXTRA_PKG, apk)
+                val pi = android.app.PendingIntent.getBroadcast(
+                    this, sessionId, intent,
+                    android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+                )
+                session.commit(pi.intentSender)
+            }
+            JSONObject().apply {
+                put("installing", apk)
+                put("sessionId", sessionId)
+                put("note", "已提交 PackageInstaller 会话；结果经广播回传，可轮询 app.listInstalled 确认")
+            }
         },
         "app.uninstall" to MethodDef(listOf("device_owner"), true) { p ->
-            val m = requireDpm()
-            m.uninstallPackage(deviceAdmin, p.optString("pkg", ""))
-            JSONObject().apply { put("uninstalling", p.optString("pkg", "")) }
+            // 同样：静默卸载走 PackageInstaller.uninstall（Device Owner 特权）。
+            val pkg = p.optString("pkg", "")
+            if (pkg.isEmpty()) throw BridgeError(CODE_INVALID_PARAM, "pkg 为空")
+            val intent = Intent(this, PackageInstallReceiver::class.java)
+                .setAction(PackageInstallReceiver.ACTION_UNINSTALLED)
+                .putExtra(EXTRA_PKG, pkg)
+            val pi = android.app.PendingIntent.getBroadcast(
+                this, pkg.hashCode(), intent,
+                android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+            )
+            packageManager.packageInstaller.uninstall(pkg, pi.intentSender)
+            JSONObject().apply { put("uninstalling", pkg) }
         },
         "app.grantPermission" to MethodDef(listOf("device_owner"), true) { p ->
             val m = requireDpm()
@@ -506,6 +541,9 @@ class HostBridgeService : Service() {
         const val CODE_INVALID_PARAM = -32602
         const val CODE_METHOD_NOT_FOUND = -32601
         const val CODE_INTERNAL = -32603
+
+        /** PackageInstaller 回传广播里携带的目标（apk 路径或包名），见 PackageInstallReceiver。 */
+        const val EXTRA_PKG = "dsh_target"
 
         // 能力分组 -> 代表能力（用于握手时的 groups 交集）
         val GROUP_REQUIRED = mapOf(

@@ -99,7 +99,11 @@ class KernelManager(private val context: Context) {
             context.assets.open(baselineAsset).use { input ->
                 val zip = File(context.cacheDir, "kernel-baseline.zip")
                 zip.outputStream().use { out -> input.copyTo(out) }
-                val version = readVersionFromZip(zip) ?: return@use
+                val version = readVersionFromZip(zip)
+                if (version == null) {
+                    zip.delete()
+                    return@use null
+                }
                 val dest = File(kernelRoot, version).apply { mkdirs() }
                 unzip(zip, dest)
                 zip.delete()
@@ -131,6 +135,24 @@ class KernelManager(private val context: Context) {
             null
         } catch (_: Throwable) {
             null
+        }
+    }
+
+    /** 解压 zip 到 dest（自动建目录）。内核包是 .zip，走 java.util.zip 即可，无需外部依赖。 */
+    private fun unzip(zip: File, dest: File) {
+        java.util.zip.ZipInputStream(zip.inputStream()).use { zis ->
+            var entry = zis.nextEntry
+            while (entry != null) {
+                val out = File(dest, entry.name)
+                if (entry.isDirectory) {
+                    out.mkdirs()
+                } else {
+                    out.parentFile?.mkdirs()
+                    out.outputStream().use { os -> zis.copyTo(os) }
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
         }
     }
 

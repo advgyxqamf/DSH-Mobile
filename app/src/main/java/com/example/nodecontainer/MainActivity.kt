@@ -111,7 +111,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 读取内核只读版本端点（GET /guard/version）。失败返回 null（不阻断更新流程）。 */
     private fun tryReadKernelVersion(): String? = try {
-        val c = java.net.URL("http://127.0.0.1:$KERNEL_CONTROL_PORT/guard/version").openConnection() as java.net.HttpURLConnection
+        val c = java.net.URL("http://127.0.0.1:${NodeRuntimeService.KERNEL_CONTROL_PORT}/guard/version").openConnection() as java.net.HttpURLConnection
         c.connectTimeout = 500
         c.readTimeout = 500
         c.requestMethod = "GET"
@@ -167,7 +167,7 @@ class MainActivity : AppCompatActivity() {
         retryBtn.visibility = View.GONE
         webView.visibility = View.VISIBLE
         // 加载**内核同源托管**的宿主帧（非容器 assets）：宿主页与面板同源 → 面板写操作不被内核 403。
-        webView.loadUrl("http://127.0.0.1:$KERNEL_CONTROL_PORT/__host")
+        webView.loadUrl("http://127.0.0.1:${NodeRuntimeService.KERNEL_CONTROL_PORT}/__host")
     }
 
     private fun isPortUp(): Boolean = try {
