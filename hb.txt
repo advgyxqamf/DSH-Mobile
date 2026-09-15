@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 225
-time : Tue Sep 15 22:54:11 UTC 2026
+beat : 226
+time : Tue Sep 15 22:54:57 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
 mem  : avail=13.6GB
 cgmax: n/a
-load : 3.09 3.05 3.01
-logsize: 15855712
-objs   : host=2135 target=3359
+load : 3.04 3.04 3.01
+logsize: 15949660
+objs   : 137
 oomhits: 0
 0
-lastprog:   /usr/local/lib/android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release
+lastprog:   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/mksnapshot/deps/v8/src/snapshot/embedded/platform-embedded-file-writer-zos.o ../deps/v8/src/
