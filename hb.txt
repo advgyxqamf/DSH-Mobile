@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 252
-time : Tue Sep 15 23:15:06 UTC 2026
+beat : 253
+time : Tue Sep 15 23:15:52 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.2GB
+mem  : avail=13.8GB
 cgmax: n/a
-load : 3.22 3.16 3.06
-logsize: 16663064
-objs   : host=2146 target=3690
+load : 3.01 3.11 3.05
+logsize: 16796941
+objs   : host=2146 target=3723
 oomhits: 0
 0
-lastprog:   LD_LIBRARY_PATH=/tmp/tmp.FUXM8odFff/node/out/Release/lib.host:/tmp/tmp.FUXM8odFff/node/out/Release/lib.target:$LD_LIBRARY_PATH; export LD_LIBRARY_PATH; cd ../
+lastprog:   /usr/local/lib/android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release
