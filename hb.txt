@@ -1,14 +1,14 @@
 CI_HEARTBEAT
-beat : 49
-time : Tue Sep 15 20:37:45 UTC 2026
+beat : 50
+time : Tue Sep 15 20:38:32 UTC 2026
 stage: 7/9 NODE-BUILD (longest, V8 compile)
 run  : 35016859539
 sha  : 5bb8957aa55779304d442203d5d7ba8c7d930511
-mem  : avail=13.5GB
+mem  : avail=13.6GB
 cgmax: n/a
-load : 3.00 3.00 2.79
-logsize: 6385144
+load : 3.00 3.00 2.80
+logsize: 6446522
 objs   : host=983 target=2124
 oomhits: 0
 0
-lastprog:   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_base_without_compiler/deps/v8/src/codegen/reloc-info.o ../deps/v8/src/codegen/reloc-info.
+lastprog:   /usr/bin/clang++ -o /tmp/tmp.FUXM8odFff/node/out/Release/obj.host/v8_base_without_compiler/deps/v8/src/compiler-dispatcher/lazy-compile-dispatcher.o ../deps/v
