@@ -1,0 +1,13 @@
+CI_HEARTBEAT
+beat : 1
+time : Wed Sep 16 05:07:44 UTC 2026
+stage: boot
+run  : 35058257429
+sha  : 019720199c0ed21f2ea684df9d4b806d44f31bc6
+mem  : avail=14.0GB
+cgmax: n/a
+load : 1.59 0.41 0.14
+logsize: 0 (skipped: node build cache hit)
+objs   : n/a
+oomhits: n/a
+lastprog: (node build skipped — reused cached binary)
