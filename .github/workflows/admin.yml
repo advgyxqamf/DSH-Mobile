@@ -16,6 +16,9 @@ name: Admin (cancel / status)
 #    admin-cancel-<run_id>    取消指定 run
 #    admin-status-<run_id>    查询指定 run 状态 + artifact 列表
 #    admin-logs-<run_id>      拉取指定 run 的失败步骤日志（排查 CI 失败用）
+#    admin-apk-<run_id>       校验某 run 产物 APK 的 lib/ 内容 + ELF 形态校验
+#                             （沙箱下载不了 Release 附件 / artifact 302 到被屏蔽的
+#                              release-assets.githubusercontent.com，只能在 CI 侧验）
 #    admin-release[-<tag>]    查询 Release 附件（默认 apk-latest）
 #    admin-cancelall          取消所有 queued/in_progress 的 run（除自己）
 #
@@ -72,6 +75,15 @@ jobs:
             logs-*)
               echo "kind=logs"     >> "$GITHUB_OUTPUT"
               echo "target=${CMD#logs-}" >> "$GITHUB_OUTPUT" ;;
+            apk-*)
+              # 校验某个 run 产物 APK 的内容（主要看 lib/ 下有没有清单资产）。
+              #
+              # 为什么需要：维护沙箱的外网白名单不含 release-assets.githubusercontent.com，
+              # 下载不了 Release 附件；而 artifact 走 api.github.com 的 302 同样到不了。
+              # 所以「APK 里到底装了什么」这件事只能在 CI 侧验证 —— 不能让
+              # 「我本地验证过了」变成一句无法兑现的话。
+              echo "kind=apk"      >> "$GITHUB_OUTPUT"
+              echo "target=${CMD#apk-}" >> "$GITHUB_OUTPUT" ;;
             *)
               echo "[error] 未知动作: $CMD"
               echo "kind=unknown" >> "$GITHUB_OUTPUT"
@@ -180,6 +192,69 @@ jobs:
                 echo "(--log-failed 不可用，回退到全量日志的尾部)" >> "$OUT"
                 gh run view "$TARGET" --repo "$REPO" --log 2>&1 | tail -120 >> "$OUT" || true
               }
+              ;;
+
+            apk)
+              # 用 .github/native-assets.txt 作为期望清单（与 gradle / 构建脚本同一来源），
+              # 逐项核对 APK 内是否真有对应条目，并打印压缩方式。
+              echo "== run $TARGET 的 APK 内容校验 ==" >> "$OUT"
+              ABI="${ABI:-arm64-v8a}"
+              W="/tmp/apkchk"
+              rm -rf "$W"; mkdir -p "$W"
+
+              echo "  [1/3] 下载 artifact（android-node-container-apk）" >> "$OUT"
+              if ! gh run download "$TARGET" --repo "$REPO" \
+                     --name android-node-container-apk --dir "$W" >> "$OUT" 2>&1; then
+                echo "  [FAIL] artifact 下载失败（已过期？run 失败？）" >> "$OUT"
+              else
+                APK="$(find "$W" -name '*.apk' -type f | head -1)"
+                echo "  APK: $APK" >> "$OUT"
+                echo "  大小: $(stat -c%s "$APK") 字节" >> "$OUT"
+                echo "  sha256: $(sha256sum "$APK" | awk '{print $1}')" >> "$OUT"
+
+                echo >> "$OUT"
+                echo "  [2/3] APK 内 lib/ 条目" >> "$OUT"
+                unzip -l "$APK" | grep 'lib/' >> "$OUT" 2>&1 || echo "  (无 lib/ 条目 —— 严重异常)" >> "$OUT"
+
+                echo >> "$OUT"
+                echo "  [3/3] 逐项核对清单 .github/native-assets.txt" >> "$OUT"
+                MISS=""
+                for a in $(grep -v '^[[:space:]]*#' .github/native-assets.txt | grep -v '^[[:space:]]*$' | tr -d '\r'); do
+                  n=$(unzip -l "$APK" | grep -c "lib/${ABI}/$a" || true)
+                  if [ "$n" -ge 1 ]; then
+                    echo "    [ok]   lib/${ABI}/$a" >> "$OUT"
+                  else
+                    echo "    [FAIL] lib/${ABI}/$a 不在 APK 内" >> "$OUT"
+                    MISS="$MISS $a"
+                  fi
+                done
+                if [ -n "$MISS" ]; then
+                  echo >> "$OUT"
+                  echo "  结果: ✗ 缺少$MISS" >> "$OUT"
+                  echo "        APK 装到真机会因缺符号/缺运行时而失败。" >> "$OUT"
+                else
+                  echo >> "$OUT"
+                  echo "  结果: ✓ 清单内资产全部在 APK 内" >> "$OUT"
+                fi
+
+                echo >> "$OUT"
+                echo "  --- 压缩方式（Stored=未压缩 / Defl=压缩） ---" >> "$OUT"
+                unzip -v "$APK" | awk '$NF ~ /lib\// {print "    " $NF "  " $2 "  " $3 "  " $4}' >> "$OUT" 2>&1 || true
+
+                echo >> "$OUT"
+                echo "  --- 独立校验：解出 libnode.so 的 ELF 形态（exec 四道关） ---" >> "$OUT"
+                mkdir -p "$W/x"
+                if unzip -o -q "$APK" "lib/${ABI}/libnode.so" -d "$W/x" 2>/dev/null; then
+                  N="$W/x/lib/${ABI}/libnode.so"
+                  echo "    文件: $(file -b "$N")" >> "$OUT"
+                  echo "    e_machine/app:  $(readelf -h "$N" 2>/dev/null | awk -F: '/Machine/{print $2}' | xargs)" >> "$OUT"
+                  echo "    interp:  $(readelf -W -l "$N" 2>/dev/null | awk '/interpreter/{print $NF}' | head -1)" >> "$OUT"
+                  echo "    NEEDED:  $(readelf -d "$N" 2>/dev/null | awk '/NEEDED/{gsub(/[\[\]]/,"",$NF); printf "%s ", $NF}')" >> "$OUT"
+                  echo "    LOAD 对齐: $(readelf -W -l "$N" 2>/dev/null | awk '/^  LOAD/{print $NF}' | sort -u | tr '\n' ' ')" >> "$OUT"
+                else
+                  echo "    [skip] 解不出 libnode.so" >> "$OUT"
+                fi
+              fi
               ;;
 
             *)
