@@ -111,7 +111,7 @@ android {
             //
             // 清单缺失时**不静默降级**：直接 fail，避免打出一个看似正常、
             // 实则缺符号的 APK。
-            keepDebugSymbols += nativeAssetNames.map { "**/$it" }
+            keepDebugSymbols += nativeAssetNames().map { "**/$it" }
         }
     }
     // 注意：node 二进制现位于 jniLibs/arm64-v8a/libnode.so。
@@ -122,10 +122,17 @@ android {
 /**
  * 读 `.github/native-assets.txt`（NativeAssetRegistry 的投影）。
  *
- * 在配置阶段求值，因此文件缺失/为空会直接让构建失败 —— 这是刻意的：
- * 静默降级会产出「编译成功但真机跑不起来」的 APK，那种问题排查成本远高于一次构建失败。
+ * ⚠️ 必须是 **普通函数**，不能用 `val ... by lazy` 的委托属性：
+ * 在 Gradle Kotlin DSL 里，脚本体的 `val x by lazy {}` 其委托对象是在
+ * 脚本**求值过程中**才赋值的，而 `packaging { }` 这个 lambda 会在同一次
+ * 求值里先于该赋值执行 —— 于是拿到的是 null，报
+ *   `Cannot invoke "kotlin.Lazy.getValue()" because "<local1>" is null`
+ * （CI 真实踩过）。函数没有这个求值顺序问题。
+ *
+ * 文件缺失/为空时直接抛异常，**刻意不静默降级**：
+ * 否则会产出「编译成功但真机跑不起来」的 APK，排查成本远高于一次构建失败。
  */
-val nativeAssetNames: List<String> by lazy {
+fun nativeAssetNames(): List<String> {
     val f = rootProject.file(".github/native-assets.txt")
     if (!f.exists()) {
         throw GradleException(
@@ -139,7 +146,7 @@ val nativeAssetNames: List<String> by lazy {
     if (names.isEmpty()) {
         throw GradleException(".github/native-assets.txt 里没有任何资产名 —— 是不是被清空了？")
     }
-    names
+    return names
 }
 
 dependencies {

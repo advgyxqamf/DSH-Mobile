@@ -186,8 +186,8 @@ if (fs.existsSync(GRADLE_KTS)) {
   const g = stripKotlinComments(fs.readFileSync(GRADLE_KTS, 'utf8'));
   check(
     '② keepDebugSymbols 由清单派生（不是硬编码文件名）',
-    /keepDebugSymbols\s*\+=\s*nativeAssetNames\.map/.test(g),
-    '期望出现 keepDebugSymbols += nativeAssetNames.map { "**/$it" }'
+    /keepDebugSymbols\s*\+=\s*nativeAssetNames\(\)\.map/.test(g),
+    '期望出现 keepDebugSymbols += nativeAssetNames().map { "**/$it" }'
   );
   check(
     '② nativeAssetNames 读的是 .github/native-assets.txt',
@@ -198,6 +198,21 @@ if (fs.existsSync(GRADLE_KTS)) {
     '② 清单缺失时抛异常（不静默降级）',
     /GradleException/.test(g) && /native-assets\.txt/.test(g),
     '缺清单应直接 fail —— 否则会打出看似正常、实则缺符号的 APK'
+  );
+  // 反向：不应再用 `by lazy` 的委托属性。
+  // Gradle Kotlin DSL 里脚本体 `val x by lazy {}` 的委托对象在脚本求值过程中才赋值，
+  // 而 packaging { } lambda 会先于该赋值执行 → NPE：
+  //   Cannot invoke "kotlin.Lazy.getValue()" because "<local1>" is null
+  // CI 真实踩过，故加断言防回归。
+  check(
+    '② nativeAssetNames 用函数而非 by lazy（避免 Gradle 求值顺序 NPE）',
+    /fun\s+nativeAssetNames\s*\(\s*\)\s*:\s*List<String>/.test(g),
+    '必须写成 fun nativeAssetNames(): List<String>'
+  );
+  check(
+    '② 未见 `nativeAssetNames` 的 by lazy 委托写法',
+    !/val\s+nativeAssetNames[^\n]*by\s+lazy/.test(g),
+    'by lazy 会在 packaging{} 求值时抛 Lazy.getValue() NPE'
   );
   // 反向：不应再出现硬编码的 lib*.so 字面量（注释已剥离）
   const hardcoded = [...g.matchAll(/"\*\*\/([^"]+\.so)"/g)].map((m) => m[1]);
