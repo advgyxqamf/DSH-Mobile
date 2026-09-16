@@ -631,6 +631,66 @@ jobs:
           echo "    装配位置: /data/app/.../<pkg>-.../lib/arm64-v8a/libnode.so"
           echo "    运行期由 applicationInfo.nativeLibraryDir 定位并 exec。"
 
+      - name: Inject release keystore (optional, for stable signing)
+        id: signing
+        # =====================================================================
+        #  「设备能否自我升级 APK」的唯一开关。
+        # =====================================================================
+        #  本 workflow 产出的是**发布版 APK**，所以这一步比 fast-apk.yml 里
+        #  更重要：没有稳定签名，发布出来的包在已装设备上根本装不上去。
+        #
+        #  仍然**不 fail**（secret 未配置时构建照常，便于 fork/PR 场景），
+        #  但 ::warning:: 会显式说明"本包不具备升级能力"。
+        #
+        #  与 repack-apk.yml 复用同一组 secret 名（ANDROID_KEYSTORE_BASE64 等），
+        #  见 scripts/keygen-android-keystore.sh 头注释里的两把钥匙辨析。
+        # =====================================================================
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KS_KEYPASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -uo pipefail
+          # 写 stage，否则本步骤失败时诊断会显示**上一步**的名字
+          # （ci-stage 是"当前进行到哪"的唯一来源，不回写就会一直停在上一步）。
+          echo "7.5/9 signing" > /tmp/ci-stage
+          if [ -z "${KS_B64:-}" ]; then
+            echo "::warning title=未配置 APK 签名密钥::本次产物将使用一次性 debug 签名，\n\
+          无法覆盖安装到既有设备上（INSTALL_FAILED_UPDATE_INCOMPATIBLE）。\n\
+          发布包请配置 ANDROID_KEYSTORE_BASE64 等 secret。"
+            echo "[dsh-signing] 跳过：未配置 ANDROID_KEYSTORE_BASE64"
+            echo "NOT_SIGNED_STABLE" > /tmp/signing-state
+            exit 0
+          fi
+
+          mkdir -p keys
+          echo "$KS_B64" | base64 -d > keys/release.keystore
+          chmod 600 keys/release.keystore
+
+          {
+            echo "DSH_KEYSTORE_PASSWORD=${KS_PASS:-}"
+            echo "DSH_KEY_ALIAS=${KS_ALIAS:-dsh}"
+            echo "DSH_KEY_PASSWORD=${KS_KEYPASS:-${KS_PASS:-}}"
+          } >> "$GITHUB_ENV"
+
+          echo "SIGNED_STABLE" > /tmp/signing-state
+
+          # 立刻核验：能读出指纹才说明密码对、文件完整。
+          # 不核验的话，密码错要等整个 APK 构建完才在 apksigner 那步炸。
+          #
+          # ⚠ 正则必须匹配 "fingerprint"，不能写 "SHA256:" ——
+          #   keytool 实际输出的是：
+          #     Certificate fingerprint (SHA-256): DA:35:...
+          #   而不是 "SHA256:"。实测写 grep -E "SHA256:" 会**永不匹配**，
+          #   于是连健康路径也走 || 分支报错（本地实测踩到）。
+          #   注意 "SHA-256" 中间有连字符，故用 sha-?256 兼容两种写法。
+          keytool -list -keystore keys/release.keystore \
+            -storepass "${KS_PASS:-}" 2>/dev/null \
+            | grep -Ei 'fingerprint.*(sha-?256|sha1)' \
+            | sed 's/^/[dsh-signing] /' \
+            || { echo "::error title=keystore 校验失败::密码错误或文件损坏"; exit 1; }
+
       - name: Build debug APK
         id: gradlebuild
         run: |
@@ -829,6 +889,8 @@ jobs:
             echo "node-restore: ${{ steps.restorenode.outcome }}"
             echo "node-reused : ${{ steps.restorenode.outputs.cache-hit }}"
             echo "node-build  : ${{ steps.nodebuild.outcome }}"
+            # signing 决定产物"能不能装到已有设备上"，必须登记（同 enginetests 的理由）。
+            echo "signing     : ${{ steps.signing.outcome }}"
             echo "gradle-build: ${{ steps.gradlebuild.outcome }}"
             echo
             # 容器引擎测试的日志：它是最可能"秒级失败"的一步，
@@ -899,6 +961,8 @@ jobs:
             echo "node-restore: ${{ steps.restorenode.outcome }}"
             echo "node-reused : ${{ steps.restorenode.outputs.cache-hit }} (yes=跳过重编)"
             echo "node-build  : ${{ steps.nodebuild.outcome }}"
+            # signing 决定产物"能不能装到已有设备上"，必须登记（同 enginetests 的理由）。
+            echo "signing     : ${{ steps.signing.outcome }}"
             echo "gradle-build: ${{ steps.gradlebuild.outcome }}"
             echo
             if [ "${{ steps.restorenode.outputs.cache-hit }}" = "yes" ]; then

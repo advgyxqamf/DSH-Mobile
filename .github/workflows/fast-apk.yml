@@ -374,6 +374,65 @@ jobs:
           echo "$(grep -c '^PASS' /tmp/baseline-test.log || true) 个 PASS，$(grep -c '^FAIL' /tmp/baseline-test.log || true) 个 FAIL"
           exit $RC
 
+      - name: Inject release keystore (optional, for stable signing)
+        id: signing
+        # =====================================================================
+        #  「设备能否自我升级 APK」的唯一开关，别小看这一步。
+        # =====================================================================
+        #  未注入时 AGP 会用 runner 上现场生成的 debug keystore 签名 ——
+        #  指纹**每次都不同** ⇒ 新包覆盖安装到旧包上会
+        #  INSTALL_FAILED_UPDATE_INCOMPATIBLE ⇒ 设备自我升级走不通。
+        #
+        #  这里**不 fail**（secret 未配置是常态，本地/PR 场景不需要稳定签名），
+        #  但会打醒目的 ::warning:: —— 让"这次产物不能用来升级"这件事
+        #  留在 CI 日志里，而不是靠人去猜。
+        #
+        #  secret 命名复用 repack-apk.yml 已经用的那一组，不另立一套
+        #  （见 scripts/keygen-android-keystore.sh 头注释）。
+        #
+        #  与 OTA 内核签名（ed25519 / keys/ota-private.pem）**无关**，
+        #  两者是独立的信任根，详见 scripts/keygen-android-keystore.sh。
+        # =====================================================================
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KS_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KS_KEYPASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -uo pipefail
+          if [ -z "${KS_B64:-}" ]; then
+            echo "::warning title=未配置 APK 签名密钥::本次产物将使用一次性 debug 签名，\n\
+          无法覆盖安装到既有设备上（INSTALL_FAILED_UPDATE_INCOMPATIBLE）。\n\
+          若需要设备自我升级能力，请配置 ANDROID_KEYSTORE_BASE64 等 secret。"
+            echo "[dsh-signing] 跳过：未配置 ANDROID_KEYSTORE_BASE64"
+            exit 0
+          fi
+
+          mkdir -p keys
+          echo "$KS_B64" | base64 -d > keys/release.keystore
+          chmod 600 keys/release.keystore
+
+          # 密码经 GITHUB_ENV 传给 gradle（不写进命令行，避免出现在日志里）
+          {
+            echo "DSH_KEYSTORE_PASSWORD=${KS_PASS:-}"
+            echo "DSH_KEY_ALIAS=${KS_ALIAS:-dsh}"
+            echo "DSH_KEY_PASSWORD=${KS_KEYPASS:-${KS_PASS:-}}"
+          } >> "$GITHUB_ENV"
+
+          # 立刻核验：能读出指纹才说明密码对、文件完整。
+          # 不核验的话，密码错要等整个 APK 构建完才在 apksigner 那步炸。
+          # 立刻核验：能读出指纹才说明密码对、文件完整。
+          # 不核验的话，密码错要等整个 APK 构建完才在 apksigner 那步炸。
+          #
+          # ⚠ 正则匹配 "fingerprint" 而非 "SHA256:"（keytool 实际输出
+          #   "Certificate fingerprint (SHA-256): ..."，写 "SHA256:" 永不匹配，
+          #   会让健康路径也误报 keystore 校验失败 —— 本地实测踩到）。
+          keytool -list -keystore keys/release.keystore \
+            -storepass "${KS_PASS:-}" 2>/dev/null \
+            | grep -Ei 'fingerprint.*(sha-?256|sha1)' \
+            | sed 's/^/[dsh-signing] /' \
+            || { echo "::error title=keystore 校验失败::密码错误或文件损坏"; exit 1; }
+
       - name: Build debug APK
         run: |
           chmod +x gradlew

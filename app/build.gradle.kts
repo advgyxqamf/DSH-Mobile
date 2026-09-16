@@ -33,14 +33,100 @@ android {
         }
     }
 
+    // =========================================================================
+    //  签名配置：**从环境变量/密钥文件注入，缺失时退化为 debug 并显式警告**
+    // =========================================================================
+    //  为什么必须有这一段（这是一个真实的、用户可见的缺陷）：
+    //
+    //  此前本项目**没有任何 signingConfig** —— 每次 CI 出包都用 AGP 自动生成的
+    //  debug keystore（`~/.android/debug.keystore`，由 runner 现场生成，
+    //  指纹每次都不同）。后果是：
+    //
+    //    · `adb install -r` 新包 → INSTALL_FAILED_UPDATE_INCOMPATIBLE
+    //      （签名不一致，Android 拒绝覆盖安装）
+    //    · 「设备自我升级 APK」这条路彻底走不通 —— 而它是 A'（重打包路线）
+    //      与 app.install 静默升级能力的**共同绝对前提**
+    //    · 增量升级、灰度推送等一切依赖"应用身份稳定"的机制都不成立
+    //
+    //  所以这里让它可注入。设计上的三个取舍：
+    //
+    //  ① **可选而非必需**。没配密钥时**不报错**，退化为 debug 签名继续出包 ——
+    //     本项目大部分场景（本地开发、功能验证）只需要一个能装的包，
+    //     强制要求密钥会让这些场景全部卡住。
+    //
+    //  ② **但必须显式警告**。缺失时打 WARNING 并说明后果 ——
+    //     静默退化会让"发布包签名不稳定"这件事永远浮不出来，
+    //     而那正是上面三个后果的根源。
+    //
+    //  ③ **读文件而非只读环境变量**。密钥库是二进制，环境变量传它会
+    //     有很大的转义/长度风险。所以约定：CI 从 secret 解出文件放到
+    //     `keys/release.keystore`，这里按文件存在性判断
+    //     （`keys/` 整体 gitignored，与 ota-private.pem 一致）。
+    // =========================================================================
+    val releaseKeystore = rootProject.file("keys/release.keystore")
+    val hasReleaseKeystore = releaseKeystore.exists()
+
+    // 密码先取到局部不可变 val，再赋给 signingConfig。
+    //
+    // ⚠️ 不能写成 `storePassword = System.getenv(...) ?: ""` 后紧跟
+    //    `require(storePassword.isNotEmpty())` —— 会直接编译失败：
+    //      Smart cast to 'String' is impossible, because 'storePassword'
+    //      is a mutable property that could have been changed by this time
+    //    ApkSigningConfig 的这两个属性是 `var`，Kotlin 拒绝对可变属性做
+    //    智能转换。用局部 val 绕开，同时也让"读环境变量"只发生一次。
+    val keystorePw = System.getenv("DSH_KEYSTORE_PASSWORD") ?: ""
+    val keyPw = System.getenv("DSH_KEY_PASSWORD") ?: keystorePw
+    val keyAliasName = System.getenv("DSH_KEY_ALIAS") ?: "dsh"
+
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            create("release") {
+                storeFile = releaseKeystore
+                storePassword = keystorePw
+                keyAlias = keyAliasName
+                keyPassword = keyPw
+                // 校验：密码空着会让 apksigner 在**最后一步**才失败，
+                // 那时整个构建已经等了很久（release 构建含 native 交叉编译）。
+                // 这里前置报错，失败得越早越好。
+                require(keystorePw.isNotEmpty()) {
+                    "检测到 keys/release.keystore，但 DSH_KEYSTORE_PASSWORD 为空。" +
+                        "请设置该环境变量（CI: 由 secret 注入）。"
+                }
+                // V1/V2 都开：minSdk=24 的设备对 V2 支持良好，但 V1 保留可兼容
+                // 更老的安装器与某些加固/分发渠道。
+                enableV1Signing = true
+                enableV2Signing = true
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            // debug 构建也允许用稳定签名 —— 否则"开发期装两次要卸载重装"。
+            if (hasReleaseKeystore) signingConfig = signingConfigs.getByName("release")
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            if (hasReleaseKeystore) signingConfig = signingConfigs.getByName("release")
         }
+    }
+
+    // 构建期把签名状态打出来。放在这里（配置阶段）而不是某个 task 里，
+    // 是为了让它在**任何**任务执行时都出现在日志开头 —— 排查"装不上"时
+    // 第一眼就要看到"这个包到底是用什么签的"。
+    if (!hasReleaseKeystore) {
+        logger.warn(
+            "[dsh-signing] ⚠ 未找到 ${releaseKeystore.path} —— 本次产物将使用 AGP 自动生成的 " +
+                "debug 签名。后果：签名指纹每次都不同，新包无法覆盖安装到旧包上" +
+                "（INSTALL_FAILED_UPDATE_INCOMPATIBLE）。若这是发布构建，请配置密钥。" +
+                "本地可用 ./scripts/keygen-android-keystore.sh 生成。"
+        )
+    } else {
+        logger.lifecycle("[dsh-signing] 使用稳定签名: ${releaseKeystore.path}")
     }
 
     compileOptions {
