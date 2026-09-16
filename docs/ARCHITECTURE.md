@@ -287,6 +287,51 @@ GET maven.aliyun.com/repository/google/com/android/tools/build/aapt2/<V>/
 `files/kernel/<version>/` 下的一个数据目录，容器本来就有权改它。
 唯一缺的是「设备上从哪拿到新内核包」—— 这就是 `LocalKernelFeed` 补的那一步。
 
+### 2.4 两把独立的信任根（极易混淆，必须辨析）
+
+本项目有**两套密码学身份**，它们没有任何关系、不可互相替代。混用会导致
+"验签通过却装不上"这类极难定位的问题：
+
+| | APK 签名 | 内核签名 |
+|---|---|---|
+| 算法 | Java keystore（RSA 4096 / EC） | ed25519 |
+| 管什么 | 「这个 APK 是不是同一发布者发的」 | 「这个内核包是不是官方签的」 |
+| 信任锚点 | **设备上已装的那个包**的签名 | **焊死在 APK 里**的 `assets/ota-public.pem` |
+| 谁校验 | Android 安装器（PackageManager） | 设备端 `kernel-verify.js`（Node，随 APK 冻结） |
+| 生成 | `scripts/keygen-android-keystore.sh` | `scripts/keygen.sh` |
+| 产物 | `keys/release.keystore`（gitignored） | `keys/ota-private.pem`（gitignored） |
+
+两点容易搞反的推论：
+
+* 内核包签名正确 **≠** APK 能装到设备上。前者不影响安装器决策。
+* APK 签名稳定 **≠** 内核包可信。攻击者用自己的 keystore 重签一个 APK，
+  签名一样"稳定"，但里面的 `ota-public.pem` 换了 → 设备会拒装外来内核。
+
+### 2.5 为什么「稳定签名身份」是自我升级的前提
+
+原项目**没有任何 `signingConfig`** ⇒ 每次 CI 出包用 AGP 现场生成的
+debug keystore（runner 每次重建，指纹每次不同）⇒ 新包覆盖安装旧包时
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE`。
+
+这条链断掉的不只是一个便利功能，而是整条「设备自我升级」能力：
+
+* A'（重打包路线）依赖它 —— 新 APK 必须能装到旧 APK 上；
+* `app.install` 静默升级能力依赖它；
+* 增量升级、灰度推送等一切「应用身份稳定」机制都依赖它。
+
+现在 `app/build.gradle.kts` 从 `keys/release.keystore` 注入签名，CI 从
+secret 解码。三条路径的语义是刻意设计的：
+
+| 情形 | 行为 | 理由 |
+|---|---|---|
+| 有 keystore + 有密码 | 用稳定签名 | 正常发布路径 |
+| **无** keystore | WARNING 后退化 debug，**不阻断构建** | 本地开发/PR 只需能装的包；强制要求密钥会卡住所有这类场景 |
+| 有 keystore 但密码空 | **前置报错** | 否则要等整个构建（release 含 native 交叉编译）跑完才在 apksigner 那步炸 |
+
+⚠ **`keys/release.keystore` 一旦用于真实发布必须永久保存**：丢掉它 = 再也
+无法给已装该应用的设备推升级，只能让用户卸载重装（会清掉 `files/` 下全部
+内核与 Agent 数据）。Android 生态**没有"换回旧签名"的机制**。
+
 ---
 
 ## 3. 硬约束二：linker 找不到 `libc++_shared.so`
