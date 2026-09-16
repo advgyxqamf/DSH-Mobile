@@ -1,0 +1,8 @@
+BUILD_OK
+time    : Wed Sep 16 05:18:16 UTC 2026
+mode    : fast-apk (no Node rebuild)
+runtime : node-runtime-24.21.0-arm64-v8a
+sha     : 0197201
+apk     : app-debug.apk
+apk_sha : ff9ac7c634f545439369a1b5f71dc4d66aa22109febde6c32d9f13489a27b400
+url     : https://github.com/advgyxqamf/DSH-Mobile/releases/download/apk-latest/app-debug.apk
