@@ -212,10 +212,22 @@ CI 等价流程见 `.github/workflows/kernel-ota.yml`（用 `OTA_PRIVATE_KEY_PEM
 
 ```bash
 cd container-engine && npm test
-# sign-verify 6 / kernel-bundle 9 / ota-engine 12 / runtime-json 8 /
-# bridge-protocol 14 / bridge-e2e 14 / bridge-interop 14 / kernel-update-bridge 22 / e2e-mock-kernel 8
-# ⇒ 107 passed, 0 failed（9 套件）
+# native-assets 30 / sign-verify 6 / kernel-bundle 9 / kernel-selfboot 68 /
+# kernel-feed 23 / ota-engine 12 / runtime-json 8 / bridge-protocol 14 /
+# bridge-e2e 14 / bridge-interop 14 / kernel-update-bridge 22 / e2e-mock-kernel 8
+# ⇒ 228 passed, 0 failed（12 套件）
+#
+# 另有 kernel-baseline 8 条断言，但它验的是**构建产物**（app/src/main/assets/
+# kernel/baseline.zip，gitignored），所以单独拆成 test:baseline：
+#   npm run test:logic     逻辑测试（不依赖任何产物，CI 上必跑、秒级）
+#   npm run test:baseline  产物测试（需 DSH_REQUIRE_BASELINE=1 才强制）
+# 拆分理由：产物"存不存在"取决于流水线跑到哪一步，与"逻辑对不对"混在一起
+# 会让两者互相污染（曾导致一次必然假红）。
 ```
+
+注：`bridge-interop` 是**跨仓**测试（需要内核仓的 HostBridge 客户端）。
+内核仓不在时它显式 SKIP 并说明"未验证什么"，而不是崩溃 ——
+可用 `DSH_KERNEL_REPO=/path/to/kernel` 指定内核仓位置。
 
 覆盖：ed25519 签名/验签、内核包打包、OTA 验签+解包+原子指针切换+坏包拦截、runtime.json 契约、HostBridge 协议编解码/握手/方法能力/审计、**内核↔容器桥真实 UDS 互通**、**更新桥协议契约**，以及**真实 spawn 内核 + 健康检查**的端到端。
 
