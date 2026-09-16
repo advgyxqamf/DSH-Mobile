@@ -1,0 +1,31 @@
+# bionic / 系统提供的 .so 白名单 —— 构建期依赖闭环自检用
+#
+# 用途：scripts/build-node-android.sh 读 ELF 的 DT_NEEDED 列表，逐个核对。
+#   在名单里的 → 由系统提供，跳过；
+#   不在名单里的 → 必须由我们随包提供（即 app/src/main/jniLibs/<abi>/ 下必须有）。
+#
+# 为什么需要这道护栏：这类问题在【编译期毫无征兆】，只有装到真机才会暴露，
+# 而一轮完整 CI 要 2~3 小时 —— 人工核对极易漏，必须让脚本自己兜住。
+# 真机曾报：CANNOT LINK EXECUTABLE ".../libnode.so": cannot locate symbol
+#
+# ⚠ 本名单只描述「Android 系统自带」的库。随包提供的库（如 libc++_shared.so）
+#   刻意【不】列在这里 —— 它们必须通过闭环自检，被证明确实在 OUT_DIR 里。
+#   随包库的清单位于 app/src/main/java/.../native/NativeAssetRegistry.kt
+#   的 requiredDeps 字段（另有 .github/native-assets.txt 供 CI 使用）。
+#
+# 格式：每行一个库名，空行与 # 开头的行忽略。
+#
+# --- bionic 核心 ---
+libc.so
+libm.so
+libdl.so
+liblog.so
+libz.so
+libatomic.so
+libstdc++.so
+# --- Android 框架 ---
+libandroid.so
+libGLESv2.so
+libEGL.so
+libnativewindow.so
+libsync.so

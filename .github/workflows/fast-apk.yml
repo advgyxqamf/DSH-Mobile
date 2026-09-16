@@ -43,6 +43,9 @@ on:
       - 'gradle.properties'
       - 'gradlew'
       - 'gradlew.bat'
+      # 原生资产清单 —— 它决定 APK 里装哪些 .so、CI 下载校验哪些资产、
+      # 以及 gradle 的 keepDebugSymbols。改它就等于改了 APK 内容。
+      - '.github/native-assets.txt'
     # 额外的 tag 触发：推 fast-<任意> 即可手动跑一次，不必改代码。
     # 维护环境（沙箱）无法操作网页、workflow_dispatch 点不了，
     # tag 是最干净的显式触发手段。
@@ -193,10 +196,24 @@ jobs:
             exit 1
           fi
 
+          # 资产清单来自 .github/native-assets.txt（NativeAssetRegistry 的投影）。
+          # 这样加新二进制时只需改注册表 + 这份清单，不用再回来改 workflow。
+          # 清单为空或读不到即中止 —— 静默降级会让 APK 悄悄少装东西。
+          ASSETS_FILE=".github/native-assets.txt"
+          [ -f "$ASSETS_FILE" ] || { echo "[error] 找不到 $ASSETS_FILE"; exit 1; }
+          ASSETS="$(grep -v '^[[:space:]]*#' "$ASSETS_FILE" | grep -v '^[[:space:]]*$' | tr -d '\r')"
+          [ -n "$ASSETS" ] || { echo "[error] $ASSETS_FILE 里没有任何资产"; exit 1; }
+          echo "== 资产清单（取自 $ASSETS_FILE）=="
+          echo "$ASSETS" | sed 's/^/  /'
+
+          PATTERNS=""
+          for a in $ASSETS; do PATTERNS="$PATTERNS --pattern $a"; done
+
+          # shellcheck disable=SC2086
           gh release download "$TAG" \
             --repo '${{ github.repository }}' \
             --dir /tmp/rt \
-            --pattern 'libnode.so' --pattern 'libc++_shared.so' --pattern 'manifest.json'
+            $PATTERNS --pattern 'manifest.json'
 
           echo "== 下载内容 =="
           ls -la /tmp/rt/
@@ -229,10 +246,14 @@ jobs:
           # 文件名必须是 lib*.so：否则 AGP 不会把它当 native lib 处理，
           # 也就不会在安装时解压到可执行的 nativeLibraryDir（W^X 约束）。
           mkdir -p "app/src/main/jniLibs/${ABI}"
-          cp -f /tmp/rt/libnode.so       "app/src/main/jniLibs/${ABI}/libnode.so"
-          cp -f /tmp/rt/libc++_shared.so "app/src/main/jniLibs/${ABI}/libc++_shared.so"
-          chmod +x "app/src/main/jniLibs/${ABI}/libnode.so"
-          chmod +x "app/src/main/jniLibs/${ABI}/libc++_shared.so"
+          for a in $ASSETS; do
+            if [ ! -f "/tmp/rt/$a" ]; then
+              echo "[error] Release 里没有 $a（清单要求它随包）"
+              exit 1
+            fi
+            cp -f "/tmp/rt/$a" "app/src/main/jniLibs/${ABI}/$a"
+            chmod +x "app/src/main/jniLibs/${ABI}/$a"
+          done
 
           echo
           echo "== jniLibs 就位 =="
@@ -245,7 +266,9 @@ jobs:
         run: |
           set -euo pipefail
           D="app/src/main/jniLibs/${ABI}"
-          for f in libnode.so libc++_shared.so; do
+          # 清单驱动，与上面同一份文件；加资产不用改这里。
+          ASSETS="$(grep -v '^[[:space:]]*#' .github/native-assets.txt | grep -v '^[[:space:]]*$' | tr -d '\r')"
+          for f in $ASSETS; do
             if [ ! -f "$D/$f" ]; then
               echo "[error] $D/$f 缺失 —— 打包会产出真机跑不起来的 APK，中止。"
               exit 1
@@ -272,15 +295,20 @@ jobs:
           echo "--- lib/ 下的条目 ---"
           unzip -l "$APK" | grep 'lib/' || { echo "[error] 没有 lib/ 条目"; exit 1; }
 
-          # 这两个文件缺任何一个，装到真机上都会挂：
+          # 清单里每个文件缺了，装到真机上都会挂：
           #   缺 libnode.so       → exec 找不到东西
           #   缺 libc++_shared.so → cannot locate symbol
           # 与其让它在真机上失败，不如在这里失败 —— 反馈快得多。
-          for f in lib/arm64-v8a/libnode.so lib/arm64-v8a/libc++_shared.so; do
+          #
+          # 路径由 ${ABI} 与清单拼出，不再硬编码 —— 加资产/换 ABI 都不用改这里。
+          ASSETS="$(grep -v '^[[:space:]]*#' .github/native-assets.txt | grep -v '^[[:space:]]*$' | tr -d '\r')"
+          for a in $ASSETS; do
+            f="lib/${ABI}/$a"
             if unzip -l "$APK" | grep -q "$f"; then
               echo "[ok] $f"
             else
               echo "[error] APK 里缺少 $f"
+              echo "        清单来源: .github/native-assets.txt（NativeAssetRegistry 的投影）"
               exit 1
             fi
           done

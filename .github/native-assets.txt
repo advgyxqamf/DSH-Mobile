@@ -1,0 +1,15 @@
+# 随包原生资产清单 —— 由 CI 与构建脚本共同读取
+#
+# 这是 app/src/main/java/com/example/nodecontainer/native/NativeAssetRegistry.kt
+# 的**投影**。注册表是唯一事实来源，本文件是它在 shell 侧的可读形式。
+#
+# 格式：每行一个文件名（不含 lib/<abi>/ 前缀），空行与 # 开头的行忽略。
+# 顺序：先依赖库（libc++_shared.so），再可执行资产本体（libnode.so）。
+#
+# 改这里之前请先改注册表 —— container-engine/test/native-assets-test.js
+# 会做双向一致性校验，不同步会直接让测试失败。
+#
+# --- 依赖库（DT_NEEDED，必须与可执行资产同目录）---
+libc++_shared.so
+# --- 可执行资产本体 ---
+libnode.so

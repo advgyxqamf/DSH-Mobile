@@ -93,6 +93,93 @@ error=13, Permission denied
 **现在的升级路径**：换 Node 版本 = 用新的预编译二进制重新出一次 APK。
 这正是 `fast-apk.yml` 存在的原因 —— 几分钟而不是几小时。
 
+### 2.1 从「一个二进制」到「一组原生资产」
+
+上面三条规则对**每一个**可执行资产都成立。一旦有第二个（例如未来的 APK
+重打包工具），"哪些文件要能 exec、各自依赖什么、怎么验证"就必须是**数据**
+而不是散落的特判。
+
+**唯一事实来源**：`app/src/main/java/com/example/nodecontainer/native/NativeAssetRegistry.kt`
+
+```kotlin
+val LIBCXX = NativeExecutable(
+    id = "libcxx", libName = "libc++_shared.so", humanName = "C++ 运行期",
+    probeArgs = emptyList(), probeExpect = null,      // 数据资产，不做 exec-probe
+    requiredDeps = emptyList(), required = true,
+    note = "不是可执行文件，但必须在 nativeLibraryDir —— libnode.so 的 DT_NEEDED 依赖它",
+)
+val NODE = NativeExecutable(
+    id = "node", libName = "libnode.so", humanName = "Node 运行时",
+    probeArgs = listOf("-v"), probeExpect = "v",
+    requiredDeps = listOf("libc++_shared.so"), required = true,
+    note = "实为可执行文件，改名 lib*.so 借 jniLibs 通道落到 exec_type 目录",
+)
+```
+
+**统一引擎**：`native/NativePreparer.kt`。启动链与桥方法都走它，不存在两套实现。
+
+#### exec 的四道关
+
+一个 ELF 想在 Android aarch64 上跑起来，必须**同时**越过：
+
+| 关 | 要求 | 装机后能否补救 |
+|---|---|---|
+| 1. W^X | 落在 `nativeLibraryDir`（`exec_type`） | 能（改打包） |
+| 2. interp | `PT_INTERP` = `/system/bin/linker64` | **不能**（只能换二进制） |
+| 3. 架构 | `e_machine` = `0x00b7`（aarch64） | **不能** |
+| 4. libc | `DT_NEEDED` 只能是 bionic / 随包库 | **不能** |
+
+第 2/3/4 关在装机后无法补救，所以必须在**打包期**用 readelf 校验。
+`pin-node.yml` 已经做了这三项校验；这也是「A 全内置工具链」方案
+（aapt2 等 x86-64 + glibc 的 Google 官方产物）被判定不可行的直接原因 ——
+它在第 2/3/4 关全部失败，只剩 QEMU user-mode + 随包 amd64 glibc 一条路，
+而那在 SELinux 受限的 `untrusted_app` 域里没有公开成功先例。
+
+#### 验证顺序即修复（不要打乱）
+
+`NativePreparer.verify()` 严格按此序，**任一步失败立即返回、不再往下走**：
+
+```
+① 存在性    nativeLibraryDir 里有没有这个文件
+             ↳ 没有 → 查 APK 内是否有该条目 → MissingFromLib(inApk)
+② 依赖前置  遍历 requiredDeps，每个都必须在同目录
+             ↳ 缺 → MissingDependency
+③ exec 探针 【仅对 probeArgs 非空的资产】真跑一次
+             ↳ IOException → NotExecutable（此时可确定归因 SELinux）
+             ↳ exit≠0 或 stdout 缺片段 → ProbeFailed
+```
+
+**顺序本身就是修复。** 历史实现里这三件事分散在三个地方，且依赖检查
+**只打日志、从不阻断**。叠加出的真实故障是：
+
+> `libc++_shared.so` 缺失 → exec-probe 以 linker 错误失败 → errno 是 `13`
+> → 归因走到「该路径被 SELinux 禁止 exec」→ 排查者去查 SELinux 与解压路径
+> → **真因（依赖库缺失）永远浮不出来**。
+
+把依赖检查提到 exec-probe **之前**，`error=13` 才能被唯一地归因到 W^X。
+
+#### 五处清单，一个源头
+
+「哪些 `.so` 随包」这件事在仓库里以 5 种形态存在。① 是权威源，②–⑤ 是投影：
+
+| # | 位置 | 作用 |
+|---|---|---|
+| ① | `native/NativeAssetRegistry.kt` | **权威源** |
+| ② | `app/build.gradle.kts` `keepDebugSymbols` | 防 strip 破坏 |
+| ③ | `.github/native-assets.txt` | CI 下载校验 + APK 审计 |
+| ④ | `scripts/native-deps.txt` | 构建期 NEEDED 闭环自检（系统库白名单） |
+| ⑤ | `scripts/inject-libcxx-into-apk.py` | 注入锚点 |
+
+② 直接读 ③（`nativeAssetNames`），所以实际只需同步 ③④⑤。
+**一致性由 `container-engine/test/native-assets-test.js` 双向守护**
+（正向：注册表每项下游都有；反向：下游没有注册表未声明的项）。
+已用变异测试验证：改注册表名、删清单项、加幽灵项、在别处重新硬编码 ——
+四种漂移全部被捕获。
+
+> 为什么值得单独写个测试：这类问题的暴露路径是
+> 「跑 3 小时 CI → 装到真机 → 失败」，而测试只需几秒。
+> 更麻烦的是缓存相关的那种间歇形态 —— 命中缓存才炸、首次完整编译却正常。
+
 ---
 
 ## 3. 硬约束二：linker 找不到 `libc++_shared.so`
@@ -185,10 +272,16 @@ $ANDROID_NDK/toolchains/llvm/prebuilt/<host>/sysroot/usr/lib/aarch64-linux-andro
 packaging {
     jniLibs {
         useLegacyPackaging = true
-        keepDebugSymbols += setOf("**/libnode.so", "**/libc++_shared.so")
+        // 直接从 .github/native-assets.txt 读（NativeAssetRegistry 的投影）——
+        // 不再硬编码文件名，加资产时 gradle 配置自动跟上。
+        keepDebugSymbols += nativeAssetNames.map { "**/$it" }
     }
 }
 ```
+
+**注意现在读的是清单文件，不是字面量列表**（见 §2.1 的五处清单）。
+清单缺失/为空时直接抛 `GradleException` —— 刻意不静默降级，
+否则会产出「编译成功但真机跑不起来」的 APK，那种问题排查成本远高于一次构建失败。
 
 `keepDebugSymbols` 是旧 API `doNotStrip` 的替代
 （AGP 文档原话：*"Use jniLibs.keepDebugSymbols.add() instead."*）。
@@ -202,7 +295,7 @@ packaging {
 - `libc++_shared.so` —— node 的运行期动态依赖，strip 掉符号表只会让
   动态链接更无解。
 
-这两个文件由 CI 用与 node 相同的 NDK 亲自挑选/产出，不需要 AGP 再加工。
+这些文件由 CI 用与 node 相同的 NDK 亲自挑选/产出，不需要 AGP 再加工。
 
 ---
 
@@ -322,22 +415,46 @@ aarch64）在 GitHub 免费 runner 上要 **2~3 小时**。
 | 阶段 | 含义 | 失败时看什么 |
 |---|---|---|
 | `init` | 服务启动，打印设备信息 | — |
+| `kernel` | 内核版本指针 + 入口布局断言 | 入口被误放到 filesDir 外会在此失败 |
 | `version` | 清单里的版本号 | 与实际 `node -v` 对比 |
-| `provision` | 内置 node 就位 | 目录实况会一并打印 |
+| `native-assets` | **逐资产校验：存在性 → 依赖 → exec-probe** | 见下方「归因速查」，结论是唯一的 |
 | `script` | server.js 就位 | — |
-| `libdir` | lib 目录里有啥 | 有没有 `libc++_shared.so` |
-| `apk-libs` | APK 里有啥 | 与 `libdir` 对比可定位是打包还是解压问题 |
-| `exec-probe` | **真跑一次 `node -v`** | 可执行性的确定性结论 |
+| `runtime` | runtime.json 已写入 | — |
 | `exec` | node 进程已启动 | pid |
 | `process` | node 退出了 | `exitCode` |
 | `node-stderr` | node 自己报的错 | **最关键的一项** |
 | `port` | 端口是否就绪 | 成功标志 |
 
+> 历史阶段名 `provision` / `libdir` / `apk-libs` / `exec-probe` 已合并为
+> `native-assets` 一项 —— 它们本就是同一个问题的四个侧面，分开写只会
+> 制造「四处都说了但拼不出结论」的困境。
+
+### 归因速查（`native-assets` 结构化结论）
+
+`PrepareReport` 给出的是**唯一结论**，不是「可能原因 1/2/3」：
+
+| `status` | 含义 | 下一步 |
+|---|---|---|
+| `ready` | 全部通过 | — |
+| `missing_from_lib` + `inApk=true` | APK 里有但没解压落盘 | 查 `extractNativeLibs` / `useLegacyPackaging` |
+| `missing_from_lib` + `inApk=false` | 打包期就丢了 | 查构建脚本产物 + `.github/native-assets.txt` |
+| `missing_dependency` | **某个依赖 `.so` 不在同目录** | 补齐依赖；linker 不查 `nativeLibraryDir`，必须同目录 + 设 `LD_LIBRARY_PATH` |
+| `not_executable` | 存在、依赖齐，但 exec 被拒 | **依赖已确认完好 → 可确定归因 SELinux W^X**：确认该文件真在 `nativeLibraryDir` |
+| `probe_failed` | 进程起来了但退出码/输出不对 | 看 `output`；多半是拿错了二进制 |
+
+**关键差别**：`not_executable` 出现时，依赖检查已经通过 —— 所以
+`error=13` 不再有第二种解释。历史实现因为把依赖检查只当日志，
+同一段错误提示同时覆盖「SELinux 拒 exec」和「依赖缺失」两种完全不同的
+排查路径，浪费了大量真机调试时间。
+
+内核可经桥方法 `sys.nativeAssets` 拿到同一份结构化报告（传
+`{"walkProbes": false}` 可跳过 spawn 进程，只做静态检查）。
+
 ### 错误码速查
 
 | 错误 | 含义 | 方向 |
 |---|---|---|
-| `error=13` Permission denied | SELinux 禁止 exec | 确认执行的是 `nativeLibraryDir` 下的 `libnode.so`，不是 `files/` 里的副本 |
+| `error=13` Permission denied | SELinux 禁止 exec **或** 依赖库缺失 | 先看 `sys.nativeAssets` 的结论再定方向 |
 | `error=2` No such file | `.so` 没被解压落盘 | 检查 `extractNativeLibs` / `useLegacyPackaging` |
 | `error=8` Exec format error | ABI 不匹配或页对齐不满足 | 检查 `abiFilters` 与 16KB 对齐 |
 | `cannot locate symbol` | linker 找不到 `libc++_shared.so` | 检查 `LD_LIBRARY_PATH` 是否设置 |

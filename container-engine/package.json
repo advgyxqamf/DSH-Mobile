@@ -4,7 +4,7 @@
   "private": true,
   "description": "DSH 安卓容器底座（L0）可测引擎：内核签名 OTA、runtime.json 契约、HostBridge 协议。",
   "scripts": {
-    "test": "node test/sign-verify-test.js && node test/kernel-bundle-test.js && node test/ota-engine-test.js && node test/runtime-json-test.js && node test/bridge-protocol-test.js && node test/bridge-e2e-test.js && node test/bridge-interop-test.js && node test/kernel-update-bridge-test.js && node test/e2e-mock-kernel-test.js",
+    "test": "node test/native-assets-test.js && node test/sign-verify-test.js && node test/kernel-bundle-test.js && node test/ota-engine-test.js && node test/runtime-json-test.js && node test/bridge-protocol-test.js && node test/bridge-e2e-test.js && node test/bridge-interop-test.js && node test/kernel-update-bridge-test.js && node test/e2e-mock-kernel-test.js",
     "bundle": "node bin/build-bundle.js"
   }
 }

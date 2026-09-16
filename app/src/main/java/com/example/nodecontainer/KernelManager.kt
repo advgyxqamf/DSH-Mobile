@@ -11,12 +11,31 @@ import java.security.MessageDigest
  * 布局（与 container-engine/src/ota-engine.js、kernel-bundle.js 对齐）：
  *   files/kernel/CURRENT                 -> 当前生效版本号（原子写）
  *   files/kernel/<version>/kernel.json   -> 内核包清单（含 entry/signature/requires）
- *   files/kernel/<version>/bin/dsh-supervisor -> 内核入口（由 :node 进程 exec）
+ *   files/kernel/<version>/bin/dsh-supervisor -> 内核入口（**由 node 解释执行**）
  *
  * 与 Node 运行时版本（NodeVersionManager，files/node/CURRENT）是两套独立指针：
  *   - Node 运行时（L0）冻结；
  *   - 内核（L1）经签名 OTA 热更新。
  * 二者互不替代。
+ *
+ * ============================================================================
+ *  ⚠️ dsh-supervisor 是【脚本】，不是可执行的二进制 —— 不要试图 exec 它
+ * ============================================================================
+ * 它落在 `filesDir`（label = `app_data_file`），**SELinux W^X 禁止 execve**。
+ * 正确用法是把它当**参数**交给 node：
+ *
+ * ```kotlin
+ * ProcessBuilder(nodeBin.absolutePath, entry.absolutePath, "daemon")
+ * ```
+ * 即「用 node 跑这个脚本」。见 NodeRuntimeService 的启动链。
+ *
+ * 这与 `libnode.so` 的处理方式**刻意不同** —— 后者是真正要被 exec 的 ELF，
+ * 必须放在 `nativeLibraryDir`（label = `exec_type`），即 `jniLibs/<abi>/`。
+ *
+ * 历史上的类注释误写成「由 :node 进程 exec」，与实现矛盾。这是埋着的雷：
+ * 照注释去 `ProcessBuilder(entry.absolutePath)` 必在真机上以
+ * `error=13, Permission denied` 失败。本注释即为修正，并加了运行时断言守护。
+ * ============================================================================
  */
 class KernelManager(private val context: Context) {
 
@@ -48,7 +67,37 @@ class KernelManager(private val context: Context) {
 
     fun kernelDir(version: String): File = File(kernelRoot, version)
 
+    /**
+     * 内核入口脚本路径 —— **这是一个脚本，不是可执行二进制**。
+     *
+     * 它位于 `filesDir`（`app_data_file`），SELinux W^X 禁止 execve。
+     * 必须交给 node 解释执行：`ProcessBuilder(nodeBin, entryPath(v), "daemon")`。
+     *
+     * 调用 [assertNotDirectlyExecutable] 可在开发期抓住误用。
+     */
     fun entryPath(version: String): File = File(kernelDir(version), "bin/dsh-supervisor")
+
+    /**
+     * 断言 [entryPath] 不会被直接 exec —— 该路径在 `app_data_file` 下，W^X 会拒绝。
+     *
+     * 初衷：类注释曾与实现矛盾（写「由 :node 进程 exec」而实际落 filesDir），
+     * 这是典型的「埋雷」型缺陷 —— 后人照注释写代码就必崩。把不变式写成可执行
+     * 断言，比注释更难被忽略。
+     *
+     * 注意断言的是**目录归属**（唯一可靠的静态判据），不是文件权限位：
+     * `File.canExecute()` 对 `app_data_file` 也返回 true，在此完全不可信。
+     *
+     * @throws IllegalStateException 该路径竟然不在 filesDir 子树内（布局被破坏）
+     */
+    fun assertNotDirectlyExecutable(version: String) {
+        val entry = entryPath(version).canonicalFile
+        val filesRoot = context.filesDir.canonicalFile
+        check(entry.startsWith(filesRoot)) {
+            "内核入口应位于 filesDir（app_data_file，W^X 禁 exec）内，但它跑到了 ${entry.parent}。" +
+                "此断言失败意味着内核 OTA 的落盘布局被破坏 —— " +
+                "若入口需要被 exec，它必须改走 jniLibs/nativeLibraryDir（exec_type）通道。"
+        }
+    }
 
     fun kernelJsonPath(version: String): File = File(kernelDir(version), "kernel.json")
 

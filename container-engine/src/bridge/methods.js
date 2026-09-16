@@ -60,6 +60,21 @@ const METHODS = {
   'notif.post':           { group: 'notification', caps: ['base'] },
 
   'sys.info':             { group: 'system', caps: ['base'] },
+  // 原生资产自检：只读探测，无权限要求。
+  //
+  // 用途：W^X/exec 链的失败几乎全部发生在真机，且容器侧诊断要用户手动去翻
+  // diagnostics.txt。把它暴露给内核后，UI 可直接回答「node 到底能不能跑、
+  // 为什么不能」，并拿到**结构化归因**（缺依赖 / 未解压 / SELinux 拒 exec / 探针失败）。
+  //
+  // 返回形状（与 Kotlin NativePreparer.PrepareReport.toJson 对齐）：
+  //   { allRequiredReady: Boolean, nativeLibraryDir: String, libSearchPath: String,
+  //     assets: [{ id, libName, humanName, required, note, requiredDeps,
+  //                status, path?, inApk?, missingDep?, errno?, exit?, output?, hint? }] }
+  //   status ∈ ready | missing_from_lib | missing_dependency | not_executable | probe_failed
+  //
+  // 参数：{ walkProbes?: Boolean }，默认 true（真跑 exec-probe）。传 false 只做
+  //       存在性+依赖检查，避免频繁 spawn 进程。
+  'sys.nativeAssets':     { group: 'system', caps: ['base'] },
   'sys.setTime':          { group: 'system', caps: ['device_owner'], audit: true },
   'sys.setTimeZone':      { group: 'system', caps: ['device_owner'], audit: true },
   'sys.reboot':           { group: 'system', caps: ['device_owner'], audit: true },

@@ -39,6 +39,11 @@ on:
       - 'scripts/inject-*.py'
       - 'scripts/make-release.sh'
       - 'scripts/gh-access.sh'
+      # 例外：原生资产清单改了就影响 APK 内容，必须重编。
+      # ⚠️ GitHub 的 paths-ignore 没有「先匹配 ignore 再排除」的否定语法，
+      #    所以这里只注释说明；实际由 fast-apk.yml 的 paths 白名单覆盖
+      #    （它显式列了 '.github/native-assets.txt'）。
+      #    本 workflow 走 workflow_dispatch 时不受 paths 过滤影响。
 
 # ---------------------------------------------------------------------------
 # 并发控制：同一个 ref 上只允许一个构建在跑。
@@ -410,7 +415,7 @@ jobs:
             file -b "$DEST" || true
 
             # ------------------------------------------------------------------
-            # 连带恢复 libc++_shared.so —— 这一步曾漏掉，是个隐蔽的坑。
+            # 连带恢复全部随包依赖 —— 这一步曾漏掉，是个隐蔽的坑。
             #
             # libnode.so 动态依赖 libc++_shared.so（readelf -d 可见 NEEDED 项），
             # 而它不在 Android 系统里，必须随 APK 一起打包。
@@ -421,38 +426,43 @@ jobs:
             # 而未命中缓存（完整编译）时却又是好的 —— 于是表现为
             # 「第一次能跑、命中缓存后反而不行」这种极难排查的间歇性故障。
             #
-            # 所以：缓存里必须同时存这两个文件，恢复时也一并还原。
+            # 所以：缓存里必须同时存全部清单资产，恢复时也一并还原。
+            # 清单来源：.github/native-assets.txt（NativeAssetRegistry 的投影）。
             # ------------------------------------------------------------------
-            CXX_DEST="app/src/main/jniLibs/arm64-v8a/libc++_shared.so"
-            if [ -f /tmp/dsh-node-cache/libc++_shared.so ]; then
-              cp -f /tmp/dsh-node-cache/libc++_shared.so "$CXX_DEST"
-              chmod +x "$CXX_DEST"
-              echo "[ok] 连带恢复 libc++_shared.so:"
-              ls -la "$CXX_DEST"
-            else
-              # 旧缓存（本修复之前写入的）里没有这个文件。
-              # 不能静默放过 —— 那会打出一个真机跑不起来的包。
-              echo "[warn] 缓存里没有 libc++_shared.so（多半是旧缓存）。"
-              echo "       将尝试从本机 NDK 补一份……"
-              CXX_SRC="$(find "${ANDROID_NDK_LATEST_HOME:-}" \
-                           "${ANDROID_NDK_HOME:-}" \
-                           "${ANDROID_NDK_ROOT:-}" \
-                           "$ANDROID_HOME/ndk" \
-                           /usr/local/lib/android/sdk/ndk \
-                           -path '*sysroot/usr/lib/aarch64-linux-android/libc++_shared.so' 2>/dev/null | head -1)"
-              if [ -n "$CXX_SRC" ] && [ -f "$CXX_SRC" ]; then
-                cp -f "$CXX_SRC" "$CXX_DEST"
-                chmod +x "$CXX_DEST"
-                echo "[ok] 已从 NDK 补齐: $CXX_SRC"
-                ls -la "$CXX_DEST"
+            ASSETS="$(grep -v '^[[:space:]]*#' .github/native-assets.txt | grep -v '^[[:space:]]*$' | tr -d '\r')"
+            for a in $ASSETS; do
+              [ "$a" = "libnode.so" ] && continue   # 本体已在上方恢复
+              D="app/src/main/jniLibs/arm64-v8a/$a"
+              if [ -f "/tmp/dsh-node-cache/$a" ]; then
+                cp -f "/tmp/dsh-node-cache/$a" "$D"
+                chmod +x "$D"
+                echo "[ok] 连带恢复 $a:"
+                ls -la "$D"
               else
-                echo "[error] 缓存与本机 NDK 都没有 libc++_shared.so。"
-                echo "        继续下去会打出无法启动的 APK，故在此失败。"
-                echo "        解法：重新完整编译一次（脚本已会连带打包该库），"
-                echo "        或让缓存 key 变化以避开这份旧缓存。"
-                exit 1
+                # 旧缓存（本修复之前写入的）里没有这个文件。
+                # 不能静默放过 —— 那会打出一个真机跑不起来的包。
+                echo "[warn] 缓存里没有 $a（多半是旧缓存）。"
+                echo "       将尝试从本机 NDK 补一份……"
+                LIB_SRC="$(find "${ANDROID_NDK_LATEST_HOME:-}" \
+                             "${ANDROID_NDK_HOME:-}" \
+                             "${ANDROID_NDK_ROOT:-}" \
+                             "$ANDROID_HOME/ndk" \
+                             /usr/local/lib/android/sdk/ndk \
+                             -path "*sysroot/usr/lib/aarch64-linux-android/$a" 2>/dev/null | head -1)"
+                if [ -n "$LIB_SRC" ] && [ -f "$LIB_SRC" ]; then
+                  cp -f "$LIB_SRC" "$D"
+                  chmod +x "$D"
+                  echo "[ok] 已从 NDK 补齐: $LIB_SRC"
+                  ls -la "$D"
+                else
+                  echo "[error] 缓存与本机 NDK 都没有 $a。"
+                  echo "        继续下去会打出无法启动的 APK，故在此失败。"
+                  echo "        解法：重新完整编译一次（脚本已会连带打包依赖），"
+                  echo "        或让缓存 key 变化以避开这份旧缓存。"
+                  exit 1
+                fi
               fi
-            fi
+            done
             # 复用缓存二进制时做一次形态校验。
             # 注意：这里【不】强制要求 linker64 解释器 —— 该文件本质是普通 ELF
             # 可执行文件，被系统当 native lib 解压落盘后直接 exec，并非作为共享库
@@ -527,18 +537,27 @@ jobs:
           cp -f out/Release/node /tmp/dsh-node-cache/node
           chmod +x /tmp/dsh-node-cache/node
 
-          # 连带保存 libc++_shared.so。
-          # 它是 node 的运行期动态依赖、且不在 Android 系统里，必须随包提供。
-          # 只存 node 本体的话，下次命中缓存就会打出缺少该库的 APK ——
+          # 连带保存全部随包依赖（清单驱动）。
+          # 它们是 node 的运行期动态依赖、且不在 Android 系统里，必须随包提供。
+          # 只存 node 本体的话，下次命中缓存就会打出缺少依赖的 APK ——
           # 真机表现为 cannot locate symbol，见恢复段的详细说明。
-          CXX_SRC="app/src/main/jniLibs/arm64-v8a/libc++_shared.so"
-          if [ -f "$CXX_SRC" ]; then
-            cp -f "$CXX_SRC" /tmp/dsh-node-cache/libc++_shared.so
-            echo "[ok] 连带保存 libc++_shared.so ($(stat -c%s "$CXX_SRC") 字节)"
-          else
-            echo "[warn] $CXX_SRC 不存在，缓存里将没有 libc++_shared.so。"
-            echo "       下次命中缓存时会尝试从 NDK 补齐（见 Restore 步骤）。"
-          fi
+          #
+          # 清单来源：.github/native-assets.txt（NativeAssetRegistry 的投影）
+          ASSETS="$(grep -v '^[[:space:]]*#' .github/native-assets.txt | grep -v '^[[:space:]]*$' | tr -d '\r')"
+          for a in $ASSETS; do
+            SRC="app/src/main/jniLibs/arm64-v8a/$a"
+            if [ "$a" = "libnode.so" ]; then
+              # 本体已在上面以 /tmp/dsh-node-cache/node 的形式存过（保持既有缓存键不变，
+              # 避免所有历史缓存失效）
+              echo "[ok] $a 已作为 node 缓存项保存"
+            elif [ -f "$SRC" ]; then
+              cp -f "$SRC" "/tmp/dsh-node-cache/$a"
+              echo "[ok] 连带保存 $a ($(stat -c%s "$SRC") 字节)"
+            else
+              echo "[warn] $SRC 不存在，缓存里将没有 $a。"
+              echo "       下次命中缓存时会尝试从 NDK 补齐（见 Restore 步骤）。"
+            fi
+          done
           # 记下产出这份缓存时的 key + run id，供下次区分"精确命中/回退命中"。
           echo "node-android-${{ steps.nodever.outputs.tag }}-${{ hashFiles('scripts/build-node-android.sh') }}:${GITHUB_RUN_ID}" \
             > /tmp/dsh-node-cache/.cache-key
@@ -620,21 +639,29 @@ jobs:
           unzip -l "$APK" | grep 'lib/' || echo "(没有 lib/ 条目 —— 严重异常)"
           echo
 
-          HAVE_NODE=$(unzip -l "$APK" | grep -c 'lib/arm64-v8a/libnode.so' || true)
-          HAVE_CXX=$(unzip -l "$APK" | grep -c 'lib/arm64-v8a/libc++_shared.so' || true)
-          echo "libnode.so        : $HAVE_NODE"
-          echo "libc++_shared.so  : $HAVE_CXX"
-
-          if [ "$HAVE_NODE" -lt 1 ]; then
-            echo "[error] APK 里没有 lib/arm64-v8a/libnode.so —— 运行时缺失，无法启动。"
+          # 清单驱动：路径与资产名都从 .github/native-assets.txt 读，
+          # 加资产不用回来改这一大段（此前是逐个硬编码 + 各自写一段报错）。
+          ASSETS="$(grep -v '^[[:space:]]*#' .github/native-assets.txt | grep -v '^[[:space:]]*$' | tr -d '\r')"
+          if [ -z "$ASSETS" ]; then
+            echo "[error] .github/native-assets.txt 里没有任何资产 —— 审计无意义，中止"
             exit 1
           fi
-          if [ "$HAVE_CXX" -lt 1 ]; then
-            echo "[error] APK 里没有 lib/arm64-v8a/libc++_shared.so。"
-            echo "        这正是真机 'cannot locate symbol _ZTVNSt6__ndk119basic_ostringstream' 的直接原因："
-            echo "        libnode.so 动态依赖 libc++_shared.so，而它不在 Android 系统里，"
-            echo "        必须随 APK 打包。请检查 scripts/build-node-android.sh 的打包段"
+
+          MISSING_ASSETS=""
+          for a in $ASSETS; do
+            n=$(unzip -l "$APK" | grep -c "lib/arm64-v8a/$a" || true)
+            printf '  %-22s: %s\n' "$a" "$n"
+            [ "$n" -ge 1 ] || MISSING_ASSETS="$MISSING_ASSETS $a"
+          done
+
+          if [ -n "$MISSING_ASSETS" ]; then
+            echo
+            echo "[error] APK 里缺少:$MISSING_ASSETS"
+            echo "        这正是真机 'cannot locate symbol _ZTVNSt6__ndk119basic_ostringstream' 一类"
+            echo "        故障的直接原因：libnode.so 动态依赖 libc++_shared.so，而后者不在 Android"
+            echo "        系统里，必须随 APK 打包。请检查 scripts/build-node-android.sh 的打包段"
             echo "        与 app/build.gradle.kts 的 jniLibs 配置。"
+            echo "        清单来源: .github/native-assets.txt（NativeAssetRegistry 的投影）"
             exit 1
           fi
 
@@ -644,7 +671,7 @@ jobs:
           echo "--- 压缩方式（Stored=未压缩 / Defl=压缩） ---"
           unzip -v "$APK" | awk '$NF ~ /lib\/arm64-v8a\// {print "  " $NF "  " $2 "  " $3 "  " $4}'
           echo
-          echo "[ok] APK 审计通过：两个 .so 都在包里。"
+          echo "[ok] APK 审计通过：清单内 ${ASSETS} 全部在包里。"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

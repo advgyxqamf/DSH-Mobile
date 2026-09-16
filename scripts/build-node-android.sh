@@ -59,6 +59,12 @@ OUT_DIR="$ROOT/app/src/main/jniLibs/arm64-v8a"
 OUT_NAME="libnode.so"
 mkdir -p "$OUT_DIR"
 
+# 本脚本产出的文件名必须与 NativeAssetRegistry.NODE.libName 一致，
+# 也必须出现在 .github/native-assets.txt 里（CI 据此下载校验、审计 APK、
+# gradle 据此决定 keepDebugSymbols）。改名前先改注册表。
+#
+# 一致性由 container-engine/test/native-assets-test.js 双向守护。
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -813,6 +819,40 @@ chmod +x "$OUT_DIR/libc++_shared.so"
 echo "    源: $LIBCXX_SRC"
 echo "    目标: $OUT_DIR/libc++_shared.so ($(stat -c%s "$OUT_DIR/libc++_shared.so") 字节)"
 
+# ---- 清单一致性自检：OUT_DIR 内容与 .github/native-assets.txt 必须完全一致 ----
+# 防的是「脚本加了产物但忘了更新清单」（CI 就不会下载/审计它），
+# 或「清单里有但脚本不产出」（CI 下载会 404）。两个方向都要拦。
+# 运行时 NativePreparer 也是按注册表逐项校验的，清单漏项会让真机静默缺资产。
+echo "==> 清单一致性自检（.github/native-assets.txt）"
+MANIFEST="$ROOT/.github/native-assets.txt"
+if [ ! -f "$MANIFEST" ]; then
+  echo "==> [error] 找不到资产清单 $MANIFEST"
+  exit 1
+fi
+MISMATCH=0
+for f in "$OUT_DIR"/*.so; do
+  [ -f "$f" ] || continue
+  base="$(basename "$f")"
+  if ! grep -qxF "$base" <(grep -v '^[[:space:]]*#' "$MANIFEST" | sed 's/[[:space:]]*$//' | grep -v '^$'); then
+    echo "    [FAIL] $base 已产出，但不在 $MANIFEST 里（CI 不会下载/审计它）"
+    MISMATCH=1
+  fi
+done
+while IFS= read -r a; do
+  case "$a" in ''|'#'*) continue ;; esac
+  a="$(echo "$a" | tr -d '[:space:]')"
+  if [ ! -f "$OUT_DIR/$a" ]; then
+    echo "    [FAIL] 清单要求 $a，但 $OUT_DIR 里没有它（CI 下载会 404）"
+    MISMATCH=1
+  fi
+done < "$MANIFEST"
+if [ "$MISMATCH" -ne 0 ]; then
+  echo "==> [error] 产物与 .github/native-assets.txt 不一致。"
+  echo "           该清单是 NativeAssetRegistry 的投影，二者必须同步。"
+  exit 1
+fi
+echo "    [ok] 产物与清单一致（$(ls "$OUT_DIR"/*.so | wc -l) 项）"
+
 # ---- 依赖闭环自检：libnode.so 需要的每个 .so 都必须在本目录里备齐 ----
 # 这是本脚本最重要的一道护栏。做法：读 ELF 的 NEEDED 列表，逐个核对。
 #   · bionic 自带的（libc/libm/libdl/liblog/libz 等）由系统提供，跳过；
@@ -822,20 +862,32 @@ echo "    目标: $OUT_DIR/libc++_shared.so ($(stat -c%s "$OUT_DIR/libc++_shared
 echo "==> 依赖闭环自检"
 READELF="$(ls "$ANDROID_NDK"/toolchains/llvm/prebuilt/*/bin/llvm-readelf 2>/dev/null | head -1)"
 MISSING=""
+# 系统库白名单从 scripts/native-deps.txt 读取（不再硬编码在 case 语句里）。
+# 这份名单是 NativeAssetRegistry（随包库）之外的补充说明，二者职责不同：
+#   名单内的 = 系统提供，跳过；名单外的 = 必须随包，必须存在。
+DEPS_LIST="$ROOT/scripts/native-deps.txt"
+if [ ! -f "$DEPS_LIST" ]; then
+  echo "==> [error] 找不到系统库白名单: $DEPS_LIST"
+  exit 1
+fi
+# 读入为空格分隔串（供 case 匹配），并剔除注释与空行
+SYSTEM_LIBS="$(grep -v '^[[:space:]]*#' "$DEPS_LIST" | grep -v '^[[:space:]]*$' | tr '\n' ' ')"
+if [ -z "$SYSTEM_LIBS" ]; then
+  echo "==> [error] $DEPS_LIST 里没有任何库名（是不是被清空了？）"
+  exit 1
+fi
+echo "    系统库白名单: $DEPS_LIST（$(echo "$SYSTEM_LIBS" | wc -w) 项）"
 if [ -n "$READELF" ]; then
   NEEDED="$("$READELF" -d "$OUT_DIR/$OUT_NAME" 2>/dev/null | awk '/NEEDED/{gsub(/[\[\]]/,"",$NF); print $NF}')"
   for lib in $NEEDED; do
-    case "$lib" in
-      libc.so|libm.so|libdl.so|liblog.so|libz.so|libandroid.so|libGLESv2.so|libEGL.so|libnativewindow.so|libsync.so|libatomic.so|libstdc++.so)
-        echo "    [ok] $lib （bionic/系统提供）" ;;
-      *)
-        if [ -f "$OUT_DIR/$lib" ]; then
-          echo "    [ok] $lib （已随包提供）"
-        else
-          echo "    [FAIL] $lib 被 node 依赖，但 $OUT_DIR 下没有它！"
-          MISSING="$MISSING $lib"
-        fi ;;
-    esac
+    if echo " $SYSTEM_LIBS " | grep -q " $lib "; then
+      echo "    [ok] $lib （bionic/系统提供）"
+    elif [ -f "$OUT_DIR/$lib" ]; then
+      echo "    [ok] $lib （已随包提供）"
+    else
+      echo "    [FAIL] $lib 被 node 依赖，但 $OUT_DIR 下没有它！"
+      MISSING="$MISSING $lib"
+    fi
   done
 else
   echo "    [warn] 找不到 llvm-readelf，跳过依赖检查"

@@ -16,6 +16,10 @@ import android.os.Environment
 import android.os.IBinder
 import android.provider.Settings
 import android.util.Log
+import com.example.nodecontainer.native.AssetStatus
+import com.example.nodecontainer.native.NativeAssetRegistry
+import com.example.nodecontainer.native.NativePreparer
+import com.example.nodecontainer.native.PrepareReport
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -252,6 +256,44 @@ class HostBridgeService : Service() {
                 put("androidApi", Build.VERSION.SDK_INT)
                 put("platform", "android")
                 put("bridge", SOCKET_NAME)
+            }
+        },
+        // 原生资产自检（只读，无权限要求）。
+        //
+        // 为什么把它暴露给内核：W^X/exec 这条链的失败**几乎全部发生在真机上**，
+        // 而容器侧的诊断层（diagnostics.txt）需要用户手动去翻。把它经桥暴露后，
+        // 内核可以直接在 UI 里回答「node 到底能不能跑、为什么不能」，
+        // 且给出的是**结构化归因**（缺依赖 / 未解压 / SELinux 拒 exec / 探针失败），
+        // 而不是一句 "启动失败"。
+        //
+        // 注意：本方法是**只读探测**，每次调用会真跑一次 exec-probe（默认 walkProbes=true）。
+        // 传 {"walkProbes": false} 可只做存在性+依赖检查，避免频繁 spawn 进程。
+        // 探针默认走 NativePreparer.prepare()，与容器启动链**完全同一实现**，不会漂移。
+        "sys.nativeAssets" to MethodDef(listOf("base"), false) { p ->
+            val walkProbes = p.optBoolean("walkProbes", true)
+            val report = if (walkProbes) {
+                NativePreparer.prepare(this)
+            } else {
+                // 跳过 exec-probe：逐项做存在性 + 依赖检查
+                PrepareReport(
+                    NativeAssetRegistry.ALL.map { exe ->
+                        exe to if (NativeAssetRegistry.resolve(this, exe).exists()) {
+                            AssetStatus.Ready(
+                                exe, NativeAssetRegistry.resolve(this, exe).absolutePath,
+                                "（未执行探针：walkProbes=false）"
+                            )
+                        } else {
+                            AssetStatus.MissingFromLib(
+                                exe, NativeAssetRegistry.resolve(this, exe).absolutePath,
+                                inApk = false, libListing = ""
+                            )
+                        }
+                    }
+                )
+            }
+            report.toJson().apply {
+                put("nativeLibraryDir", applicationInfo.nativeLibraryDir)
+                put("libSearchPath", NativePreparer.libSearchPath(this@HostBridgeService))
             }
         },
         "sys.setTime" to MethodDef(listOf("device_owner"), true) { p ->

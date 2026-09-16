@@ -99,15 +99,47 @@ android {
             //   这两个文件由 CI 用与 node 相同的 NDK 亲自挑选/产出，不需要 AGP 再加工。
             //   显式豁免，避免「体积看着小了、真机反而加载失败」这类极难排查的副作用。
             // -----------------------------------------------------------------
-            keepDebugSymbols += setOf(
-                "**/libnode.so",
-                "**/libc++_shared.so"
-            )
+            // ↓ 直接读清单，不再硬编码文件名。
+            //
+            // 清单来源：.github/native-assets.txt —— 它是
+            // app/src/main/java/com/example/nodecontainer/native/NativeAssetRegistry.kt
+            // 的**投影**（注册表是唯一事实来源）。
+            //
+            // 这样做的意义：加一个新的可执行资产时，只要改注册表 + 这份清单，
+            // gradle 配置**自动跟上**。此前这里写死两个名字，新资产会被 AGP
+            // 悄悄 strip 掉 —— 而 strip 的破坏只在真机运行期才暴露，极难排查。
+            //
+            // 清单缺失时**不静默降级**：直接 fail，避免打出一个看似正常、
+            // 实则缺符号的 APK。
+            keepDebugSymbols += nativeAssetNames.map { "**/$it" }
         }
     }
     // 注意：node 二进制现位于 jniLibs/arm64-v8a/libnode.so。
     // 它的文件名必须以 lib 开头、.so 结尾，否则 AGP 不会把它当 native lib 处理，
     // 也就不会被解压到可执行的 lib dir 里去。
+}
+
+/**
+ * 读 `.github/native-assets.txt`（NativeAssetRegistry 的投影）。
+ *
+ * 在配置阶段求值，因此文件缺失/为空会直接让构建失败 —— 这是刻意的：
+ * 静默降级会产出「编译成功但真机跑不起来」的 APK，那种问题排查成本远高于一次构建失败。
+ */
+val nativeAssetNames: List<String> by lazy {
+    val f = rootProject.file(".github/native-assets.txt")
+    if (!f.exists()) {
+        throw GradleException(
+            "缺少 .github/native-assets.txt —— 它是 NativeAssetRegistry 的投影，构建必需。\n" +
+                "该文件同时被 CI（fast-apk.yml / build-apk.yml）读取，用于下载校验与 APK 审计。"
+        )
+    }
+    val names = f.readLines()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() && !it.startsWith("#") }
+    if (names.isEmpty()) {
+        throw GradleException(".github/native-assets.txt 里没有任何资产名 —— 是不是被清空了？")
+    }
+    names
 }
 
 dependencies {

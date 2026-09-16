@@ -82,6 +82,31 @@ class BridgeServer {
       case 'notif.post': return { posted: true, title: params.title, text: params.text };
       case 'notif.read': return { notifications: [] };
       case 'sys.info': return { device: 'mock-android', apiLevel: 35, arch: 'arm64' };
+      // 原生资产自检（2026-09）。返回形状与 Kotlin NativePreparer.PrepareReport.toJson 对齐：
+      //   { allRequiredReady, nativeLibraryDir, libSearchPath, assets: [...] }
+      // 与注册表 NativeAssetRegistry（libcxx + node）保持一致 —— 改动注册表时同步这里，
+      // 否则 container-engine/test/native-assets-test.js 会失败。
+      case 'sys.nativeAssets': return {
+        allRequiredReady: true,
+        nativeLibraryDir: '/data/app/~~mock/pkg-mock/lib/arm64-v8a',
+        libSearchPath: '/data/app/~~mock/pkg-mock/lib/arm64-v8a',
+        assets: [
+          {
+            id: 'libcxx', libName: 'libc++_shared.so', humanName: 'C++ 运行期',
+            required: true, requiredDeps: [],
+            note: '不是可执行文件，但必须在 nativeLibraryDir —— libnode.so 的 DT_NEEDED 依赖它',
+            status: 'ready', path: '/data/app/~~mock/pkg-mock/lib/arm64-v8a/libc++_shared.so',
+            probeOutput: '数据资产：mock（不做 exec-probe）',
+          },
+          {
+            id: 'node', libName: 'libnode.so', humanName: 'Node 运行时',
+            required: true, requiredDeps: ['libc++_shared.so'],
+            note: '实为可执行文件，改名 lib*.so 借 jniLibs 通道落到 exec_type 目录',
+            status: 'ready', path: '/data/app/~~mock/pkg-mock/lib/arm64-v8a/libnode.so',
+            probeOutput: 'v24.21.0',
+          },
+        ],
+      };
       // ui_automation：与 Kotlin 真实实现的返回结构对齐（P2，2026-09）。
       // Kotlin 侧 ui.* 返回 {ok:bool}（getUiTree 返回 {windows,windowCount,truncated}）
       case 'ui.getUiTree': return { windows: [], windowCount: 0, truncated: false };

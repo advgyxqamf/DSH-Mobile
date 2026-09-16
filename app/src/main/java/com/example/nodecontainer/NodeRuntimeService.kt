@@ -8,13 +8,15 @@ import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
+import com.example.nodecontainer.native.AssetStatus
+import com.example.nodecontainer.native.NativeAssetRegistry
+import com.example.nodecontainer.native.NativePreparer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.io.File
-import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -30,15 +32,18 @@ import java.net.URL
  * node 自己报了什么，而不是只能翻 logcat 猜。
  *
  * Node 是直接 exec 的应用私有二进制（bionic 链接）——这是真正的"原生安卓
- * 环境"，与 Termux 无关、不需要 root。
+ * 环境"，与 Termux 无关、不需要 root。可执行性的全部约束（W^X / linker / 架构 /
+ * libc 四道关）与验证手段收敛在 `native/` 包，见 [NativePreparer]。
  *
  * 流程（对齐 container-engine/src/boot.js 与 docs/BASE_SPEC.md §9）：
  *   0. 预置体检（ProvisioningProbe，PROVISIONING.md §4）—— 控制面能力可见。
  *   1. 启动 HostBridge（UDS 能力桥，独立服务）。
- *   2. 确认内置 node 就位 + server.js 探针 + 两个 .so + exec-probe 真跑一次。
- *   3. 写 runtime.json（schema 2，容器写内核读）。
- *   4. spawn 内核进程（注入 DSH_ANDROID 环境）。
- *   5. 轮询控制面端口；失败/进程退出 → 退避重启（START_STICKY 保活）。
+ *   2. 原生资产统一准备：存在性 → 依赖前置 → exec-probe（`NativePreparer.prepare`）。
+ *      全过程**任一必需项失败即中止**，且给出精确到修复动作的归因。
+ *   3. server.js 探针就位。
+ *   4. 写 runtime.json（schema 2，容器写内核读）。
+ *   5. spawn 内核进程（注入 DSH_ANDROID 环境）。
+ *   6. 轮询控制面端口；失败/进程退出 → 退避重启（START_STICKY 保活）。
  *
  * 关键点：一次包升级 = 重启 :node 进程（用户侧“热”的，无 APK 重编）。
  */
@@ -51,8 +56,14 @@ class NodeRuntimeService : Service() {
     private var keepRunning = true
     private var restartCount = 0
 
-    /** 让 linker 找到随包的 libc++_shared.so。这个值的必要性见 runExecProbe 的说明。 */
-    private val libSearchPath: String get() = applicationInfo.nativeLibraryDir
+    /**
+     * 让 linker 找到随包 `.so` 的搜索路径。
+     *
+     * 唯一正确取值 = `nativeLibraryDir`，由 [NativePreparer.libSearchPath] 从
+     * [NativeAssetRegistry] 派生 —— 不要再各写一份。完整论证（为什么这个变量必需、
+     * 为什么不能省、为什么不用 `$ORIGIN` rpath）见 `NativePreparer.probe()` 的注释。
+     */
+    private val libSearchPath: String get() = NativePreparer.libSearchPath(this)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -105,8 +116,9 @@ class NodeRuntimeService : Service() {
     /**
      * 单次拉起内核；成功返回 true（进程已起 + 控制面就绪），失败返回 false。
      *
-     * 步骤经 exec-probe 真跑一次 node 验证可执行性 —— canExecute() 只查 stat 权限位，
-     * 对 SELinux W^X 无感（假阳性）。这是上游真机排查得出的结论，务必保留。
+     * 可执行性验证由 [NativePreparer.prepare] 完成 —— 它**真跑一次**进程。
+     * `canExecute()` 只查 stat 权限位，对 SELinux W^X 无感（假阳性），
+     * 这是上游真机排查得出的结论，务必保留。
      */
     private fun bootKernelOnce(): Boolean {
         try {
@@ -121,6 +133,17 @@ class NodeRuntimeService : Service() {
             val kernelDir = if (!kVersion.isNullOrBlank()) km.kernelDir(kVersion) else null
             val entry = if (!kVersion.isNullOrBlank()) km.entryPath(kVersion) else null
             val hasKernel = entry != null && entry.exists()
+            // 不变式守护：内核入口是【脚本】，必须交给 node 解释执行。
+            // 它落在 filesDir（app_data_file），W^X 禁止 execve —— 直接 ProcessBuilder
+            // 它在真机上必然 error=13。这个断言把「注释与实现矛盾」的雷变成可执行检查。
+            if (hasKernel && kVersion != null) {
+                try {
+                    km.assertNotDirectlyExecutable(kVersion)
+                } catch (e: IllegalStateException) {
+                    RuntimeDiagnostics.append(this, "kernel", false, "内核入口布局异常", err(e))
+                    return false
+                }
+            }
             RuntimeDiagnostics.append(
                 this, "kernel", hasKernel,
                 if (hasKernel) "内核版本=$kVersion" else "尚无内核包（等待 OTA 下发，先跑内置探针）",
@@ -128,40 +151,38 @@ class NodeRuntimeService : Service() {
                 else "files/kernel/CURRENT 缺失且无 assets/kernel/baseline.zip；本次将回落到 assets/node/server.js 探针模式"
             )
 
-            // ---- 1) 确认内置 node 就位 ----
-            // 这里刻意【不】用 canExecute() 判断可用性：它只查 stat 的 x 权限位，
-            // 对 SELinux W^X 完全无感（假阳性）。真正确认能否执行的是第 4 步的
-            // exec-probe —— 真去跑一次。详见 NodeProvisioner 顶部说明。
-            val nodeBin = NodeProvisioner.bundledExecutable(this)
+            // ---- 1) 原生资产统一准备（存在性 → 依赖前置 → exec-probe） ----
+            //
+            // 这一步取代了历史上的三处分散逻辑：
+            //   · NodeProvisioner.ensureBundledNode   （只知道 libnode.so 存在与否）
+            //   · diagnoseNativeLibs()                （只打日志，从不阻断 → 缺陷 1）
+            //   · runExecProbe(nodeBin)               （归因只按 errno 罗列可能 → 缺陷 2）
+            //
+            // 三者叠加出的真实故障：libc++_shared.so 缺失 → exec-probe 以 linker 错误失败
+            // → errno=13 → 归因到「SELinux 禁止 exec」→ 真因（依赖缺失）永远浮不出来。
+            // 现在依赖检查前置且独立归因，见 native/NativePreparer.kt 顶部说明。
             val version = NodeVersionManager(this).currentVersion()
             RuntimeDiagnostics.append(
                 this, "version", true, "内置 Node 版本=$version",
                 "（以清单为准；实际二进制版本见下方 exec-probe 的输出）"
             )
 
-            try {
-                NodeProvisioner.ensureBundledNode(this)
+            val assets = NativePreparer.prepare(this)
+            if (!assets.allRequiredReady) {
+                val what = assets.failedRequired.joinToString("; ") { (e, st) ->
+                    "${e.libName}（${describeStatus(st)}）"
+                }
                 RuntimeDiagnostics.append(
-                    this, "provision", true, "内置 node 就位",
-                    "${nodeBin.absolutePath}\n" +
-                        "大小=${nodeBin.length()} 字节, 可读=${nodeBin.canRead()}\n" +
-                        "（x 权限位=${nodeBin.canExecute()} —— 仅供参考，" +
-                        "能否真正 exec 由 SELinux 决定，见下方 exec-probe）"
+                    this, "provision", false, "原生资产校验未通过，中止启动", what
                 )
-            } catch (e: Exception) {
-                RuntimeDiagnostics.append(this, "provision", false, "内置 node 不可用", err(e))
                 return false
             }
+            val nodeAsset = NativeAssetRegistry.NODE
+            val nodeBin = NativeAssetRegistry.resolve(this, nodeAsset)
 
             // ---- 2) server.js 探针就位 ----
             val script = NodeProvisioner.ensureServerScript(this)
             RuntimeDiagnostics.append(this, "script", true, "server.js 探针就位", script.absolutePath)
-
-            // ---- 3) 两个 .so 是否都在 lib 目录 / APK 内 ----
-            diagnoseNativeLibs()
-
-            // ---- 4) exec-probe：真跑一次 node -v ----
-            if (!runExecProbe(nodeBin)) return false
 
             // ---- 5) 写 runtime.json（schema 2，容器写内核读） ----
             writeRuntimeJson(
@@ -175,6 +196,11 @@ class NodeRuntimeService : Service() {
 
             // ---- 6) 启动内核 ----
             // 有内核包：跑内核入口（控制面 36360）；无内核包：回落内置探针 server.js（便于首启验证 Node 原生链路）。
+            //
+            // ⚠️ 注意第一个参数是 nodeBin（nativeLibraryDir 下的 libnode.so，唯一可 exec 的东西），
+            //    entry 是**脚本参数**、不是被 exec 的目标 —— 它落在 filesDir（app_data_file），
+            //    W^X 禁止 execve。把两者顺序写反必在真机上 error=13。
+            //    不变式由 km.assertNotDirectlyExecutable() 守护。
             val pb = if (hasKernel && kernelDir != null && entry != null) {
                 val uiDir = File(kernelDir, "manager/dist").absolutePath
                 ProcessBuilder(nodeBin.absolutePath, entry.absolutePath, "daemon")
@@ -201,7 +227,7 @@ class NodeRuntimeService : Service() {
                 put("HOME", filesDir.absolutePath)
                 put("TMPDIR", cacheDir.absolutePath)
                 put("NODE_PATH", File(filesDir, "node_modules").absolutePath)
-                // 必需项，理由见 runExecProbe。漏了 node 会在动态链接期直接失败。
+                // 必需项，理由见 NativePreparer.probe() 的注释。漏了 node 会在动态链接期直接失败。
                 put("LD_LIBRARY_PATH", libSearchPath)
             }
             nodeProcess = pb.start()
@@ -225,121 +251,22 @@ class NodeRuntimeService : Service() {
     }
 
     /**
-     * 自检两个 .so 的存在性：既看安装解压后的 lib 目录，也看 APK 内部。
+     * 把资产失败状态压成一句可读结论（供启动中止时的诊断行）。
      *
-     * 两者要分开看，因为排查方向完全相反：
-     *   APK 里有、lib 目录没有 → 安装期没解压出来（extractNativeLibs 未生效）
-     *   APK 里就没有            → 打包期就丢了（构建脚本没拷 / AGP strip 掉）
-     * 合在一起看会分不清问题出在哪一环。
+     * 每种状态对应**互不相同**的修复动作 —— 这正是把归因结构化的意义：
+     * 不再是「可能原因有 1/2/3」，而是「就是这一条」。
      */
-    private fun diagnoseNativeLibs() {
-        // (a) 安装解压后的 nativeLibraryDir
-        try {
-            val libDir = File(applicationInfo.nativeLibraryDir)
-            val files = libDir.listFiles()?.sortedBy { it.name } ?: emptyList()
-            val hasCxx = files.any { it.name == "libc++_shared.so" }
-            RuntimeDiagnostics.append(
-                this, "libdir", hasCxx,
-                if (hasCxx) "libc++_shared.so 就在 lib 目录里"
-                else "⚠ lib 目录里【没有】libc++_shared.so —— 动态链接必然失败",
-                "nativeLibraryDir=${libDir.absolutePath}\n" +
-                    "文件数=${files.size}\n" +
-                    files.joinToString("\n") { "  ${it.name}  ${it.length()} 字节" }
-            )
-        } catch (e: Exception) {
-            RuntimeDiagnostics.append(this, "libdir", false, "列举 nativeLibraryDir 失败", err(e))
-        }
-
-        // (b) APK 内部（APK 本身就是 zip）
-        try {
-            val apkPath = applicationInfo.sourceDir
-            val entries = java.util.zip.ZipFile(apkPath).use { zf ->
-                zf.entries().asSequence()
-                    .map { it.name }
-                    .filter { it.startsWith("lib/") }
-                    .sorted()
-                    .toList()
-            }
-            val inApk = entries.any { it.endsWith("libc++_shared.so") }
-            RuntimeDiagnostics.append(
-                this, "apk-libs", inApk,
-                if (inApk) "APK 内确实打包了 libc++_shared.so"
-                else "⚠ APK 内【没有】libc++_shared.so —— 问题出在打包阶段",
-                "APK=$apkPath\n大小=${File(apkPath).length()} 字节\n" +
-                    "lib/ 条目数=${entries.size}\n" +
-                    entries.joinToString("\n") { "  $it" }
-            )
-        } catch (e: Exception) {
-            RuntimeDiagnostics.append(this, "apk-libs", false, "读取 APK 条目失败", err(e))
-        }
-    }
-
-    /**
-     * 真跑一次 `node -v`，验证"这个二进制能不能被 exec"。
-     *
-     * 这是对可执行性的确定性验证，比 canExecute() 可靠得多 —— 它真去执行了。
-     * 刻意【不用 runCatching】：它会吞掉所有 Throwable（含 InterruptedException
-     * / OutOfMemoryError），把不该归为"exec 失败"的情况也引向这个错误结论。
-     * 只精确捕获 IOException —— 那正是"进程无法创建"（error=13）的形态。
-     *
-     * ----------------------------------------------------------------------
-     * LD_LIBRARY_PATH 为什么是必需的（改这里之前务必读完）
-     * ----------------------------------------------------------------------
-     * 现象：真机报
-     *   CANNOT LINK EXECUTABLE ".../lib/arm64-v8a/libnode.so":
-     *   cannot locate symbol "_ZTVNSt6__ndk119basic_ostringstream..."
-     *
-     * 根因：Android linker 查找依赖库的目录【只有三个】：
-     *   ① $LD_LIBRARY_PATH 里的目录
-     *   ② 二进制 DT_RUNPATH 动态段列出的目录
-     *   ③ 系统默认路径 /system/lib64、/system/lib
-     * （DT_RPATH 在 Android 上被忽略，只有 DT_RUNPATH 有效。）
-     *
-     * nativeLibraryDir **不在这三者中的任何一个** —— 它只在 Java 层
-     * dlopen / System.loadLibrary 时才进搜索路径。而我们是 exec 一个可执行
-     * 文件、由它自己拉起依赖，完全是另一套规则。libnode.so 自身既无
-     * DT_RPATH 也无 DT_RUNPATH（readelf 逐个核对过动态段 29 个条目），
-     * 于是它只能查系统默认路径，那里没有 libc++_shared.so（它不是 bionic
-     * 的一部分），符号解析失败。
-     *
-     * 解法：显式设 LD_LIBRARY_PATH = nativeLibraryDir。两个 .so 都在该目录，
-     * 一举解决。注意 ProcessBuilder 是直接 exec、不经过 shell，所以值就是
-     * 路径原文，不涉及任何展开或引号处理。
-     *
-     * 为什么不改用 $ORIGIN rpath：那需要重编并改链接参数，且有资料指出它
-     * 只在部分设备上有效。LD_LIBRARY_PATH 是跨设备可靠的那一个。
-     *
-     * @return true = 可执行；false = 已写入失败诊断，调用方应中止后续步骤
-     */
-    private fun runExecProbe(nodeBin: File): Boolean {
-        try {
-            val probe = ProcessBuilder(nodeBin.absolutePath, "-v")
-                .redirectErrorStream(true)
-                .apply { environment()["LD_LIBRARY_PATH"] = libSearchPath }
-                .start()
-            val out = probe.inputStream.bufferedReader().readText().trim()
-            val exit = probe.waitFor()
-            val ok = exit == 0
-            RuntimeDiagnostics.append(
-                this, "exec-probe", ok,
-                if (ok) "node -v 执行成功（可执行性已验证）" else "node -v 退出码非 0",
-                "输出: ${out.ifBlank { "(空)" }}, exitCode=$exit\n" +
-                    "LD_LIBRARY_PATH=$libSearchPath"
-            )
-            return ok
-        } catch (e: IOException) {
-            // 走到这里通常是 exec 被拒。把错误码含义一次说清，省得再来回猜。
-            RuntimeDiagnostics.append(
-                this, "exec-probe", false, "无法执行 node 二进制",
-                err(e) + "\n" +
-                    "排查方向：\n" +
-                    "  · error=13 Permission denied → 该路径被 SELinux 禁止 exec。\n" +
-                    "    请确认执行的是 nativeLibraryDir 下的 libnode.so，而不是 files/ 里的副本。\n" +
-                    "  · error=2 No such file → extractNativeLibs 未生效，.so 没被解压到 lib dir。\n" +
-                    "  · error=8 Exec format error → ABI 不匹配或页对齐不满足。"
-            )
-            return false
-        }
+    private fun describeStatus(st: AssetStatus): String = when (st) {
+        is AssetStatus.Ready -> "就位"
+        is AssetStatus.MissingFromLib ->
+            if (st.inApk) "APK 内有但未解压到 nativeLibraryDir（查 extractNativeLibs / useLegacyPackaging）"
+            else "APK 内就没有（打包期丢失：查构建脚本产物与 keepDebugSymbols）"
+        is AssetStatus.MissingDependency ->
+            "缺少依赖 ${st.dep}（linker 不查 nativeLibraryDir，须随包放同目录）"
+        is AssetStatus.NotExecutable ->
+            "无法 exec（依赖已确认完好 → SELinux W^X 拒 exec，查该文件是否真在 nativeLibraryDir）"
+        is AssetStatus.ProbeFailed ->
+            "探针失败 exit=${st.exit}，输出=${st.output.ifBlank { "(空)" }}"
     }
 
     /**

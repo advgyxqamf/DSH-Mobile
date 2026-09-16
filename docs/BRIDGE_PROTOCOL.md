@@ -121,7 +121,55 @@
 | 方法 | 参数 | 依赖 | 落地 |
 |---|---|---|---|
 | `sys.info` | — | 基础（设备/API level） | ✅ |
+| `sys.nativeAssets` | `walkProbes?`（默认 `true`） | 基础（只读探测） | ✅ |
 | `sys.setTime` / `sys.setTimeZone` / `sys.reboot` | 见 §3.4 | **Device Owner** | ✅ |
+
+#### `sys.nativeAssets` —— 原生资产自检
+
+W^X/exec 这条链的失败几乎全部发生在真机，而容器侧的诊断要么用户手动去翻
+`diagnostics.txt`，要么只能看一句「启动失败」。本方法把
+`NativePreparer.prepare()` 的**结构化结论**经桥暴露出来。
+
+同一份实现被容器启动链复用，所以桥上的结论和诊断文件里的**永远不会漂移**。
+
+**请求**
+```json
+{ "method": "sys.nativeAssets", "params": { "walkProbes": true } }
+```
+- `walkProbes: true`（默认）—— 真跑一次 exec-probe（会 spawn 进程）
+- `walkProbes: false` —— 只做存在性 + 依赖检查，不 spawn
+
+**响应**
+```json
+{
+  "allRequiredReady": true,
+  "nativeLibraryDir": "/data/app/~~x/pkg-y/lib/arm64-v8a",
+  "libSearchPath": "/data/app/~~x/pkg-y/lib/arm64-v8a",
+  "assets": [
+    {
+      "id": "node", "libName": "libnode.so", "humanName": "Node 运行时",
+      "required": true, "requiredDeps": ["libc++_shared.so"],
+      "note": "实为可执行文件，改名 lib*.so 借 jniLibs 通道落到 exec_type 目录",
+      "status": "ready",
+      "path": "/data/app/~~x/pkg-y/lib/arm64-v8a/libnode.so",
+      "probeOutput": "v24.21.0"
+    }
+  ]
+}
+```
+
+`status` 取值与对应的 `hint`（失败时携带）：
+
+| `status` | 附加字段 | 含义 |
+|---|---|---|
+| `ready` | `path`, `probeOutput` | 就位且探针通过 |
+| `missing_from_lib` | `inApk`, `libListing`, `hint` | 不在 `nativeLibraryDir`；`inApk` 区分「安装期未解压」vs「打包期就丢了」 |
+| `missing_dependency` | `missingDep`, `libListing`, `hint` | 依赖 `.so` 不在同目录（**历史实现完全缺失这一层**） |
+| `not_executable` | `errno`, `raw`, `hint` | 存在+依赖齐但 exec 被拒 → 可确定归因 SELinux W^X |
+| `probe_failed` | `exit`, `output` | 进程起来了但退出码/输出不对 |
+
+> 客户端应优先读 `allRequiredReady` 做快速判定，再按 `status` 决定给用户
+> 什么引导 —— 这五种状态的修复动作完全不同，不应该被压成同一句「失败」。
 
 ---
 
