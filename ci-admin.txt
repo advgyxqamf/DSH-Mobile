@@ -1,0 +1,47 @@
+ADMIN_REPORT
+time  : 2026-09-16 05:19:26 UTC
+tag   : admin-logs-35058735647
+kind  : logs
+target: 35058735647
+
+== run 35058735647 的失败日志 ==
+  wf    : Fast APK (no Node rebuild)
+  sha   : 0197201
+  status: completed
+  concl : success
+  url   : https://github.com/advgyxqamf/DSH-Mobile/actions/runs/35058735647
+
+=== 各步骤结果 ===
+  [success] build :: Set up job
+  [success] build :: Checkout
+  [success] build :: Resolve Node runtime version
+  [success] build :: Validate workflow files (fail fast on YAML/syntax errors)
+  [success] build :: Container engine tests (logic)
+  [success] build :: Set up JDK 17
+  [success] build :: Show Android SDK env
+  [success] build :: Install SDK packages
+  [success] build :: Fetch prebuilt Node runtime from pinned release
+  [success] build :: Gate — verify runtime is in place before gradle
+  [success] build :: Build kernel baseline bundle
+  [success] build :: Verify kernel baseline bundle
+  [success] build :: Inject release keystore (optional, for stable signing)
+  [success] build :: Build debug APK
+  [success] build :: Audit APK contents
+  [success] build :: Upload APK artifact
+  [success] build :: Publish APK to Release
+  [success] build :: Report to ci-ok
+  [success] build :: Post Set up JDK 17
+  [success] build :: Post Checkout
+  [success] build :: Complete job
+
+=== 失败步骤日志（仅 failed 步骤） ===
+
+=== 最近 8 个 run ===
+  35059047460  c5bb718  in_progress/  Admin (cancel / status)
+  35058982901  c5bb718  completed/success  Admin (cancel / status)
+  35058974556  0197201  completed/success  Admin (cancel / status)
+  35058735647  0197201  completed/success  Fast APK (no Node rebuild)
+  35058647578  0197201  completed/success  Fast APK (no Node rebuild)
+  35058529184  c5bb718  completed/success  Fast APK (no Node rebuild)
+  35058458258  c5bb718  completed/success  Admin (cancel / status)
+  35058287379  0197201  completed/success  Admin (cancel / status)
