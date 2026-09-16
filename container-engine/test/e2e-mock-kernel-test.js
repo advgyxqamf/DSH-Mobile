@@ -8,12 +8,34 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const makeRunner = require('./harness');
+const crypto = require('crypto');
 const { packBundle } = require('../src/kernel-bundle');
-const { loadPrivateKey, loadPublicKey } = require('../src/keys');
 const { OtaEngine } = require('../src/ota-engine');
 const { bootKernel, pollHealth } = require('../src/boot');
 
 const { check, finish } = makeRunner('e2e-mock-kernel');
+
+// ============================================================================
+//  测试自造密钥对，**不读仓库外的生产私钥**
+// ============================================================================
+//  原先这里用 loadPrivateKey()/loadPublicKey() 去读
+//  `keys/ota-private.pem` + `assets/ota-public.pem`。这在单仓 CI 上必然崩：
+//  `keys/ota-private.pem` 被 .gitignore 排除（**这是刻意的** —— 私钥绝不入库），
+//  checkout 出来的仓库里根本没有它，于是测试以
+//  `ENOENT: .../keys/ota-private.pem` 崩掉，一条断言都跑不出来。
+//
+//  更根本的问题是**测试的语义**：本测试要验的是
+//  「签名打包 → 验签解包 → 切指针 → spawn → 健康检查」这条**链路**，
+//  而不是「生产密钥对不对」。用生产密钥当夹具，既让它依赖一个不该存在的文件，
+//  又让"链路坏了"和"密钥轮换了"两种失败混在一起、无法区分。
+//
+//  改用自造密钥对后：测试自洽、可离线、可并行，且与生产密钥的轮换彻底解耦。
+//  （其他测试如 kernel-selfboot-test.js 一直就是这么做的。）
+// ============================================================================
+const kp = crypto.generateKeyPairSync('ed25519', {
+  privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+  publicKeyEncoding: { type: 'spki', format: 'pem' },
+});
 
 const STATUS_PORT = 3081;
 // 扮演 dsh-supervisor 的最小 node 进程：绑定健康检查端口并常驻直到被 kill。
@@ -44,8 +66,8 @@ process.on('SIGINT', () => { clearInterval(keep); server.close(() => process.exi
   fs.writeFileSync(path.join(srcDir, 'manager', 'index.js'), 'module.exports = {};\n');
 
   // 2) 签名打包（engines 对齐沙箱实际 node，使 _nodeSatisfied 通过）
-  const privateKey = loadPrivateKey();
-  const publicKey = loadPublicKey();
+  const privateKey = kp.privateKey;
+  const publicKey = kp.publicKey;
   const version = '1.0.0-mock';
   const nodeMajor = parseInt(process.versions.node, 10);
   const { zipBuf, manifest } = packBundle({

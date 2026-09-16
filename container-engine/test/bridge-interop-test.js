@@ -16,9 +16,43 @@ const path = require('path');
 
 const { check, finish } = makeRunner('bridge-interop');
 
-// 内核侧客户端（跨仓引用）
-const clientMod = require('/workspace/dsh-android-kernel/src/platform/host-bridge/client');
+// ============================================================================
+//  跨仓依赖：内核侧 HostBridge 客户端
+// ============================================================================
+//  本文件是**跨仓**测试 —— 它要的不是容器仓里的任何东西，而是内核仓的
+//  `src/platform/host-bridge/client.js`。所以「内核仓在不在」直接决定它能不能跑。
+//
+//  原先这里写死了 `require('/workspace/dsh-android-kernel/src/...')`，后果是：
+//  在**单仓 CI**（只 checkout 容器仓）上直接 `Cannot find module` 崩溃 ——
+//  而崩溃发生在 require 的那一刻，连一条有用的断言都打不出来，
+//  整个测试步骤红掉，看起来像"容器引擎有 bug"，实际是"隔壁仓不在"。
+//
+//  这是 3 小时发布构建上真实发生过的一次假红。正确做法：
+//    · 路径可配置（env DSH_KERNEL_REPO），不写死绝对路径；
+//    · 找不到就**显式 SKIP** 并说明"未验证什么"，让读者知道这次没验到什么。
+//
+//  注意：不能把 SKIP 做成静默通过 —— 跨仓互通是本项目最关键的接线之一，
+//  "没验"和"验过了"在日志里必须能区分。所以 SKIP 时会把原因与补救方式打全。
+// ============================================================================
+const KERNEL_REPO = process.env.DSH_KERNEL_REPO || '/workspace/dsh-android-kernel';
+const CLIENT_REL = path.join('src', 'platform', 'host-bridge', 'client.js');
+const CLIENT_ABS = path.join(KERNEL_REPO, CLIENT_REL);
+
+if (!fs.existsSync(CLIENT_ABS)) {
+  console.log('SKIP 跨仓互通测试：找不到内核侧桥客户端');
+  console.log('     期望路径: ' + CLIENT_ABS);
+  console.log('     —— 未验证：内核客户端 ←→ 容器桥服务端的真实 UDS 互通');
+  console.log('        （握手 / 能力协商 / 8 组方法调用 / -32001 与 -32601 门禁）。');
+  console.log('     —— 这是**跨仓**测试，单仓 CI 上内核仓不在，属预期情况。');
+  console.log('     —— 本地跑法：把内核仓放到 /workspace/dsh-android-kernel（同级目录），');
+  console.log('        或设 DSH_KERNEL_REPO=<内核仓路径>。');
+  console.log('     —— CI 若要跑它，需在 checkout 步骤额外拉内核仓并设置该环境变量。');
+  finish();
+}
+
+const clientMod = require(CLIENT_ABS);
 const { BridgeServer } = require('../src/bridge/server');
+
 
 const SOCK = 'dsh_test_' + process.pid + '_' + Math.random().toString(36).slice(2, 8);
 const auditLog = path.join(os.tmpdir(), 'bridge-interop-audit-' + process.pid + '.log');

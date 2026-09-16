@@ -95,6 +95,22 @@ jobs:
           chmod +x scripts/build-kernel-bundle.sh
           ./scripts/build-kernel-bundle.sh "$PWD/kernel-src" "$KERNEL_VER" "$KERNEL_ABI" "$OTA_URL_BASE"
 
+      - name: Assemble device-consumable feed
+        # 把上一步的散件（kernel-<ver>.zip + kernel-manifest.json）组织成
+        # 设备侧 LocalKernelFeed.scan() 期望的**目录约定**，产出可直接整体投递的 feed/。
+        #
+        # 为什么需要这一步：Release 附件是给人下载的散件，而设备期望的是
+        # kernel-feed/ 目录下「kernel-*.zip + kernel-manifest.json」这一组
+        # 固定命名的文件。缺了这一层，用户拿到 Release 后仍要手工猜
+        # 「放哪、命名成什么」——「自举」在最后一百米断掉。
+        #
+        # 本步骤同时做两件构建期校验（比运行时才发现便宜得多）：
+        #   · manifest.sha256 与 zip 实际字节一致（不一致 → 设备判 sha256-mismatch）
+        #   · 用**设备端同一个校验器**验一遍签名
+        run: |
+          chmod +x scripts/build-kernel-feed.sh
+          ./scripts/build-kernel-feed.sh "$PWD/kernel-src" "$KERNEL_VER" "$KERNEL_ABI" "$PWD/feed"
+
       - name: Upload bundle artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -102,6 +118,7 @@ jobs:
           path: |
             release/kernel-${{ env.KERNEL_VER }}.zip
             release/kernel-manifest.json
+            feed/
           if-no-files-found: error
 
       - name: Publish to Release
@@ -109,8 +126,48 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # feed/ 单独打成一个 zip 一并发布 —— 这是**设备投递包**：
+          # 解开就是 kernel-feed/ 该有的内容，可直接 adb push。
+          # 同时保留散件（有人就是要单拿 manifest / 单拿 zip）。
+          ( cd feed && zip -q -r "../release/kernel-feed-${{ env.KERNEL_VER }}.zip" . )
+          ls -la release/
+
+          # 发布说明写到文件再 --notes-file 读入。
+          # 不直接写 --notes "多行"：多行字符串在 YAML 块标量里必须整体缩进，
+          # 而缩进一破 YAML 就断（这里真实踩过 —— validate-workflow.py 立刻报
+          # "could not find expected ':'"）。写文件既避开缩进问题，
+          # 也让这段中文说明不必挤在缩进层级里。
+          cat > /tmp/notes.md <<'NOTES'
+          Signed kernel OTA bundle. Verify with the welded APK public key.
+
+          ## 投递到设备（三种方式任选其一）
+
+          1. 下载 `kernel-feed-<ver>.zip`，解开后整体推送到设备：
+             ```
+             adb push . /sdcard/dsh/kernel-feed/
+             ```
+          2. 只推两个文件：
+             ```
+             adb push kernel-<ver>.zip kernel-manifest.json /sdcard/dsh/kernel-feed/
+             ```
+          3. 推到应用专属目录（无需任何存储权限）：
+             ```
+             adb push kernel-<ver>.zip kernel-manifest.json \
+               /sdcard/Android/data/<包名>/files/kernel-feed/
+             ```
+
+          ## 生效方式
+
+          下次启动容器时自动发现并安装（`NodeRuntimeService` 步骤 0b）。
+          安装**必须**验签通过；未签名或签名不匹配的包会被拒绝 ——
+          设备只安装已签名内核，不生产内核。
+          NOTES
+
           gh release create "kernel-${{ env.KERNEL_VER }}" \
             release/kernel-${{ env.KERNEL_VER }}.zip \
             release/kernel-manifest.json \
+            release/kernel-feed-${{ env.KERNEL_VER }}.zip \
             --title "Kernel OTA ${{ env.KERNEL_VER }}" \
-            --notes "Signed kernel OTA bundle (abi=${{ env.KERNEL_ABI }}). Verify with welded APK public key."
+            --notes-file /tmp/notes.md
+
+

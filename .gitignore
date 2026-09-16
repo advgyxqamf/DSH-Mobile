@@ -23,6 +23,13 @@ app/src/main/assets/kernel/baseline.zip
 # OTA 发布包
 release/
 
+# 内核 feed 目录（由 scripts/build-kernel-feed.sh 产出，是**投递产物**而非源码）
+#
+# 与服务端 feed 同理：它内容是「内核仓某 commit + 某个私钥」的函数，
+# 入库会立刻脱节，且每次构建字节都不同 → 无意义的 diff。
+# 它存在的意义是「投给设备」，而投递本身走 Release / adb push，不需要经过 git。
+feed/
+
 # 沙箱产物
 *.log
 .DS_Store

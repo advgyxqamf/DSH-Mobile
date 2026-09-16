@@ -18,6 +18,13 @@ const path = require('path');
 
 const { check, finish } = makeRunner('kernel-update-bridge');
 
+// 跨仓路径（内核仓）。**不写死绝对路径** —— 见 bridge-interop-test.js
+// 顶部关于"单仓 CI 上跨仓测试崩掉"的说明。
+// 本文件对内核源码的引用是**静态比对**（读文件做正则/存在性检查），
+// 用的是软探测（存在才比，不存在就说明"未验证"），所以内核仓不在时不会崩，
+// 只是少验几条"两侧常量是否漂移"的断言。
+const KERNEL_REPO = process.env.DSH_KERNEL_REPO || '/workspace/dsh-android-kernel';
+
 // ── 内核侧契约常量（须与 kernelUpdateBridge.ts 一致）──
 const KERNEL_BRIDGE_PROTOCOL_VERSION = 1;
 const REQUEST = 'dsh:kernel-update-request';
@@ -94,7 +101,7 @@ function main() {
   check('progress 消息不终结请求', kernelConsume({ v: 1, type: PROGRESS, requestId: rid }, rid) === null);
 
   // ── 3) 协议常量与内核源码一致（静态比对，防版本漂移）──
-  const tsPath = '/workspace/dsh-android-kernel/ui/src/services/supervisor/kernelUpdateBridge.ts';
+  const tsPath = path.join(KERNEL_REPO, 'ui/src/services/supervisor/kernelUpdateBridge.ts');
   let ts = '';
   try { ts = fs.readFileSync(tsPath, 'utf8'); } catch {}
   if (ts) {
@@ -107,8 +114,8 @@ function main() {
   }
 
   // ── 4) 宿主帧产物存在且含关键契约元素 ──
-  const hostHtml = '/workspace/dsh-android-kernel/ui/public/host.html';
-  const hostJs = '/workspace/dsh-android-kernel/ui/public/host-frame.js';
+  const hostHtml = path.join(KERNEL_REPO, 'ui/public/host.html');
+  const hostJs = path.join(KERNEL_REPO, 'ui/public/host-frame.js');
   if (fs.existsSync(hostHtml)) {
     const h = fs.readFileSync(hostHtml, 'utf8');
     check('宿主页 iframe 同源（src="/"）', /<iframe[^>]*src="\/"/.test(h));

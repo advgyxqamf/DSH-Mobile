@@ -252,7 +252,7 @@ jobs:
         # zip 解包 / 内核打包 / 桥方法表任何一处坏了，打出来的 APK
         # 都是"能装但跑不起来"，而排查代价是一轮 3 小时的构建。
         #
-        # 放在这里（gradle 之前、setup-java 之后）的理由：
+        # 放在这里（gradle 之前、setup-java 之前）的理由：
         #   · 只需 Node，秒级完成，有错立刻知道；
         #   · 不依赖任何构建产物（基线包是产物，生成它需要私钥 secret
         #     且本 workflow 并不生成它）—— 所以只能跑 test:logic。
@@ -260,7 +260,14 @@ jobs:
         # 为什么不跑 test:baseline：本 workflow 不产出基线包，
         # 强求它存在会在每次发布构建上都红一次，属于假红。
         # 基线包由 fast-apk.yml 的 "Build kernel baseline bundle" 生成并验证。
+        #
+        # ⚠ 必须更新 /tmp/ci-stage。这是一个真实踩过的坑：
+        # 失败诊断（第 25 步）读的是 /tmp/ci-stage 这个**由各步骤自行写入**的
+        # 进度文件。若新加的步骤不写它，诊断里就会显示**上一步**的名字 ——
+        # 于是"容器引擎测试失败"会被报成"validate-workflow 失败"，指向完全错误的方向。
+        # 步骤 id 同理：诊断脚本按 id 列 outcomes，漏登记就看不到这一步的状态。
         run: |
+          echo "2.5/9 container-engine-tests" > /tmp/ci-stage
           set -euo pipefail
           cd container-engine
           npm run test:logic 2>&1 | tee /tmp/engine-test.log
@@ -804,6 +811,11 @@ jobs:
             echo
             echo "=== step outcomes ==="
             echo "wfvalidate  : ${{ steps.wfvalidate.outcome }}"
+            # enginetests 紧跟在 validate 之后，是"秒级快速失败"的关键一环。
+            # 必须登记 —— 本清单是**手写**的，漏一个步骤就等于该步骤失败时
+            # 诊断里看不到它，会把它误判成"上一步失败"（真实踩过：
+            # 容器引擎测试失败被报成 validate-workflow 失败，指向完全错误的方向）。
+            echo "enginetests : ${{ steps.enginetests.outcome }}"
             echo "hbstart     : ${{ steps.hbstart.outcome }}"
             echo "ping        : ${{ steps.ping.outcome }}"
             echo "checkout    : ${{ steps.checkout.outcome }}"
@@ -818,6 +830,19 @@ jobs:
             echo "node-reused : ${{ steps.restorenode.outputs.cache-hit }}"
             echo "node-build  : ${{ steps.nodebuild.outcome }}"
             echo "gradle-build: ${{ steps.gradlebuild.outcome }}"
+            echo
+            # 容器引擎测试的日志：它是最可能"秒级失败"的一步，
+            # 而失败原因（哪个套件、哪条断言）只在日志里。
+            # 不转存的话，沙箱侧就只能看到一个 outcome=failure，无从下手。
+            echo "=== container-engine test log (tail 60) ==="
+            if [ -f /tmp/engine-test.log ]; then
+              wc -c /tmp/engine-test.log
+              grep -E '^FAIL|^结果' /tmp/engine-test.log | tail -20
+              echo "--- 原始尾部 ---"
+              tail -60 /tmp/engine-test.log | cut -c1-400
+            else
+              echo "(no /tmp/engine-test.log)"
+            fi
             echo
             if [ "${{ steps.restorenode.outputs.cache-hit }}" = "yes" ]; then
               echo "=== node-build.log ==="

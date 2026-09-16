@@ -24,6 +24,7 @@ function main() {
 
   if (!srcDir || !version) {
     console.error('用法: build-bundle.js <kernel-src-dir> <version> [abi] [url-base]');
+    console.error('环境变量: DSH_BUNDLE_OUT_DIR 可指定输出目录（默认 <repo>/release）');
     process.exit(2);
   }
   if (!fs.existsSync(srcDir)) {
@@ -32,14 +33,36 @@ function main() {
   }
 
   const privateKey = loadPrivateKey();
-  const url = (urlBase ? urlBase.replace(/\/$/, '') + '/' : '') + `kernel-${version}.zip`;
+  // url 只在**确实给了 urlBase** 时才写。
+  //
+  // 原实现是无条件拼 `(urlBase ? ... : '') + 'kernel-<ver>.zip'`，
+  // 于是 urlBase 为空时 url 变成了**裸文件名** `kernel-1.2.0.zip`。
+  // 那不是 url —— 它没有 scheme、没有 host，设备端拿它既不能下载也无法解析，
+  // 却会因为"manifest 里有 url 字段"而让人以为存在远端通道。
+  // 本地 feed 场景（scripts/build-kernel-feed.sh）把它暴露了出来。
+  //
+  // 正确语义：**没有基址就是没有 url**（用空串表示"本地投递，无远端"）。
+  const url = urlBase ? urlBase.replace(/\/$/, '') + `/kernel-${version}.zip` : '';
   const { zipBuf, manifest } = packBundle({ srcDir, version, abi, privateKeyPem: privateKey, url });
 
   // 重新核算，确保 manifest.sha256 与落盘 zip 字节一致
   const actualSha = sha256(zipBuf);
   const manifestOut = Object.assign({}, manifest, { sha256: actualSha });
 
-  const outDir = path.resolve(__dirname, '..', '..', 'release');
+  // 输出目录可用 DSH_BUNDLE_OUT_DIR 覆盖。
+  //
+  // 为什么需要这个开关：原先输出目录**硬编码**为 `path.resolve(__dirname,'../..','release')`
+  // —— 即「本脚本所在仓库的 release/」。这在正常用法下没问题，但它把
+  // 「往哪写产物」与「脚本装在哪」绑死了：任何想把产物放到别处的调用方
+  // （例如在临时目录里跑集成测试、或 CI 要把产物直接投到另一个路径）
+  // 都只能去翻这个硬编码。
+  //
+  // 这在 kernel-feed-test.js 里真实暴露过：测试把脚本拷到沙箱再跑，
+  // 于是 release/ 落到了沙箱里的错误位置，而脚本按自己推导的路径找不到包。
+  // 加一个环境变量开关是最小改动，同时保持默认行为完全不变。
+  const outDir = process.env.DSH_BUNDLE_OUT_DIR
+    ? path.resolve(process.env.DSH_BUNDLE_OUT_DIR)
+    : path.resolve(__dirname, '..', '..', 'release');
   fs.mkdirSync(outDir, { recursive: true });
   const zipPath = path.join(outDir, `kernel-${version}.zip`);
   fs.writeFileSync(zipPath, zipBuf);
