@@ -1,0 +1,104 @@
+CI_LAST_REPORT
+time   : Wed Sep 16 05:08:04 UTC 2026
+run    : 35058257429
+sha    : 019720199c0ed21f2ea684df9d4b806d44f31bc6
+stage  : 4/9 sdk-install
+job    : cancelled
+
+=== step outcomes ===
+wfvalidate  : success
+enginetests : success
+hbstart     : success
+ping        : success
+checkout    : success
+setup-java  : success
+sdk-env     : success
+sdk-install : cancelled
+host-deps   : skipped
+node-tag    : skipped
+sync-json   : skipped
+node-cache  : skipped
+node-restore: skipped
+node-reused : 
+node-build  : skipped
+signing     : skipped
+gradle-build: skipped
+
+=== container-engine test log (tail 60) ===
+12813 /tmp/engine-test.log
+结果: 30 passed, 0 failed  (native-assets)
+结果: 6 passed, 0 failed  (sign-verify)
+结果: 9 passed, 0 failed  (kernel-bundle)
+结果: 68 passed, 0 failed  (kernel-selfboot)
+结果: 23 passed, 0 failed  (kernel-feed)
+结果: 12 passed, 0 failed  (ota-engine)
+结果: 8 passed, 0 failed  (runtime-json)
+结果: 14 passed, 0 failed  (bridge-protocol)
+结果: 14 passed, 0 failed  (bridge-e2e)
+结果: 0 passed, 0 failed  (bridge-interop)
+结果: 16 passed, 0 failed  (kernel-update-bridge)
+结果: 8 passed, 0 failed  (e2e-mock-kernel)
+--- 原始尾部 ---
+PASS notif.post 不审计
+PASS BRIDGE_TOKENS 含 8 组
+PASS DEVICE_CAPS 含 device_owner/accessibility/shizuku
+PASS response 往返 id 保持
+
+结果: 14 passed, 0 failed  (bridge-protocol)
+PASS 握手返回 capabilities 含 device_owner
+PASS 握手 groups 含 bridge:app_control
+PASS 握手 groups 不含缺能力的 storage
+PASS notif.post（base）成功
+PASS policy.lockNow（device_owner）成功
+PASS fs.write 缺 manage_external_storage 被拒(-32001)
+PASS 未知方法 METHOD_NOT_FOUND(-32601)
+PASS ui.tap（accessibility）成功且返回 {ok:true}
+PASS ui.getUiTree 返回 windows 结构
+PASS ui.waitFor 返回 found/elapsedMs
+PASS ui.screenshot 缺 mediaprojection 被拒(-32001)
+PASS sys.setTimeZone（device_owner）成功
+PASS 审计日志含 policy.lockNow（特权）
+PASS 审计日志含握手记录
+
+结果: 14 passed, 0 failed  (bridge-e2e)
+SKIP 跨仓互通测试：找不到内核侧桥客户端
+     期望路径: /workspace/dsh-android-kernel/src/platform/host-bridge/client.js
+     —— 未验证：内核客户端 ←→ 容器桥服务端的真实 UDS 互通
+        （握手 / 能力协商 / 8 组方法调用 / -32001 与 -32601 门禁）。
+     —— 这是**跨仓**测试，单仓 CI 上内核仓不在，属预期情况。
+     —— 本地跑法：把内核仓放到 /workspace/dsh-android-kernel（同级目录），
+        或设 DSH_KERNEL_REPO=<内核仓路径>。
+     —— CI 若要跑它，需在 checkout 步骤额外拉内核仓并设置该环境变量。
+
+结果: 0 passed, 0 failed  (bridge-interop)
+PASS 容器回灌报文被内核接受（不被丢弃）
+PASS 结果 ok=true（面板判成功）
+PASS 结果 stage 透传
+PASS 结果 version 透传
+PASS 结果 restartUncertain=true（重启结果不确定语义）
+PASS version 缺失 → null 且仍被接受
+PASS 旧报文（缺 v/ok）被判定为内核丢弃
+PASS 缺 v → 内核丢弃
+PASS v 不符（版本漂移）→ 内核丢弃
+PASS requestId 不匹配 → 内核丢弃
+PASS type 不符 → 内核丢弃
+PASS ok 非布尔 true → 内核判失败（ok=false）
+PASS progress 消息不终结请求
+PASS （跳过）内核源码不可达，仅做行为契约
+PASS （跳过）宿主页不可达
+PASS （跳过）宿主帧脚本不可达
+
+结果: 16 passed, 0 failed  (kernel-update-bridge)
+PASS 打包产出 zipBuf 非空
+PASS manifest 含 sha256 与签名
+PASS 验签 + sha256 通过
+PASS 解包落盘到 kernel/<version>
+PASS CURRENT 指针切到新版本
+PASS 内核进程已 spawn
+PASS runtime.json 已写入（schema 2）
+PASS 内核健康检查通过
+
+结果: 8 passed, 0 failed  (e2e-mock-kernel)
+
+=== node-build.log size / tail ===
+(no node-build.log)
