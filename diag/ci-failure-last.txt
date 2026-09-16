@@ -1,0 +1,37 @@
+=== CI failure diagnostics ===
+run : https://github.com/advgyxqamf/DSH-Mobile/actions/runs/35057454457
+node: 
+ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+ANDROID_NDK: /usr/local/lib/android/sdk/ndk/27.3.13750724
+
+=== step outcomes (success/failure/skipped) ===
+wfvalidate  : success
+hbstart     : success
+ping        : success
+checkout    : success
+setup-java  : skipped
+sdk-env     : skipped
+sdk-install : skipped
+host-deps   : skipped
+node-tag    : skipped
+sync-json   : skipped
+node-cache  : skipped
+node-restore: skipped
+node-reused :  (yes=跳过重编)
+node-build  : skipped
+gradle-build: skipped
+
+=== sdk-install.log (filtered tail 60, license noise removed) ===
+
+=== node-build.log :: ALL error lines (grep -n) ===
+
+=== node-build.log :: context around FIRST error (40 lines before/after) ===
+(no 'error:' line found; see tail below)
+
+=== node-build.log :: context around LAST error (40 lines before/after) ===
+(no 'error:' line found; see tail below)
+
+=== node-build.log (tail 200, warnings filtered out) ===
+
+=== gradle-build.log (tail 150) ===
+(no gradle-build.log — failure before Gradle)
