@@ -245,6 +245,29 @@ jobs:
           # on.push key，导致推任意 tag 都会误触发构建）。
           python3 scripts/validate-workflow.py
 
+      - name: Container engine tests (logic)
+        id: enginetests
+        # 本 workflow 产出的是**发布版 APK**（全量交叉编译 3 小时），
+        # 它比 fast-apk 那条日常路径更不该裸奔：容器引擎里的
+        # zip 解包 / 内核打包 / 桥方法表任何一处坏了，打出来的 APK
+        # 都是"能装但跑不起来"，而排查代价是一轮 3 小时的构建。
+        #
+        # 放在这里（gradle 之前、setup-java 之后）的理由：
+        #   · 只需 Node，秒级完成，有错立刻知道；
+        #   · 不依赖任何构建产物（基线包是产物，生成它需要私钥 secret
+        #     且本 workflow 并不生成它）—— 所以只能跑 test:logic。
+        #
+        # 为什么不跑 test:baseline：本 workflow 不产出基线包，
+        # 强求它存在会在每次发布构建上都红一次，属于假红。
+        # 基线包由 fast-apk.yml 的 "Build kernel baseline bundle" 生成并验证。
+        run: |
+          set -euo pipefail
+          cd container-engine
+          npm run test:logic 2>&1 | tee /tmp/engine-test.log
+          echo
+          echo "=== 容器引擎逻辑测试汇总 ==="
+          echo "$(grep -c '^PASS' /tmp/engine-test.log || true) 个 PASS，$(grep -c '^FAIL' /tmp/engine-test.log || true) 个 FAIL"
+
       - name: Set up JDK 17
         id: setupjava
         uses: actions/setup-java@v4

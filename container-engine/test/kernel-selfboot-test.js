@@ -412,48 +412,19 @@ check('超过体积硬上限时构建期报错', limitTripped && /超过硬上�
 check('排除表含 node_modules（防止被误删）', EXCLUDED_SEGMENTS.has('node_modules'));
 
 // ============================================================================
-//  ⑥ 基线资产与桥契约
+//  ⑥ 桥契约
 // ============================================================================
-console.log('\n--- ⑥ 基线资产与桥契约 ---');
-
-const BASELINE = path.join(ROOT, 'app', 'src', 'main', 'assets', 'kernel', 'baseline.zip');
-const hasBaseline = fs.existsSync(BASELINE);
-// CI 上基线包由 fast-apk.yml 实时生成，此时**必须**存在 —— 用环境变量把
-// "这次运行要求它存在"显式化，避免"源码树没有 → 永远 SKIP → 永远没人发现它坏了"。
-const REQUIRE_BASELINE = process.env.DSH_REQUIRE_BASELINE === '1';
-
-if (!hasBaseline && REQUIRE_BASELINE) {
-  check('基线包存在（DSH_REQUIRE_BASELINE=1 时强制）', false,
-    '未找到 ' + BASELINE + ' —— CI 的基线生成步骤应已产出它');
-} else if (!hasBaseline) {
-  // 基线包是**构建产物**（.gitignore 里排除），源码树里本来就可能没有。
-  // 所以这里不能直接判 FAIL —— 那会让"刚 clone 下来"的仓库永远红。
-  //
-  // 正确做法是：把它当**条件断言**，但必须显式说明"未验证什么"。
-  // 这样既不会假绿（读者知道这项没验），也不会假红（阻塞无关开发）。
-  console.log('SKIP 基线包未生成（构建产物，见 .gitignore）');
-  console.log('     —— 未验证：基线包体积/内容/验签。');
-  console.log('     —— 生成: ./scripts/build-kernel-baseline.sh ../dsh-android-kernel');
-  console.log('     —— 设 DSH_REQUIRE_BASELINE=1 可强制要求存在（CI 用）。');
-} else {
-  const bBuf = fs.readFileSync(BASELINE);
-  check('基线包体积在合理范围（<8MB）', bBuf.length < 8 * 1024 * 1024,
-    (bBuf.length / 1048576).toFixed(2) + ' MB');
-  const bList = listZip(bBuf);
-  check('基线包含 kernel.json', bList.some((e) => e.name.endsWith('kernel.json')));
-  check('基线包含入口 bin/dsh-supervisor', bList.some((e) => e.name.endsWith('bin/dsh-supervisor')));
-  // 基线包必须能通过公钥锚点验签（否则装机后必失败）
-  const ANCHOR = path.join(ROOT, 'app', 'src', 'main', 'assets', 'ota-public.pem');
-  if (fs.existsSync(ANCHOR)) {
-    const bv = runVerifier(['--zip', BASELINE, '--pubkey', ANCHOR]);
-    let bvJson = {};
-    try { bvJson = JSON.parse(bv.out.split('\n').find((l) => l.startsWith('DSH_VERIFY_RESULT ')).slice('DSH_VERIFY_RESULT '.length)); } catch (_e) {}
-    check('基线包通过公钥锚点验签（否则装机必失败）', bv.rc === 0 && bvJson.ok === true,
-      bvJson.reason || ('rc=' + bv.rc));
-  } else {
-    check('公钥锚点存在', false, ANCHOR);
-  }
-}
+//  注意：**基线包本身的断言**不在这里，而在 test/kernel-baseline-test.js。
+//  原因（一次自己造的 CI 事故）：基线包是**构建产物**（.gitignore 排除），
+//  它的存在与否取决于流水线跑到哪一步。原先把断言混在本文件里，于是
+//  CI 把「容器引擎测试」排在 gradle 之前（为了快速失败，这是对的），
+//  却又要求基线包已存在（而生成它的步骤在后面）→ 测试 13 秒内必然红，
+//  且失败原因与本次被测代码毫无关系。
+//
+//  拆开后的职责划分：
+//    · 本文件 —— 验**自举链的逻辑**（与任何产物无关，任何时候都该绿）
+//    · kernel-baseline-test.js —— 验**某一次构建的产物**（构建期检查）
+console.log('\n--- ⑥ 桥契约 ---');
 
 // 桥方法表
 const methods = require('../src/bridge/methods');

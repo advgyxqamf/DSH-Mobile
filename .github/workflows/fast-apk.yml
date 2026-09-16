@@ -126,28 +126,27 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
-      - name: Container engine tests
+      - name: Container engine tests (logic)
         # 本工作流改了 container-engine/src/（zip.js 的 Deflate 支持、
         # kernel-bundle 的排除表与体积断言、桥方法表）—— 不跑测试就等于没验证。
         #
         # 为什么放在 gradle 之前：这些测试只需 Node（秒级），而 gradle 要几分钟。
         # 有错就该在 10 秒内知道，而不是等 8 分钟后在编译阶段以奇怪的形式暴露。
         #
-        # DSH_REQUIRE_BASELINE=1：强制要求基线包存在。
-        # 因为本工作流下一步就会生成它 —— 若那步失败，测试必须红，
-        # 不能因为"产物没生成"而静默 SKIP 过去。
-        env:
-          DSH_REQUIRE_BASELINE: '1'
+        # 为什么是 test:logic 而不是 test —— 这里有一个**曾经踩过的坑**：
+        # 基线包（app/src/main/assets/kernel/baseline.zip）是构建产物
+        # （.gitignore 排除），生成它的 "Build kernel baseline bundle"
+        # 步骤在**本步骤之后**（它需要先拉内核源码 + 注入私钥，代价高）。
+        # 所以本步骤只能跑**不依赖产物**的逻辑测试，否则会因为"产物还没生成"
+        # 而在 13 秒内必然红 —— 一个纯粹由步骤顺序造成的假红。
+        # 基线包本身的断言放在它生成之后（见 "Verify kernel baseline bundle"）。
         run: |
           set -euo pipefail
           cd container-engine
-          npm test 2>&1 | tee /tmp/engine-test.log
-          # 汇总：任一 "N failed" 中 N != 0 就失败（npm test 本身已用退出码表达，
-          # 这里只是把结果打到日志显眼处，便于沙箱侧走 ci-ok 回执时一眼看到）
+          npm run test:logic 2>&1 | tee /tmp/engine-test.log
           echo
-          echo "=== 汇总 ==="
-          grep -c '^PASS' /tmp/engine-test.log || true
-          echo "个 PASS，$(grep -c '^FAIL' /tmp/engine-test.log || true) 个 FAIL"
+          echo "=== 容器引擎逻辑测试汇总 ==="
+          echo "$(grep -c '^PASS' /tmp/engine-test.log || true) 个 PASS，$(grep -c '^FAIL' /tmp/engine-test.log || true) 个 FAIL"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -349,6 +348,31 @@ jobs:
             echo "::error title=基线包生成失败::build-kernel-baseline.sh 非零退出 —— 详见上一步输出"
             exit 1
           fi
+
+      - name: Verify kernel baseline bundle
+        # 基线包刚生成，此刻才能验它 —— 这是 DSH_REQUIRE_BASELINE=1 真正该待的地方。
+        #
+        # 为什么不在 gradle 之前跑（那是上一版的做法，也是上一版 CI 变红的原因）：
+        # 基线包是构建产物，生成它在第 11 步（要拉内核源码 + 注入私钥，代价高）。
+        # 把"要求产物存在"的断言排在"生成产物"之前，等于自己制造一次必然失败。
+        #
+        # continue-on-error 说明：本步骤失败**不该**阻断 APK 产出 ——
+        # 没有基线包时设备仍能靠本地 feed 升级，只是失去"无网首启"能力。
+        # 但失败消息必须足够明确（见 kernel-baseline-test.js 的 FAIL 文案），
+        # 且下游 "Audit APK contents" 会**如实报告** APK 里到底有没有基线包 ——
+        # 「构建成功」不等于「设备开箱可用」，这个区别必须留在日志里。
+        continue-on-error: true
+        env:
+          DSH_REQUIRE_BASELINE: '1'
+        run: |
+          set -uo pipefail
+          cd container-engine
+          npm run test:baseline 2>&1 | tee /tmp/baseline-test.log
+          RC=${PIPESTATUS[0]}
+          echo
+          echo "=== 基线包测试汇总 ==="
+          echo "$(grep -c '^PASS' /tmp/baseline-test.log || true) 个 PASS，$(grep -c '^FAIL' /tmp/baseline-test.log || true) 个 FAIL"
+          exit $RC
 
       - name: Build debug APK
         run: |
