@@ -115,4 +115,64 @@ object NodeProvisioner {
         }
         return script
     }
+
+    /**
+     * 让内核包校验器（`assets/node/kernel-verify.js`）就位。
+     *
+     * 为什么由 Kotlin 复制而不是直接从 assets 读：Node **读不了 APK 内的
+     * assets** —— `process.env` 里没有任何指向它的路径，而且 assets 在 APK
+     * 里是压缩存储的，需要 AssetManager 才能访问。所以必须落到普通文件。
+     *
+     * 与 [ensureServerScript] 的区别：这里用**内容比对**决定是否重写。
+     * 原因：校验器会在每次内核安装时被调用，而"每次都写盘"会让它自己成为
+     * 一个潜在的失败点（磁盘满/IO 抖动）。内容一致就跳过，减少无谓写。
+     *
+     * ⚠️ 它是**校验器**，与被校验的内核包解耦。绝不能改从内核目录加载 ——
+     *    那会让"签名无效的内核"有机会提供自己的校验器（自证循环）。
+     */
+    fun ensureKernelVerifyScript(context: Context): File {
+        return ensureAssetCopied(context, "node/kernel-verify.js", File(context.filesDir, "kernel-verify.js"))
+    }
+
+    /**
+     * 让 ed25519 公钥锚点就位（`assets/ota-public.pem` → `files/ota-public.pem`）。
+     *
+     * 这把公钥是**设备端唯一信任源**：内核包只有用它验签通过才能生效。
+     * 它随 APK 冻结、只能随 APK 升级而变 —— 所以任何"运行时可替换公钥"的
+     * 设计都会让双信任根失效。本方法只做 APK assets → filesDir 的复制，
+     * 不提供任何写入/覆盖该文件的桥方法。
+     */
+    fun ensureOtaPublicKey(context: Context): File {
+        return ensureAssetCopied(context, "ota-public.pem", File(context.filesDir, "ota-public.pem"))
+    }
+
+    /**
+     * 把 assets 里的文件复制到 filesDir，**内容一致则跳过**。
+     *
+     * 用字节比对而非 mtime/size：mtime 在 APK 更新后会变（即使内容没变），
+     * 而 size 相同不代表内容相同。字节比对是这个场景下唯一可靠的判据，
+     * 且这些文件都很小（KB 级），开销可忽略。
+     */
+    private fun ensureAssetCopied(context: Context, assetPath: String, dest: File): File {
+        val assetBytes = context.assets.open(assetPath).use { it.readBytes() }
+        if (dest.exists() && dest.length() == assetBytes.size.toLong()) {
+            val same = try {
+                dest.readBytes().contentEquals(assetBytes)
+            } catch (_: Throwable) {
+                false
+            }
+            if (same) return dest
+        }
+        dest.parentFile?.mkdirs()
+        // 先写临时再 rename：避免"写到一半被杀"导致下次读到半截文件。
+        // 这个文件是安全关键件（公钥/校验器），半截内容比不存在更危险 ——
+        // 它会被当成"存在但无效"，故障表现会非常难查。
+        val tmp = File(dest.parentFile, dest.name + ".tmp")
+        tmp.writeBytes(assetBytes)
+        if (!tmp.renameTo(dest)) {
+            tmp.delete()
+            throw IllegalStateException("无法把 $assetPath 落地到 ${dest.absolutePath}")
+        }
+        return dest
+    }
 }

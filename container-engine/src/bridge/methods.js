@@ -20,8 +20,27 @@ const DEVICE_CAPS = [
   'mediaprojection',          // MediaProjection
   'manage_external_storage',  // MANAGE_EXTERNAL_STORAGE
   'notification_access',      // 通知访问
-  'build_chain',              // 内置 JDK/build-tools
+  'build_chain',              // 内置 JDK/build-tools（**已证伪，永不置位** —— 见下）
+  'kernel_update',            // 从本地 feed 安装已签名内核（A'' 自举，任意设备具备）
 ];
+
+// ⚠️ build_chain 与 kernel_update 的区别（务必别混用）
+//
+//   build_chain   —— 「设备上有编译工具链」。**已被实测证伪**：
+//                    Google Maven 上 aapt2 只有 linux/osx/windows 三个 classifier，
+//                    全是 x86_64；linux-aarch64 / linux-arm64 均 HTTP 404。
+//                    解包实况：e_machine=0x3e、PT_INTERP=/lib64/ld-linux-x86-64.so.2、
+//                    NEEDED 含 6 个 glibc 库。exec 四道关的 interp/架构/libc
+//                    三关在装机后无法补救。
+//                    ⇒ 保留此 token 只为表达"这个概念"，**任何设备都不会置位它**。
+//
+//   kernel_update —— 「设备能安装已签名内核」。不依赖任何原生工具链，
+//                    只用到：读本地文件 + Node 自带 OpenSSL 验签 + 写 filesDir。
+//                    ⇒ **任意设备都具备**（HostBridgeService.deviceCapabilities 无条件置位）。
+//
+//  这个区分本身就是一条架构教训：原先 build 组绑在 build_chain 上，
+//  于是整组因为一个永不具备的能力而**永远返回 -32001** —— 一个"沉默的、
+//  代价极高的失败"。把"安装内核"从"编译"里拆出来，那半条链立刻可用。
 
 // method → { group, caps:[deviceCap...], audit?:bool }
 const METHODS = {
@@ -53,8 +72,13 @@ const METHODS = {
   'fs.list':              { group: 'storage', caps: ['manage_external_storage'] },
   'fs.mkdir':             { group: 'storage', caps: ['manage_external_storage'], audit: true },
 
-  'build.apk':            { group: 'build', caps: ['build_chain'], audit: true },
-  'build.status':         { group: 'build', caps: ['build_chain'] },
+  'build.kernelInstall':  { group: 'build', caps: ['kernel_update'], audit: true },
+  'build.kernelStatus':   { group: 'build', caps: ['kernel_update'] },
+  // 旧名保留但语义已修正：不再是"编 APK"，而是内核安装。
+  // 保留它们是为了让存量内核的调用不会突然变成 METHOD_NOT_FOUND（-32601），
+  // 而是拿到一个**带解释的错误**（-32602 + 迁移指引）。
+  'build.apk':            { group: 'build', caps: ['kernel_update'], audit: true },
+  'build.status':         { group: 'build', caps: ['kernel_update'] },
 
   'notif.read':           { group: 'notification', caps: ['notification_access'], audit: true },
   'notif.post':           { group: 'notification', caps: ['base'] },
@@ -112,7 +136,10 @@ const GROUP_REQUIRED = {
   'ui_automation': 'accessibility',
   'shell': 'shizuku',
   'storage': 'manage_external_storage',
-  'build': 'build_chain',
+  // 组代表能力 = kernel_update，不是 build_chain。
+  // 前者"任意设备具备"，后者"永不具备"（见 DEVICE_CAPS 处关于 aapt2 的论证）。
+  // 绑错会让整组永远返回 -32001 —— 一个沉默且代价极高的失败。
+  'build': 'kernel_update',
 };
 
 /** bridge:* 组令牌 → 该组的代表能力（用于握手协商「组是否可用」）。 */

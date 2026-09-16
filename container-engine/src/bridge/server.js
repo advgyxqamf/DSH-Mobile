@@ -127,8 +127,29 @@ class BridgeServer {
       };
       case 'fs.write': return { path: params.path || '', bytes: 0, appended: !!params.append };
       case 'fs.mkdir': return { path: params.path || '', existed: false };
-      case 'build.status': return { id: params.id || 'last', status: 'idle' };
-      case 'build.apk': return { id: 'b' + Date.now(), status: 'queued' };
+      // build：A'' 内核安装（2026-09 语义修正）。与 Kotlin 返回结构对齐。
+      //
+      // 注意与旧 mock 的区别：旧的是"提交编译任务 → 返回 job id → 轮询"，
+      // 新的**同步返回结果**。因为内核安装本身是秒级操作（验签 + 解包 + 改名），
+      // 不像编译要几十分钟。为它引入任务队列只会增加状态而没有任何收益。
+      case 'build.kernelInstall': return {
+        ok: true,
+        version: '0.1.0-android.1',
+        source: params.feed ? 'APK 内置基线' : '本地文件 feed',
+        reason: null,
+        detail: '已落盘并切换指针',
+        verifierOutput: 'DSH_VERIFY_RESULT {"ok":true,...}',
+        restartRequired: true,
+      };
+      case 'build.kernelStatus': return {
+        current: '0.1.0-android.1',
+        installed: ['0.1.0-android.1'],
+        integrity: [],
+        feedPending: null,
+      };
+      // 旧名：返回**带解释的错误**而不是静默失败，便于存量调用方迁移。
+      case 'build.status': return { current: '0.1.0-android.1', installed: ['0.1.0-android.1'] };
+      case 'build.apk': throw new Error('build.apk 已废弃，请改用 build.kernelInstall');
       case 'app.launch': return { launched: params.pkg };
       case 'app.openUrl': return { opened: true, url: params.url };
       case 'app.stop': return { stopped: params.pkg };

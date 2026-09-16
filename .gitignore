@@ -9,6 +9,17 @@ local.properties
 # 编译出的 Node 二进制（体积大，按需本地生成，不入库）
 app/src/main/assets/node-bin/
 
+# 基线内核包（构建产物，由 scripts/build-kernel-baseline.sh 从内核仓实时生成）
+#
+# 为什么不入库：它是「内核仓某个 commit + 某个私钥」的函数，入库会立刻脱节
+# （内核改了、包还是旧的），且每次构建都产生新的字节 → 无意义的 diff。
+# 与 node-bin/ 同理：体积大、可重建、正确来源在别处。
+#
+# CI 侧：fast-apk.yml 的 "Build kernel baseline bundle" 步骤实时生成。
+# 本地：跑 ./scripts/build-kernel-baseline.sh ../dsh-android-kernel
+#       （缺它不影响编译 —— ensureBaseline 会给出明确诊断而非静默失败）
+app/src/main/assets/kernel/baseline.zip
+
 # OTA 发布包
 release/
 

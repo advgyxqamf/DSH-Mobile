@@ -102,14 +102,71 @@
 > 不无损则自动退 base64 并加 `note` —— 避免二进制文件被静默损坏。
 > `maxBytes` 默认 8 MB，硬顶 64 MB（与 JSON-RPC 帧模型匹配）。
 
-### 3.6 build（设备内编译 APK）
+### 3.6 build（内核安装 —— **不是**编译）
 | 方法 | 参数 | 依赖 | 落地 |
 |---|---|---|---|
-| `build.apk` | `projectDir`, `opts` | 内置构建链（JDK+aapt2/d8/apksigner） | ⏳ P3 待决策 |
-| `build.status` | `id` | 同上 | ⏳ 同上 |
+| `build.kernelInstall` | `feed?` 或 `zipPath`/`sha256`/`version` | `kernel_update` | ✅ |
+| `build.kernelStatus` | — | `kernel_update` | ✅ |
+| `build.apk` | — | — | ⚠️ 废弃，返回带迁移指引的 `-32602` |
+| `build.status` | — | `kernel_update` | ✅（旧名，保留兼容） |
 
-> 由 HostBridge 或 build-agent 编排内置工具链完成编译；产物可经 `app.install` 静默安装（DO）。
-> **待决策**：全内置（APK 体积暴涨）vs 首启下载（需网络，破坏离线可用性）vs 最小 build-tools 子集。
+> **语义已修正**：本组不再是「内置编译工具链」。那个方案**已实测证伪**——
+> Google Maven 上没有 aarch64 版 aapt2（`linux-aarch64`/`linux-arm64` 均 404），
+> 解包实为 x86-64 + glibc，exec 四道关的后三关装机后无法补救。
+> 完整论证见 [ARCHITECTURE.md §2.2–2.3](ARCHITECTURE.md)。
+>
+> 现在的语义是「**从本地 feed 安装已签名内核**」：设备不生产内核，只安装。
+> 全程离线，不需要网络、不需要 PC、不需要新原生二进制。
+> 验签由 Node 侧完成（Android 要 API 33+ 才有 Ed25519，而 minSdk=24）。
+
+**`build.kernelInstall` 请求 / 响应：**
+
+```jsonc
+// 方式一：扫本地 feed 目录并安装
+{ "method": "build.kernelInstall", "params": { "feed": true } }
+
+// 方式二：指定包路径（可附锚点）
+{ "method": "build.kernelInstall",
+  "params": { "zipPath": "/sdcard/dsh/downloads/k1.zip",
+              "sha256": "e8586375...", "version": "0.1.0-android.1" } }
+```
+
+```jsonc
+// 成功
+{ "result": {
+    "ok": true,
+    "version": "0.1.0-android.1",
+    "source": "本地文件 feed",
+    "reason": null,
+    "detail": "已落盘并切换指针: /data/.../files/kernel/0.1.0-android.1",
+    "verifierOutput": "[verify] ed25519 验签通过\nDSH_VERIFY_RESULT {...}",
+    "restartRequired": true
+} }
+
+// 失败（**不抛错，返回结构化结果** —— 便于调用方区分"可重试"与"包有问题"）
+{ "result": {
+    "ok": false,
+    "version": null,
+    "reason": "signature-invalid",
+    "detail": "ed25519 验签未通过（公钥 /data/.../files/ota-public.pem）",
+    "restartRequired": false
+} }
+```
+
+> **失败绝不破坏现状**：校验在解包**之前**发生，失败时不碰任何已有文件。
+> 最坏情况是"没升级成功"，而不是"把能跑的版本弄坏了"。
+>
+> **`restartRequired` 刻意由调用方处理**：本方法**不**自己重启进程 ——
+> 重启会让调用方（内核自己）在半途消失，无法收到回执。
+
+**feed 目录约定**（`LocalKernelFeed` 扫描顺序）：
+
+| 优先级 | 路径 | 说明 |
+|---|---|---|
+| 1 | `<externalFilesDir>/kernel-feed/` | 应用专属外部目录，**无需任何权限**，保底可用 |
+| 2 | `/sdcard/dsh/kernel-feed/` | 可直接 `adb push` / 文件管理器投递 |
+
+目录内：`kernel-*.zip`（候选包，必须带 ed25519 签名）+ 可选 `kernel-manifest.json`（提供 sha256/version 锚点）。多个候选时取**文件名倒序**第一个，装成功后自动清理。
 
 ### 3.7 notification（通知）
 | 方法 | 参数 | 依赖 | 落地 |

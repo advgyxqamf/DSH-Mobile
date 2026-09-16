@@ -128,8 +128,49 @@ class NodeRuntimeService : Service() {
             )
 
             // ---- 0) 内核版本指针 ----
+            //
+            // 顺序是刻意设计的，每一步解决不同的失败模式：
+            //   0a) 已有内核 → 直接用（最常见路径，零额外开销）
+            //   0b) 无内核 → 尝试本地 feed（A'' 自举：用户把新包放到 /sdcard）
+            //   0c) 仍无内核 → 落到 APK 内置基线（无网首启的兜底）
+            //   0d) 都没有 → 回落探针模式，并把「缺基线」记为构建缺陷
+            //
+            // 为什么本地 feed 优先于内置基线：本地 feed 意味着"有人明确要装这个版本"，
+            // 意图比"用出厂版本"更强；而基线只是"什么都没有时的兜底"。反过来的话，
+            // 用户放的新包会被出厂版本一直压着，表现为"放了包没反应"。
             val km = KernelManager(this)
-            val kVersion = km.ensureBaseline() ?: km.currentVersion()
+
+            // 0b) 本地 feed：设备上（/sdcard 等）若有 kernel-<ver>.zip + manifest，就地升级。
+            //     这是 A'' 自举的落点 —— 全程离线、不依赖网络与 PC。
+            val feed = LocalKernelFeed.scan(this)
+            if (km.currentVersion() == null && feed != null) {
+                RuntimeDiagnostics.append(
+                    this, "kernel-feed", true, "发现本地内核 feed",
+                    "zip=${feed.zip.absolutePath}（${feed.zip.length()} 字节）, manifest=${feed.manifest?.absolutePath ?: "(无)"}"
+                )
+                val feedResult = KernelInstaller.install(
+                    context = this,
+                    zip = feed.zip,
+                    manifest = feed.manifestJson,
+                    source = KernelInstaller.Source.LOCAL_FILE,
+                )
+                RuntimeDiagnostics.append(
+                    this, "kernel-feed",
+                    feedResult.ok,
+                    if (feedResult.ok) "本地 feed 内核已安装" else "本地 feed 内核未生效",
+                    "${feedResult.toDiagnosticLine()}\n校验器输出:\n${feedResult.nodeVerifyOutput.take(1200)}"
+                )
+            }
+
+            // 0c) 内置基线兜底（含完整验签，见 KernelManager.ensureBaseline 注释）
+            val baseline = km.ensureBaseline()
+            if (baseline.isDefect) {
+                RuntimeDiagnostics.append(
+                    this, "kernel-baseline", false, "无可用内置基线内核",
+                    baseline.toString()
+                )
+            }
+            val kVersion = baseline.versionOrNull
             val kernelDir = if (!kVersion.isNullOrBlank()) km.kernelDir(kVersion) else null
             val entry = if (!kVersion.isNullOrBlank()) km.entryPath(kVersion) else null
             val hasKernel = entry != null && entry.exists()
@@ -144,11 +185,19 @@ class NodeRuntimeService : Service() {
                     return false
                 }
             }
+            // 结构自检：CURRENT 与目录/入口/manifest 是否自洽。发现问题**不阻断**
+            // （可能只是 OTA 落地了一半，重试可恢复），但必须留下可查的痕迹。
+            val integrity = km.integrityChecks()
+            if (integrity.isNotEmpty()) {
+                RuntimeDiagnostics.append(
+                    this, "kernel-integrity", false, "内核布局不自洽", integrity.joinToString("; ")
+                )
+            }
             RuntimeDiagnostics.append(
                 this, "kernel", hasKernel,
-                if (hasKernel) "内核版本=$kVersion" else "尚无内核包（等待 OTA 下发，先跑内置探针）",
+                if (hasKernel) "内核版本=$kVersion" else "尚无内核包（无本地 feed、且无内置基线，先跑内置探针）",
                 if (hasKernel) "入口=${entry!!.absolutePath}"
-                else "files/kernel/CURRENT 缺失且无 assets/kernel/baseline.zip；本次将回落到 assets/node/server.js 探针模式"
+                else "files/kernel/CURRENT 缺失，且 assets/kernel/baseline.zip 不可用；本次将回落到 assets/node/server.js 探针模式"
             )
 
             // ---- 1) 原生资产统一准备（存在性 → 依赖前置 → exec-probe） ----

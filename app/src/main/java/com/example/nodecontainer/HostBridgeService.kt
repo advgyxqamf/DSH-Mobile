@@ -177,6 +177,15 @@ class HostBridgeService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && Environment.isExternalStorageManager())
             caps.add("manage_external_storage")
         if (notificationListenerEnabled()) caps.add("notification_access")
+        // 内核安装（A'' 自举）：**任意设备都具备** —— 它只做「从本地文件安装
+        // 已签名内核」，不需要任何特殊权限：读 /sdcard 走 fs.* 已有的
+        // MANAGE_EXTERNAL_STORAGE（未授权时回落 app 专属目录），写 filesDir
+        // 是应用自身的权限，验证走 Node 自带的 OpenSSL。
+        //
+        // 刻意与 build_chain 区分：后者表示「设备上有编译工具链」，而那个方案
+        // 已证伪（无 aarch64 aapt2）。把两者解耦，才能让 kernel_update 现在就可用，
+        // 而不必等一个可能永远不会出现的能力。
+        caps.add("kernel_update")
         return caps
     }
 
@@ -736,8 +745,104 @@ class HostBridgeService : Service() {
                 put("existed", f.exists())
             }
         },
-        "build.apk" to MethodDef(listOf("build_chain"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "构建链未内置") },
-        "build.status" to MethodDef(listOf("build_chain"), true) { _ -> throw BridgeError(CODE_CAPABILITY_MISSING, "构建链未内置") }
+        // ---- 3.6 build：内核安装（A'' 自举）----
+        //
+        // 语义澄清：本组**不是**「内置编译工具链」（那个方案已证伪，见
+        // /workspace/P3 内置构建链方案对比.md §5：Google Maven 无 aarch64 版
+        // aapt2，exec 四道关的后三关装机后无法补救）。
+        //
+        // 它是「设备从本地 feed 安装**已签名**内核」—— 职责是安装而非生产。
+        // 因此所需能力为 kernel_update（任意设备都具备），而非 build_chain。
+        //
+        // 为什么保留 build_chain 令牌：它是「设备上有构建工具链」的能力声明，
+        // 未来若真有了 arm64 工具链再置位即可，不需要改这里的代码路径。
+        // 现在它**不会被** deviceCapabilities() 置位，所以依赖它的调用方
+        // 仍会拿到 -32001 —— 这是正确的降级，因为我们确实没有那套工具链。
+        "build.kernelInstall" to MethodDef(listOf("kernel_update"), true) { p ->
+            // 入参二选一：
+            //   { feed: true }                  —— 扫描本地 feed 目录并安装
+            //   { zipPath, sha256?, version? }  —— 安装指定路径的包
+            //
+            // 全程离线。验签在 Node 侧做（Kotlin 拿不到 Ed25519，见 KernelInstaller 注释）。
+            val useFeed = p.optBoolean("feed", false)
+            val zip: File
+            var manifestJson: JSONObject? = null
+            var source = KernelInstaller.Source.NONE
+            var feedHandle: LocalKernelFeed.Feed? = null
+
+            if (useFeed) {
+                val feed = LocalKernelFeed.scan(this)
+                    ?: throw BridgeError(
+                        CODE_INVALID_PARAM,
+                        "本地 feed 目录里没有候选内核包。放置位置：" +
+                            "${getExternalFilesDir(null)?.let { File(it, "kernel-feed") }} 或 " +
+                            "/sdcard/dsh/kernel-feed/，文件名需为 kernel-*.zip"
+                    )
+                feedHandle = feed
+                zip = feed.zip
+                manifestJson = feed.manifestJson
+                source = KernelInstaller.Source.LOCAL_FILE
+            } else {
+                val path = p.optString("zipPath", "")
+                if (path.isBlank()) {
+                    throw BridgeError(CODE_INVALID_PARAM, "需要 feed=true 或提供 zipPath")
+                }
+                zip = requireReadableFile(path)
+                // 允许调用方直接给锚点（本地 feed 场景下 manifest 往往单独存在）
+                val sha = p.optString("sha256", "").ifBlank { null }
+                val ver = p.optString("version", "").ifBlank { null }
+                if (sha != null || ver != null) {
+                    manifestJson = JSONObject().apply {
+                        sha?.let { put("sha256", it) }
+                        ver?.let { put("version", it) }
+                    }
+                }
+                source = KernelInstaller.Source.LOCAL_FILE
+            }
+
+            val res = KernelInstaller.install(this, zip, manifestJson, source)
+            if (res.ok) feedHandle?.let { LocalKernelFeed.consume(it) }
+
+            JSONObject().apply {
+                put("ok", res.ok)
+                put("version", res.version ?: JSONObject.NULL)
+                put("source", res.source.label)
+                put("reason", res.reason ?: JSONObject.NULL)
+                put("detail", res.detail)
+                put("verifierOutput", res.nodeVerifyOutput.take(4000))
+                // 明确告知调用方「需要重启才生效」—— 本方法**不**自己重启进程。
+                // 理由：重启会让调用方（内核自己）在半途消失，无法收到回执；
+                // 由调用方决定何时重启，语义更清晰。
+                put("restartRequired", res.ok)
+            }
+        },
+        "build.kernelStatus" to MethodDef(listOf("kernel_update"), false) { _ ->
+            val km = KernelManager(this)
+            val cur = km.currentVersion()
+            JSONObject().apply {
+                put("current", cur ?: JSONObject.NULL)
+                put("installed", JSONArray(km.installedVersions()))
+                put("integrity", JSONArray(km.integrityChecks()))
+                val feed = LocalKernelFeed.scan(this@HostBridgeService)
+                put("feedPending", feed?.zip?.absolutePath ?: JSONObject.NULL)
+            }
+        },
+        // 保留旧名以兼容存量调用方，但指向内核安装（语义已修正）。
+        "build.apk" to MethodDef(listOf("kernel_update"), true) { p ->
+            throw BridgeError(
+                CODE_INVALID_PARAM,
+                "build.apk 已废弃：内置构建链经实测不可行（Google Maven 无 aarch64 版 aapt2，" +
+                    "interp/架构/libc 三关装机后无法补救）。请改用 build.kernelInstall —— " +
+                    "设备安装已签名内核，无需编译。详见 docs/ARCHITECTURE.md §2.2"
+            )
+        },
+        "build.status" to MethodDef(listOf("kernel_update"), false) { _ ->
+            val km = KernelManager(this)
+            JSONObject().apply {
+                put("current", km.currentVersion() ?: JSONObject.NULL)
+                put("installed", JSONArray(km.installedVersions()))
+            }
+        }
     )
 
     // ---- fs.* 辅助 ----
@@ -840,7 +945,11 @@ class HostBridgeService : Service() {
             "bridge:ui_automation" to "accessibility",
             "bridge:shell" to "shizuku",
             "bridge:storage" to "manage_external_storage",
-            "bridge:build" to "build_chain"
+            // build 组的代表能力改为 kernel_update（不再是 build_chain）。
+            // 理由：该组现在的语义是「安装已签名内核」，而 build_chain 描述的
+            // 「有编译工具链」已被实测证伪。若仍绑 build_chain，整组会因
+            // 那个永不具备的能力而永远不可用 —— 这正是「代价极高的沉默失败」。
+            "bridge:build" to "kernel_update"
         )
     }
 }

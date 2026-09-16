@@ -182,6 +182,113 @@ val NODE = NativeExecutable(
 
 ---
 
+### 2.2 硬约束四：ED25519 在 Android 上要 API 33+，而 minSdk 是 24
+
+这条约束**决定了内核升级链的分层**，且它在项目早期被漏掉了。
+
+**事实（Android 官方 `Signature` 算法支持表）：**
+
+| 算法 | 起始 API |
+|---|---|
+| ECDSA | 11+ |
+| **Ed25519** | **33+** |
+| RSA 系列 | 1+ |
+
+而本项目 `minSdk = 24`（Android 7.0）。所以：
+
+> **在 API 24–32 的设备上，Kotlin 侧 `Signature.getInstance("Ed25519")`
+> 直接抛 `NoSuchAlgorithmException`。Kotlin 无法验签。**
+
+旁证（真实工程教训，见 openclaw#5475）：Conscrypt 官方支持 Ed25519，但
+API 31–32 的平台 BouncyCastle 被裁剪、不含 Ed25519；API 33+ 上
+`KeyFactory.getInstance("Ed25519")` 还会**静默**解析到 AndroidKeyStore
+provider（只认硬件密钥，导入软件 PKCS8 会 `InvalidKeySpecException`）。
+即「能拿到 Signature 实例」与「能用」是两件事 —— 所以不能靠 try/catch 探测。
+
+**由此推出的分层（`kernel_update` 链）：**
+
+```
+┌─ Kotlin（宿主进程 :main，生命周期长）────────────────────┐
+│  KernelInstaller   编排：解包 / 原子 rename / 切 CURRENT  │
+│  LocalKernelFeed   发现：扫本地 feed 目录                 │
+│  ── 不含任何密码学 ──                                     │
+└──────────────────┬──────────────────────────────────────┘
+                   │ spawn 一次性进程，传 zip + 公钥路径
+                   ▼
+┌─ Node（一次性进程，用后即弃）─────────────────────────────┐
+│  kernel-verify.js  sha256 + ed25519 验签 + zip 结构校验    │
+│  ── crypto.verify 走自带 OpenSSL，与 API level 无关 ──     │
+└──────────────────────────────────────────────────────────┘
+```
+
+**为什么这样切分（每一条都是具体问题的解）：**
+
+| 决策 | 原因 |
+|---|---|
+| 验签放 Node | `minSdk=24` + `Ed25519 33+` 的硬约束，Kotlin 做不到 |
+| 落盘/切指针放 Kotlin | Node 进程随时可能被杀；让"随时消失的进程"管"自己下个版本"的落盘是竞态来源（写到一半被杀 → 半包残留） |
+| 校验器随 APK 而非内核 | 否则「签名无效的内核只要能启动就能宣布自己有效」—— 自证循环 |
+| 用一次性进程而非常驻内核 | ① 首启还没有内核，基线包也要验；② 不给内核提权机会；③ 失败可观测（退出码 + 原始输出进诊断） |
+
+**`kernel_update` vs `build_chain`** —— 两个能力令牌，别混用：
+
+| 令牌 | 含义 | 设备是否具备 |
+|---|---|---|
+| `kernel_update` | 从本地 feed **安装已签名内核**（读文件 + 验签 + 写 filesDir） | **是**，任意设备 |
+| `build_chain` | 设备上有**编译工具链**（aapt2/d8/JDK） | **否，永不置位** |
+
+后者已被实测证伪（见下节）。原先 `bridge:build` 整组绑在 `build_chain` 上，
+于是因为一个永不具备的能力而**永远返回 `-32001`** —— 一个沉默且代价极高的失败。
+拆开后，"安装内核"这半条链立刻可用。
+
+### 2.3 为什么「内置构建链」不可行（A/C1 已证伪）
+
+原始诉求是「**离线、设备自举、不依赖外网/PC**」。最初的方案是
+把 `aapt2` + d8 + JDK 打进 APK（方案 A：全内置 / C1：最小子集）。
+**实测推翻了这条路 —— 它的地基不存在。**
+
+```
+GET maven.aliyun.com/repository/google/com/android/tools/build/aapt2/<V>/
+  classifier=linux          -> 200 (2,385,035 B)   ← 解包实为 x86-64
+  classifier=linux-aarch64  -> 404
+  classifier=linux-arm64    -> 404
+  classifier=osx            -> 200
+  classifier=windows        -> 200
+```
+
+解包 `aapt2` 实况：`e_machine=0x3e`（x86-64）、
+`PT_INTERP=/lib64/ld-linux-x86-64.so.2`、NEEDED 含 6 个 glibc 库。
+（能力本身没问题 —— `strings` 能检出 compile/link/dump/diff/optimize 全部子命令。
+纯粹是「在 aarch64 上跑不起来」。）
+
+**对照 exec 四道关（§2.1）：**
+
+| 关 | 要求 | aapt2 现状 | A/C1 |
+|---|---|---|---|
+| 1. W^X | 落 `nativeLibraryDir` | — | 可解 |
+| 2. interp | `/system/bin/linker64` | `/lib64/ld-linux-x86-64.so.2` | ❌ |
+| 3. 架构 | aarch64 | x86-64 | ❌ |
+| 4. libc | bionic | 6 个 glibc 库 | ❌ |
+
+第 2/3/4 关**装机后无法补救，只能换二进制** —— 而 aarch64 版 aapt2 不存在。
+
+**转向 A''：设备只安装已签名内核，不生产内核。**
+
+| | A/C1 内置构建链 | **A'' 本地 feed 安装** |
+|---|---|---|
+| APK 体积 | +300~500 MB | **+1.2 MB**（基线包） |
+| 需要新原生二进制 | 整套工具链 | **无** |
+| 触碰 W^X 链 | 是 | **否** |
+| 私钥在设备上 | 需要（要签名） | **不需要**（只验签） |
+| 信任面 | 扩张到整条工具链 | **不扩张** |
+| 覆盖「DSH 改自己内核」 | ✅ | ✅ |
+
+关键洞察：**「DSH 改自己的内核」根本不需要碰 APK**。内核是
+`files/kernel/<version>/` 下的一个数据目录，容器本来就有权改它。
+唯一缺的是「设备上从哪拿到新内核包」—— 这就是 `LocalKernelFeed` 补的那一步。
+
+---
+
 ## 3. 硬约束二：linker 找不到 `libc++_shared.so`
 
 **结论：必须显式设置 `LD_LIBRARY_PATH`。**

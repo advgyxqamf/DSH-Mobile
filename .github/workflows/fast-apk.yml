@@ -126,6 +126,29 @@ jobs:
           sys.exit(1 if bad else 0)
           PY
 
+      - name: Container engine tests
+        # 本工作流改了 container-engine/src/（zip.js 的 Deflate 支持、
+        # kernel-bundle 的排除表与体积断言、桥方法表）—— 不跑测试就等于没验证。
+        #
+        # 为什么放在 gradle 之前：这些测试只需 Node（秒级），而 gradle 要几分钟。
+        # 有错就该在 10 秒内知道，而不是等 8 分钟后在编译阶段以奇怪的形式暴露。
+        #
+        # DSH_REQUIRE_BASELINE=1：强制要求基线包存在。
+        # 因为本工作流下一步就会生成它 —— 若那步失败，测试必须红，
+        # 不能因为"产物没生成"而静默 SKIP 过去。
+        env:
+          DSH_REQUIRE_BASELINE: '1'
+        run: |
+          set -euo pipefail
+          cd container-engine
+          npm test 2>&1 | tee /tmp/engine-test.log
+          # 汇总：任一 "N failed" 中 N != 0 就失败（npm test 本身已用退出码表达，
+          # 这里只是把结果打到日志显眼处，便于沙箱侧走 ci-ok 回执时一眼看到）
+          echo
+          echo "=== 汇总 ==="
+          grep -c '^PASS' /tmp/engine-test.log || true
+          echo "个 PASS，$(grep -c '^FAIL' /tmp/engine-test.log || true) 个 FAIL"
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -281,6 +304,52 @@ jobs:
             echo "[ok] $f  $SIZE 字节"
           done
 
+      - name: Build kernel baseline bundle
+        # 生成 APK 内置的基线内核包 → app/src/main/assets/kernel/baseline.zip
+        #
+        # 为什么必须有这一步：KernelManager.ensureBaseline() 一直想读这个文件，
+        # 但它**从来不存在**（assets/ 下只有 node/ + ota-public.pem）。后果是
+        # 真机无网首启时静默返回 null，表现为「没有内核包」—— 那是构建期缺陷，
+        # 却被当成运行时状态，排查代价极高。
+        #
+        # 内核源码从内核仓取（与本工作流解耦：本流程不重编 Node，但要带内核）。
+        # 失败不阻断 APK 产出 —— 没有基线包时设备仍能靠本地 feed 升级，
+        # 只是失去"无网首启"能力。但**必须显式警告**，不能静默跳过。
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          OTA_PRIVATE_KEY_PEM: ${{ secrets.OTA_PRIVATE_KEY_PEM }}
+        run: |
+          set -uo pipefail
+          echo "== 拉取内核源码 =="
+          KREPO="${{ github.repository_owner }}/dsh-android-kernel"
+          rm -rf /tmp/kernel-src
+          if git clone --depth 1 "https://github.com/$KREPO.git" /tmp/kernel-src 2>/dev/null; then
+            echo "[ok] 内核源码已拉取: $KREPO"
+          else
+            echo "::warning title=无基线内核::内核仓 $KREPO 拉取失败；APK 将不含基线内核（无网首启不可用，仍可走本地 feed 升级）"
+            exit 0
+          fi
+
+          # 私钥：CI secret。缺失则跳过（不产未签名基线包 —— 见脚本头注释）。
+          if [ -z "${OTA_PRIVATE_KEY_PEM:-}" ]; then
+            echo "::warning title=无基线内核::secrets.OTA_PRIVATE_KEY_PEM 未配置，跳过基线包生成（基线包必须签名，不可省）"
+            exit 0
+          fi
+          mkdir -p keys
+          printf '%s' "$OTA_PRIVATE_KEY_PEM" > keys/ota-private.pem
+          chmod 600 keys/ota-private.pem
+
+          echo "== 生成基线包 =="
+          chmod +x scripts/build-kernel-baseline.sh
+          if ./scripts/build-kernel-baseline.sh /tmp/kernel-src; then
+            echo "[ok] 基线包已生成"
+            ls -la app/src/main/assets/kernel/baseline.zip
+          else
+            echo "::error title=基线包生成失败::build-kernel-baseline.sh 非零退出 —— 详见上一步输出"
+            exit 1
+          fi
+
       - name: Build debug APK
         run: |
           chmod +x gradlew
@@ -312,7 +381,24 @@ jobs:
               exit 1
             fi
           done
-          echo "[ok] APK 审计通过"
+          echo "[ok] APK 审计通过（原生资产）"
+
+          # --- 基线内核包审计 ---
+          #
+          # 上面那步（Build kernel baseline bundle）是 continue-on-error 的 ——
+          # 它失败时构建继续，但这里必须把「APK 里到底有没有基线内核」**如实报告**。
+          # 否则「构建成功」会被误读成「设备开箱可用」，而实际上无网首启起不来。
+          echo
+          echo "--- 基线内核包 ---"
+          if unzip -l "$APK" | grep -q 'assets/kernel/baseline.zip'; then
+            SIZE=$(unzip -l "$APK" | awk '/assets\/kernel\/baseline\.zip/{print $1}')
+            echo "[ok] 含 assets/kernel/baseline.zip（$SIZE 字节）"
+          else
+            echo "::warning title=APK 无基线内核::assets/kernel/baseline.zip 不在 APK 内。"
+            echo "  影响：设备无网首启时无内核可跑，只能回落探针模式。"
+            echo "  仍可用：本地 feed（/sdcard/dsh/kernel-feed/）升级内核。"
+            echo "  常见原因：OTA_PRIVATE_KEY_PEM secret 未配置、或内核仓拉取失败。"
+          fi
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
